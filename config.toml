@@ -1,0 +1,14 @@
+# vproxy configuration
+# Пример конфигурации для VLESS прокси
+
+[inbound]
+address = "127.0.0.1"
+port = 1080
+protocol = "socks5"
+
+[server]
+address = "example.com"
+port = 443
+uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+use_tls = true
+security = "tls"
