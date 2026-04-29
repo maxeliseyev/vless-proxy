@@ -152,6 +152,18 @@ Core логика должна жить в библиотеке, а не в би
 - сейчас tests хорошо покрывают codec/framing, но этого мало для уверенности в whole-flow
 - это особенно важно перед следующими более крупными изменениями в runtime
 
+### Статус
+
+Закрыто:
+
+- добавлен integration harness с реальным `serve(...)`
+- добавлен mock VLESS server для end-to-end сценариев
+- покрыты:
+  - SOCKS5 TCP
+  - HTTP CONNECT
+  - HTTP proxy request
+  - SOCKS5 UDP ASSOCIATE
+
 ### Этап 3. Runtime hardening
 
 Что нужно сделать:
@@ -275,8 +287,8 @@ Core логика должна жить в библиотеке, а не в би
 
 Если продолжать прямо отсюда, следующий практический milestone:
 
-1. **e2e integration tests**
-2. **runtime hardening**
-3. **конфиг следующего уровня**
+1. **runtime hardening**
+2. **конфиг следующего уровня**
+3. **MUX / transport extensions only if still justified**
 
 Именно в таком порядке.

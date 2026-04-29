@@ -191,3 +191,8 @@ cargo test --quiet
 - SOCKS5 handshake
 - HTTP request parsing/rewrite
 - VLESS framing
+- e2e flows:
+  - SOCKS5 TCP
+  - HTTP CONNECT
+  - HTTP proxy request
+  - SOCKS5 UDP ASSOCIATE
