@@ -4,6 +4,7 @@
 [inbound]
 address = "127.0.0.1"
 port = 1080
+# socks5 | http
 protocol = "socks5"
 
 [server]
@@ -12,3 +13,10 @@ port = 443
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 use_tls = true
 security = "tls"
+
+[dns]
+# remote = keep domain name in VLESS request and let the remote side resolve it
+# local = resolve via the system DNS on the client before opening the VLESS session
+mode = "remote"
+# prefer_ipv4 | prefer_ipv6 | ipv4_only | ipv6_only
+strategy = "prefer_ipv4"

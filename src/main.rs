@@ -1,93 +1,97 @@
-mod config;
-mod socks5;
-mod tls;
-mod vless;
-
 use anyhow::Result;
-use config::Config;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io;
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info};
+use tracing::{info, Level};
+use vproxy::{serve, Config};
+
+struct Args {
+    config_path: PathBuf,
+    verbose: bool,
+    check_config: bool,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let args = parse_args()?;
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_max_level(if args.verbose {
+            Level::DEBUG
+        } else {
+            Level::INFO
+        })
+        .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
-
-    let config = Arc::new(Config::load(&config_path)?);
-    info!("Loaded config from {}", config_path.display());
-
-    let listener = TcpListener::bind(config.inbound_addr()).await?;
+    let config = Arc::new(Config::load(&args.config_path)?);
     info!(
-        "Listening on {} (inbound: {})",
+        "Loaded config from {} (inbound: {}, security: {:?}, dns: {:?}/{:?})",
+        args.config_path.display(),
         config.inbound_addr(),
-        config.inbound.protocol
+        config.transport_security()?,
+        config.dns_resolve_mode()?,
+        config.dns_ip_strategy()?
     );
 
-    loop {
-        let (client, addr) = listener.accept().await?;
-        info!("New connection from {}", addr);
-
-        let config = Arc::clone(&config);
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, config).await {
-                error!("Connection error: {}", e);
-            }
-        });
+    if args.check_config {
+        info!("Configuration is valid");
+        return Ok(());
     }
+
+    serve(config).await
 }
 
-async fn handle_connection(
-    mut client: TcpStream,
-    config: Arc<Config>,
-) -> Result<()> {
-    // 1. SOCKS5 Handshake
-    let socks_result = socks5::handle_handshake(&mut client).await?;
-    info!(
-        "SOCKS5 handshake successful: target {}:{}",
-        match &socks_result.address {
-            vless::Address::Ipv4(a) => a.to_string(),
-            vless::Address::Domain(d) => d.clone(),
-            vless::Address::Ipv6(a) => a.to_string(),
-        },
-        socks_result.port
+fn parse_args() -> Result<Args> {
+    let mut config_path = None;
+    let mut verbose = false;
+    let mut check_config = false;
+
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("-c") | Some("--config") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
+                config_path = Some(PathBuf::from(value));
+            }
+            Some("-v") | Some("--verbose") => verbose = true,
+            Some("--check-config") => check_config = true,
+            Some("-h") | Some("--help") => {
+                print_help();
+                std::process::exit(0);
+            }
+            Some(value) if value.starts_with('-') => {
+                anyhow::bail!("Unknown argument: {value}");
+            }
+            _ => {
+                if config_path.is_some() {
+                    anyhow::bail!("Config path can only be provided once");
+                }
+                config_path = Some(PathBuf::from(arg));
+            }
+        }
+    }
+
+    Ok(Args {
+        config_path: config_path.unwrap_or_else(|| PathBuf::from("config.toml")),
+        verbose,
+        check_config,
+    })
+}
+
+fn print_help() {
+    println!(
+        "\
+vproxy - terminal VLESS client
+
+Usage:
+  vproxy [OPTIONS] [config-path]
+
+Options:
+  -c, --config <PATH>   Path to TOML config
+  -v, --verbose         Enable debug logging
+      --check-config    Validate config and exit
+  -h, --help            Show this help
+"
     );
-
-    // 2. Connect to VLESS Server
-    let server_addr = config.server_addr();
-    let use_tls = config.server.use_tls;
-
-    let mut remote = if use_tls {
-        let tls = tls::TlsClient::new(server_addr.split(':').next().unwrap_or("localhost"))?;
-        tls.connect(&server_addr).await?
-    } else {
-        let stream = TcpStream::connect(&server_addr).await?;
-        tls::TlsStream::new(stream)
-    }?;
-
-    info!("Connected to VLESS server {}", server_addr);
-
-    // 3. Send VLESS Request Header
-    let vless_request = vless::Request {
-        uuid: config.server.uuid,
-        command: vless::Command::Tcp,
-        port: socks_result.port,
-        address: socks_result.address,
-    };
-    vless_request.write_to(&mut remote).await?;
-
-    // 4. Proxy traffic
-    let (from_client, from_remote) = io::copy_bidirectional(&mut client, &mut remote).await?;
-
-    info!(
-        "Connection closed. client→remote: {}b, remote→client: {}b",
-        from_client, from_remote
-    );
-    Ok(())
 }
