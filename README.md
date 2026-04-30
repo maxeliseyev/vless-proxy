@@ -26,6 +26,7 @@
   - обычные HTTP proxy requests для `http://...`
 - **async relay** через Tokio
 - **TOML-конфиг** с валидацией
+- **vless:// URL parser** для быстрого запуска без конфига
 - **минимальная DNS policy**
   - `remote` resolve по умолчанию
   - опциональный `local` resolve через system DNS
@@ -80,7 +81,7 @@
 
 ## Конфиг
 
-Пример:
+Пример базового конфига:
 
 ```toml
 [inbound]
@@ -98,6 +99,13 @@ security = "tls"
 [dns]
 mode = "remote"          # или "local"
 strategy = "prefer_ipv4" # prefer_ipv4 | prefer_ipv6 | ipv4_only | ipv6_only
+
+[runtime]
+connect_timeout_secs = 10
+read_timeout_secs = 300
+write_timeout_secs = 60
+idle_timeout_secs = 600
+max_connections = 1024
 ```
 
 Для незашифрованного транспорта:
@@ -111,7 +119,60 @@ use_tls = false
 security = "none"
 ```
 
+### Runtime параметры
+
+Секция `[runtime]` управляет стабильностью и производительностью:
+
+- `connect_timeout_secs` (default: 10) — таймаут подключения к серверу
+- `read_timeout_secs` (default: 300) — таймаут чтения из сокета (5 мин)
+- `write_timeout_secs` (default: 60) — таймаут записи в сокет (1 мин)
+- `idle_timeout_secs` (default: 600) — таймаут бездействия (10 мин)
+- `max_connections` (default: 1024) — лимит одновременных соединений
+
 ## Запуск
+
+### Через vless:// ссылку
+
+Быстрый запуск без создания конфига:
+
+```bash
+# Использовать vless:// URL напрямую
+cargo run -- --url 'vless://uuid@host:port?security=tls'
+
+# С кастомным inbound портом (default: 1080)
+cargo run -- --url 'vless://...' --inbound-port 8080
+
+# С проверкой конфига и verbose-логами
+cargo run -- --url 'vless://...' --check-config --verbose
+```
+
+Формат vless:// URL:
+```
+vless://uuid@host:port?security=tls&sni=example.com#remark
+```
+
+Параметры:
+- `security` — `tls`, `reality`, или `none`
+- `sni` — опциональный SNI для TLS
+- `encryption` — тип шифрования (default: `none`)
+- Fragment (`#remark`) — название сервера (отображается в логах)
+
+Примеры URL:
+```bash
+# TLS сервер
+vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls
+
+# С кастомным SNI
+vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls&sni=cdn.example.com
+
+# Без шифрования
+vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:1234?security=none
+
+# С remark
+vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls#My%20Server
+```
+
+### Через TOML конфиг
 
 Проверить конфиг:
 
@@ -136,6 +197,23 @@ cargo run -- --config ./config.toml
 ```bash
 cargo build --release
 ./target/release/vproxy --config ./config.toml --verbose
+```
+
+### Команды CLI
+
+```
+vproxy - terminal VLESS client
+
+Usage:
+  vproxy [OPTIONS] [config-path|vless://...]
+
+Options:
+  -c, --config <PATH>       Path to TOML config
+  -u, --url <VLESS_URL>     VLESS subscription URL (vless://...)
+  -p, --inbound-port <PORT> Local inbound port (default: 1080)
+  -v, --verbose             Enable debug logging
+      --check-config        Validate config and exit
+  -h, --help                Show this help
 ```
 
 ## Фоновый запуск

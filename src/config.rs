@@ -1,3 +1,4 @@
+use crate::url::VlessUrl;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ pub struct Config {
     pub inbound: InboundConfig,
     #[serde(default = "default_dns_config")]
     pub dns: DnsConfig,
+    #[serde(default = "default_runtime_config")]
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +65,50 @@ pub struct DnsConfig {
     pub mode: String,
     #[serde(default = "default_dns_strategy")]
     pub strategy: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_read_timeout")]
+    pub read_timeout_secs: u64,
+    #[serde(default = "default_write_timeout")]
+    pub write_timeout_secs: u64,
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        connect_timeout_secs: default_connect_timeout(),
+        read_timeout_secs: default_read_timeout(),
+        write_timeout_secs: default_write_timeout(),
+        idle_timeout_secs: default_idle_timeout(),
+        max_connections: default_max_connections(),
+    }
+}
+
+fn default_connect_timeout() -> u64 {
+    10
+}
+
+fn default_read_timeout() -> u64 {
+    300
+}
+
+fn default_write_timeout() -> u64 {
+    60
+}
+
+fn default_idle_timeout() -> u64 {
+    600
+}
+
+fn default_max_connections() -> usize {
+    1024
 }
 
 fn default_tls() -> bool {
@@ -126,7 +173,7 @@ impl Config {
 }
 
 impl Config {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.server.port == 0 {
             bail!("Server port must be 1-65535");
         }
@@ -215,6 +262,44 @@ fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+impl Config {
+    pub fn from_vless_url(url: &VlessUrl, inbound_port: u16) -> Self {
+        let server = ServerConfig {
+            address: url.host.clone(),
+            port: url.port,
+            uuid: url.uuid,
+            use_tls: url.use_tls(),
+            security: url.security.clone(),
+        };
+
+        let inbound = InboundConfig {
+            address: "127.0.0.1".to_string(),
+            port: inbound_port,
+            protocol: "socks5".to_string(),
+        };
+
+        let dns = DnsConfig {
+            mode: "remote".to_string(),
+            strategy: "prefer_ipv4".to_string(),
+        };
+
+        let runtime = RuntimeConfig {
+            connect_timeout_secs: default_connect_timeout(),
+            read_timeout_secs: default_read_timeout(),
+            write_timeout_secs: default_write_timeout(),
+            idle_timeout_secs: default_idle_timeout(),
+            max_connections: default_max_connections(),
+        };
+
+        Config {
+            server,
+            inbound,
+            dns,
+            runtime,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +321,13 @@ mod tests {
             dns: DnsConfig {
                 mode: "remote".to_string(),
                 strategy: "prefer_ipv4".to_string(),
+            },
+            runtime: RuntimeConfig {
+                connect_timeout_secs: default_connect_timeout(),
+                read_timeout_secs: default_read_timeout(),
+                write_timeout_secs: default_write_timeout(),
+                idle_timeout_secs: default_idle_timeout(),
+                max_connections: default_max_connections(),
             },
         }
     }
@@ -333,5 +425,28 @@ mod tests {
         config.server.address = "2001:db8::10".to_string();
 
         assert_eq!(config.server.endpoint(), "[2001:db8::10]:443");
+    }
+
+    #[test]
+    fn accepts_default_runtime_config() {
+        let config = base_config();
+
+        assert_eq!(config.runtime.connect_timeout_secs, 10);
+        assert_eq!(config.runtime.read_timeout_secs, 300);
+        assert_eq!(config.runtime.write_timeout_secs, 60);
+        assert_eq!(config.runtime.idle_timeout_secs, 600);
+        assert_eq!(config.runtime.max_connections, 1024);
+    }
+
+    #[test]
+    fn accepts_custom_runtime_config() {
+        let mut config = base_config();
+        config.runtime.connect_timeout_secs = 5;
+        config.runtime.read_timeout_secs = 120;
+        config.runtime.max_connections = 500;
+
+        assert_eq!(config.runtime.connect_timeout_secs, 5);
+        assert_eq!(config.runtime.read_timeout_secs, 120);
+        assert_eq!(config.runtime.max_connections, 500);
     }
 }

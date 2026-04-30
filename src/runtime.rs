@@ -1,4 +1,4 @@
-use crate::config::{Config, DnsConfig, InboundProtocol, ServerConfig, TransportSecurity};
+use crate::config::{Config, DnsConfig, InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity};
 use crate::dns::ResolverPolicy;
 use crate::http;
 use crate::socks5;
@@ -7,28 +7,29 @@ use crate::vless::{self, Address, Request, Response};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tokio::time::{timeout, Instant};
+use tracing::{debug, error, info, warn};
 
-/// Reusable outbound VLESS connector that can be embedded by other Rust entrypoints.
-///
-/// The terminal CLI uses this type today, and future mobile/FFI bridges can wrap the same
-/// `connect_target` API instead of depending on SOCKS5 listener logic.
 #[derive(Clone)]
 pub struct ProxyClient {
     server: ServerConfig,
     resolver: ResolverPolicy,
+    runtime: RuntimeConfig,
 }
 
 impl ProxyClient {
-    pub fn new(server: ServerConfig, dns: DnsConfig) -> Result<Self> {
+    pub fn new(server: ServerConfig, dns: DnsConfig, runtime: RuntimeConfig) -> Result<Self> {
         Ok(Self {
             server,
             resolver: ResolverPolicy::new(dns)?,
+            runtime,
         })
     }
 
@@ -38,6 +39,10 @@ impl ProxyClient {
 
     pub fn dns_policy(&self) -> &ResolverPolicy {
         &self.resolver
+    }
+
+    pub fn runtime(&self) -> &RuntimeConfig {
+        &self.runtime
     }
 
     pub async fn connect_target(
@@ -64,7 +69,12 @@ impl ProxyClient {
         address: Address,
         port: u16,
     ) -> Result<MaybeTlsStream<TcpStream>> {
-        let mut remote = connect_remote(&self.server).await?;
+        let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
+        
+        let mut remote = timeout(connect_timeout, connect_remote(&self.server))
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+
         let request_address = self.resolver.resolve(address.clone(), port).await?;
         let request = Request {
             uuid: self.server.uuid,
@@ -91,38 +101,113 @@ impl ProxyClient {
 }
 
 pub async fn serve(config: Arc<Config>) -> Result<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    
+    let mut ctrl_c_stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm_stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    
+    let shutdown_signal = async {
+        tokio::select! {
+            _ = ctrl_c_stream.recv() => {
+                info!("Received SIGINT, initiating graceful shutdown");
+            }
+            _ = sigterm_stream.recv() => {
+                info!("Received SIGTERM, initiating graceful shutdown");
+            }
+        }
+    };
+
+    let result = tokio::select! {
+        result = serve_with_shutdown(config.clone(), shutdown_rx) => result,
+        _ = shutdown_signal => {
+            info!("Shutdown signal received, stopping server");
+            let _ = shutdown_tx.send(true);
+            Ok(())
+        }
+    };
+
+    result
+}
+
+async fn serve_with_shutdown(config: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<()> {
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let max_connections = config.runtime.max_connections;
+    let semaphore = Arc::new(Semaphore::new(max_connections));
+
     match config.inbound_protocol()? {
-        InboundProtocol::Socks5 => serve_socks5(config).await,
-        InboundProtocol::Http => serve_http(config).await,
+        InboundProtocol::Socks5 => {
+            serve_socks5_with_limits(config, shutdown, connection_count, semaphore).await
+        }
+        InboundProtocol::Http => {
+            serve_http_with_limits(config, shutdown, connection_count, semaphore).await
+        }
     }
 }
 
-async fn serve_socks5(config: Arc<Config>) -> Result<()> {
+async fn serve_socks5_with_limits(
+    config: Arc<Config>,
+    mut shutdown: watch::Receiver<bool>,
+    connection_count: Arc<AtomicUsize>,
+    semaphore: Arc<Semaphore>,
+) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(config.server.clone(), config.dns.clone())?;
+    let connector = ProxyClient::new(config.server.clone(), config.dns.clone(), config.runtime.clone())?;
 
     info!(
-        "Listening on {} (inbound: {})",
+        "Listening on {} (inbound: {}, max_connections: {})",
         config.inbound_addr(),
-        config.inbound.protocol
+        config.inbound.protocol,
+        config.runtime.max_connections
     );
 
     loop {
-        let (client, addr) = listener.accept().await?;
-        info!("New connection from {}", addr);
-
-        let connector = connector.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_socks5_connection(client, connector).await {
-                error!("Connection error: {}", error);
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    info!("Shutting down SOCKS5 listener");
+                    break;
+                }
             }
-        });
+            accept_result = listener.accept() => {
+                let (client, addr) = accept_result?;
+                
+                let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if current_connections > config.runtime.max_connections {
+                    connection_count.fetch_sub(1, Ordering::Relaxed);
+                    warn!("Rejecting connection from {}: max connections ({}) reached", 
+                          addr, config.runtime.max_connections);
+                    continue;
+                }
+
+                debug!("New connection from {} (active: {})", addr, current_connections);
+
+                let connector = connector.clone();
+                let connection_count = connection_count.clone();
+                let permit = semaphore.clone().acquire_owned().await?;
+                
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_socks5_connection(client, connector).await {
+                        error!("Connection error: {}", error);
+                    }
+                    let prev = connection_count.fetch_sub(1, Ordering::Relaxed);
+                    debug!("Connection closed (active: {})", prev - 1);
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
 async fn handle_socks5_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
-    let request = socks5::accept_request(&mut client).await?;
+    let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
+    
+    let request = timeout(read_timeout, socks5::accept_request(&mut client))
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timeout"))??;
+
     info!(
         "SOCKS5 {:?} request: target {}:{}",
         request.command, request.address, request.port
@@ -141,29 +226,45 @@ async fn handle_socks5_tcp_request(
     connector: ProxyClient,
     request: socks5::HandshakeResult,
 ) -> Result<()> {
-    let mut remote = match connector
-        .connect_target(request.address, request.port)
-        .await
+    let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
+    let write_timeout = Duration::from_secs(connector.runtime().write_timeout_secs);
+    let idle_timeout = Duration::from_secs(connector.runtime().idle_timeout_secs);
+
+    let remote = match timeout(
+        Duration::from_secs(connector.runtime().connect_timeout_secs),
+        connector.connect_target(request.address, request.port),
+    )
+    .await
     {
-        Ok(remote) => remote,
-        Err(error) => {
+        Ok(Ok(remote)) => remote,
+        Ok(Err(error)) => {
             let _ = socks5::send_reply(&mut client, socks5::Reply::GeneralFailure).await;
-            return Err(error);
+            return Err(anyhow::anyhow!("Failed to connect to target: {}", error));
+        }
+        Err(_) => {
+            let _ = socks5::send_reply(&mut client, socks5::Reply::GeneralFailure).await;
+            return Err(anyhow::anyhow!("Connection timeout"));
         }
     };
 
+    let mut remote = remote;
     info!(
         "Connected to VLESS server {}",
         connector.server().endpoint()
     );
     socks5::send_success(&mut client).await?;
 
-    let (from_client, from_remote) = io::copy_bidirectional(&mut client, &mut remote).await?;
-    info!(
-        "Connection closed. client→remote: {}b, remote→client: {}b",
-        from_client, from_remote
-    );
-    Ok(())
+    let result = copy_bidirectional_with_timeouts(
+        &mut client,
+        &mut remote,
+        read_timeout,
+        write_timeout,
+        idle_timeout,
+    )
+    .await;
+
+    info!("Connection closed");
+    result.map(|_| ())
 }
 
 async fn handle_socks5_udp_associate(
@@ -200,54 +301,104 @@ async fn handle_socks5_udp_associate(
     association_result
 }
 
-async fn serve_http(config: Arc<Config>) -> Result<()> {
+async fn serve_http_with_limits(
+    config: Arc<Config>,
+    mut shutdown: watch::Receiver<bool>,
+    connection_count: Arc<AtomicUsize>,
+    semaphore: Arc<Semaphore>,
+) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(config.server.clone(), config.dns.clone())?;
+    let connector = ProxyClient::new(config.server.clone(), config.dns.clone(), config.runtime.clone())?;
 
     info!(
-        "Listening on {} (inbound: {})",
+        "Listening on {} (inbound: {}, max_connections: {})",
         config.inbound_addr(),
-        config.inbound.protocol
+        config.inbound.protocol,
+        config.runtime.max_connections
     );
 
     loop {
-        let (client, addr) = listener.accept().await?;
-        info!("New connection from {}", addr);
-
-        let connector = connector.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_http_connection(client, connector).await {
-                error!("Connection error: {}", error);
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    info!("Shutting down HTTP listener");
+                    break;
+                }
             }
-        });
+            accept_result = listener.accept() => {
+                let (client, addr) = accept_result?;
+                
+                let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if current_connections > config.runtime.max_connections {
+                    connection_count.fetch_sub(1, Ordering::Relaxed);
+                    warn!("Rejecting connection from {}: max connections ({}) reached", 
+                          addr, config.runtime.max_connections);
+                    continue;
+                }
+
+                debug!("New connection from {} (active: {})", addr, current_connections);
+
+                let connector = connector.clone();
+                let connection_count = connection_count.clone();
+                let permit = semaphore.clone().acquire_owned().await?;
+                
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_http_connection(client, connector).await {
+                        error!("Connection error: {}", error);
+                    }
+                    let prev = connection_count.fetch_sub(1, Ordering::Relaxed);
+                    debug!("Connection closed (active: {})", prev - 1);
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
 async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
-    let request = match http::accept_request(&mut client).await {
-        Ok(request) => request,
-        Err(error) => {
+    let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
+    
+    let request = match timeout(read_timeout, http::accept_request(&mut client)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
             let _ = http::send_error(&mut client, 400, "Bad Request").await;
-            return Err(error);
+            return Err(anyhow::anyhow!("HTTP request error: {}", error));
+        }
+        Err(_) => {
+            let _ = http::send_error(&mut client, 408, "Request Timeout").await;
+            return Err(anyhow::anyhow!("HTTP request timeout"));
         }
     };
+
     info!(
         "HTTP {} request: target {}:{}",
         request.method, request.address, request.port
     );
 
-    let mut remote = match connector
-        .connect_target(request.address.clone(), request.port)
-        .await
+    let write_timeout = Duration::from_secs(connector.runtime().write_timeout_secs);
+    let idle_timeout = Duration::from_secs(connector.runtime().idle_timeout_secs);
+
+    let remote = match timeout(
+        Duration::from_secs(connector.runtime().connect_timeout_secs),
+        connector.connect_target(request.address.clone(), request.port),
+    )
+    .await
     {
-        Ok(remote) => remote,
-        Err(error) => {
+        Ok(Ok(remote)) => remote,
+        Ok(Err(error)) => {
             let _ = http::send_error(&mut client, 502, "Bad Gateway").await;
-            return Err(error);
+            return Err(anyhow::anyhow!("Failed to connect to target: {}", error));
+        }
+        Err(_) => {
+            let _ = http::send_error(&mut client, 504, "Gateway Timeout").await;
+            return Err(anyhow::anyhow!("Connection timeout"));
         }
     };
 
+    let mut remote = remote;
     info!(
         "Connected to VLESS server {}",
         connector.server().endpoint()
@@ -256,16 +407,94 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     if request.is_connect {
         http::send_connect_success(&mut client).await?;
     } else if !request.initial_payload.is_empty() {
-        remote.write_all(&request.initial_payload).await?;
-        remote.flush().await?;
+        timeout(write_timeout, remote.write_all(&request.initial_payload))
+            .await
+            .map_err(|_| anyhow::anyhow!("Write timeout"))??;
+        timeout(write_timeout, remote.flush())
+            .await
+            .map_err(|_| anyhow::anyhow!("Flush timeout"))??;
     }
 
-    let (from_client, from_remote) = io::copy_bidirectional(&mut client, &mut remote).await?;
-    info!(
-        "Connection closed. client→remote: {}b, remote→client: {}b",
-        from_client, from_remote
-    );
-    Ok(())
+    let result = copy_bidirectional_with_timeouts(
+        &mut client,
+        &mut remote,
+        read_timeout,
+        write_timeout,
+        idle_timeout,
+    )
+    .await;
+
+    info!("Connection closed");
+    result.map(|_| ())
+}
+
+async fn copy_bidirectional_with_timeouts<A, B>(
+    a: &mut A,
+    b: &mut B,
+    read_timeout: Duration,
+    write_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<(u64, u64)>
+where
+    A: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+    B: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    let mut a_to_b = 0u64;
+    let mut b_to_a = 0u64;
+    let mut last_activity = Instant::now();
+    let idle_deadline = idle_timeout;
+    let mut buf_a = vec![0u8; 8192];
+    let mut buf_b = vec![0u8; 8192];
+
+    loop {
+        tokio::select! {
+            result = timeout(read_timeout, a.read(&mut buf_a)) => {
+                let n = match result {
+                    Ok(Ok(n)) => {
+                        if n == 0 {
+                            break;
+                        }
+                        n
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => return Err(anyhow::anyhow!("Read timeout from client")),
+                };
+                
+                timeout(write_timeout, b.write_all(&buf_a[..n]))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Write timeout to remote"))??;
+                b.flush().await?;
+                
+                a_to_b += n as u64;
+                last_activity = Instant::now();
+            }
+            result = timeout(read_timeout, b.read(&mut buf_b)) => {
+                let n = match result {
+                    Ok(Ok(n)) => {
+                        if n == 0 {
+                            break;
+                        }
+                        n
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => return Err(anyhow::anyhow!("Read timeout from remote")),
+                };
+                
+                timeout(write_timeout, a.write_all(&buf_b[..n]))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Write timeout to client"))??;
+                a.flush().await?;
+                
+                b_to_a += n as u64;
+                last_activity = Instant::now();
+            }
+            _ = tokio::time::sleep_until(last_activity + idle_deadline) => {
+                return Err(anyhow::anyhow!("Idle timeout"));
+            }
+        }
+    }
+
+    Ok((a_to_b, b_to_a))
 }
 
 async fn run_udp_association(

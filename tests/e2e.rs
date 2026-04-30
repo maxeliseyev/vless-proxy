@@ -8,7 +8,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
-use vproxy::{serve, socks5, vless, Config, DnsConfig, InboundConfig, ServerConfig};
+use vproxy::{
+    serve, socks5, vless, Config, DnsConfig, InboundConfig, RuntimeConfig, ServerConfig,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -226,6 +228,13 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
         dns: DnsConfig {
             mode: "remote".to_string(),
             strategy: "prefer_ipv4".to_string(),
+        },
+        runtime: RuntimeConfig {
+            connect_timeout_secs: 5,
+            read_timeout_secs: 30,
+            write_timeout_secs: 10,
+            idle_timeout_secs: 60,
+            max_connections: 100,
         },
     };
 

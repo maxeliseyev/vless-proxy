@@ -2,10 +2,13 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, Level};
-use vproxy::{serve, Config};
+use vproxy::{serve, Config, VlessUrl};
 
+#[derive(Clone)]
 struct Args {
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
+    vless_url: Option<String>,
+    inbound_port: Option<u16>,
     verbose: bool,
     check_config: bool,
 }
@@ -22,14 +25,18 @@ async fn main() -> Result<()> {
         })
         .init();
 
-    let config = Arc::new(Config::load(&args.config_path)?);
+    let config = Arc::new(load_config(args.clone())?);
     info!(
-        "Loaded config from {} (inbound: {}, security: {:?}, dns: {:?}/{:?})",
-        args.config_path.display(),
+        "Loaded config (inbound: {}, security: {:?}, dns: {:?}/{:?}, runtime: max_conn={}, timeouts: connect={}s/read={}s/write={}s/idle={}s)",
         config.inbound_addr(),
         config.transport_security()?,
         config.dns_resolve_mode()?,
-        config.dns_ip_strategy()?
+        config.dns_ip_strategy()?,
+        config.runtime.max_connections,
+        config.runtime.connect_timeout_secs,
+        config.runtime.read_timeout_secs,
+        config.runtime.write_timeout_secs,
+        config.runtime.idle_timeout_secs,
     );
 
     if args.check_config {
@@ -40,8 +47,31 @@ async fn main() -> Result<()> {
     serve(config).await
 }
 
+fn load_config(args: Args) -> Result<Config> {
+    if let Some(url_str) = args.vless_url {
+        let url = VlessUrl::parse(&url_str)?;
+        let inbound_port = args.inbound_port.unwrap_or(1080);
+        let config = Config::from_vless_url(&url, inbound_port);
+        config.validate()?;
+
+        if let Some(remark) = &url.remark {
+            info!("Using VLESS server: {}", remark);
+        }
+        info!("Server: {}:{} (TLS: {})", url.host, url.port, url.use_tls());
+
+        Ok(config)
+    } else if let Some(config_path) = args.config_path {
+        info!("Loading config from: {}", config_path.display());
+        Config::load(&config_path)
+    } else {
+        anyhow::bail!("No config provided. Use --config, --url, or provide a config path");
+    }
+}
+
 fn parse_args() -> Result<Args> {
     let mut config_path = None;
+    let mut vless_url = None;
+    let mut inbound_port = None;
     let mut verbose = false;
     let mut check_config = false;
 
@@ -54,6 +84,28 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
                 config_path = Some(PathBuf::from(value));
             }
+            Some("-u") | Some("--url") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--url requires a vless:// URL"))?;
+                vless_url = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("Invalid URL encoding"))?,
+                );
+            }
+            Some("-p") | Some("--inbound-port") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--inbound-port requires a port number"))?;
+                inbound_port = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("Invalid port encoding"))?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid port number"))?,
+                );
+            }
             Some("-v") | Some("--verbose") => verbose = true,
             Some("--check-config") => check_config = true,
             Some("-h") | Some("--help") => {
@@ -63,9 +115,15 @@ fn parse_args() -> Result<Args> {
             Some(value) if value.starts_with('-') => {
                 anyhow::bail!("Unknown argument: {value}");
             }
+            Some(value) if value.starts_with("vless://") => {
+                if vless_url.is_some() {
+                    anyhow::bail!("VLESS URL can only be provided once");
+                }
+                vless_url = Some(value.to_string());
+            }
             _ => {
-                if config_path.is_some() {
-                    anyhow::bail!("Config path can only be provided once");
+                if config_path.is_some() || vless_url.is_some() {
+                    anyhow::bail!("Config path or URL can only be provided once");
                 }
                 config_path = Some(PathBuf::from(arg));
             }
@@ -73,7 +131,9 @@ fn parse_args() -> Result<Args> {
     }
 
     Ok(Args {
-        config_path: config_path.unwrap_or_else(|| PathBuf::from("config.toml")),
+        config_path,
+        vless_url,
+        inbound_port,
         verbose,
         check_config,
     })
@@ -85,13 +145,20 @@ fn print_help() {
 vproxy - terminal VLESS client
 
 Usage:
-  vproxy [OPTIONS] [config-path]
+  vproxy [OPTIONS] [config-path|vless://...]
 
 Options:
-  -c, --config <PATH>   Path to TOML config
-  -v, --verbose         Enable debug logging
-      --check-config    Validate config and exit
-  -h, --help            Show this help
+  -c, --config <PATH>       Path to TOML config
+  -u, --url <VLESS_URL>     VLESS subscription URL (vless://...)
+  -p, --inbound-port <PORT> Local inbound port (default: 1080)
+  -v, --verbose             Enable debug logging
+      --check-config        Validate config and exit
+  -h, --help                Show this help
+
+Examples:
+  vproxy config.toml
+  vproxy --url 'vless://uuid@host:port?security=tls'
+  vproxy -u 'vless://...' -p 8080
 "
     );
 }
