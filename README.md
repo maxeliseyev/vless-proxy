@@ -119,6 +119,18 @@ use_tls = false
 security = "none"
 ```
 
+Для REALITY:
+
+```toml
+[server]
+address = "194.87.235.91"
+port = 443
+uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+security = "reality"
+reality_public_key = "T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8"
+reality_short_id = "b59cfeedfabf9f"
+```
+
 ### Runtime параметры
 
 Секция `[runtime]` управляет стабильностью и производительностью:
@@ -128,6 +140,61 @@ security = "none"
 - `write_timeout_secs` (default: 60) — таймаут записи в сокет (1 мин)
 - `idle_timeout_secs` (default: 600) — таймаут бездействия (10 мин)
 - `max_connections` (default: 1024) — лимит одновременных соединений
+
+### DNS кэш
+
+Секция `[dns.cache]` управляет кэшированием DNS-запросов:
+
+```toml
+[dns.cache]
+enabled = true          # включить/выключить кэш
+max_entries = 1000      # максимум записей в кэше
+ttl_secs = 300          # TTL по умолчанию (5 мин)
+min_ttl_secs = 30       # минимальный TTL
+max_ttl_secs = 3600     # максимальный TTL (1 час)
+```
+
+Кэш уменьшает нагрузку на system DNS и ускоряет повторные запросы.
+
+### DNS правила (Split DNS)
+
+Секция `[[dns.rules]]` позволяет настроить split DNS — разные домены резолвить по-разному:
+
+```toml
+[dns]
+mode = "remote"
+strategy = "prefer_ipv4"
+
+[dns.cache]
+enabled = true
+max_entries = 1000
+ttl_secs = 300
+
+# Российские домены — локально
+[[dns.rules]]
+domain_suffix = ".ru"
+resolve = "local"
+
+# Китайские домены — локально
+[[dns.rules]]
+domain_suffix = ".cn"
+resolve = "local"
+
+# Конкретный домен — локально
+[[dns.rules]]
+domain = "example.com"
+resolve = "local"
+
+# Всё остальное — remote (по умолчанию)
+```
+
+**Параметры правила:**
+- `domain_suffix` — суффикс домена (например, `.ru` для всех .ru доменов)
+- `domain` — точное совпадение домена
+- `domain_keyword` — ключевое слово в домене
+- `resolve` — куда отправлять: `local` или `remote`
+
+**Приоритет:** первое совпавшее правило выигрывает.
 
 ## Запуск
 
@@ -153,14 +220,19 @@ vless://uuid@host:port?security=tls&sni=example.com#remark
 
 Параметры:
 - `security` — `tls`, `reality`, или `none`
-- `sni` — опциональный SNI для TLS
+- `sni` — SNI для TLS/REALITY
 - `encryption` — тип шифрования (default: `none`)
+- `pbk` — PUBLIC_KEY для REALITY
+- `sid` — SHORT_ID для REALITY (16 hex символов)
 - Fragment (`#remark`) — название сервера (отображается в логах)
 
 Примеры URL:
 ```bash
 # TLS сервер
 vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls
+
+# REALITY сервер
+vless://uuid@host:port?security=reality&pbk=PUBLIC_KEY&sid=SHORT_ID&sni=www.example.com
 
 # С кастомным SNI
 vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls&sni=cdn.example.com

@@ -1,0 +1,45 @@
+[inbound]
+address = "127.0.0.1"
+port = 1080
+protocol = "socks5"
+
+[server]
+address = "example.com"
+port = 443
+uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+use_tls = true
+security = "tls"
+
+[dns]
+mode = "remote"
+strategy = "prefer_ipv4"
+
+# DNS cache settings
+[dns.cache]
+enabled = true
+max_entries = 1000
+ttl_secs = 300
+min_ttl_secs = 30
+max_ttl_secs = 3600
+
+# Российские домены — локально
+[[dns.rules]]
+domain_suffix = ".ru"
+resolve = "local"
+
+# Китайские домены — локально
+[[dns.rules]]
+domain_suffix = ".cn"
+resolve = "local"
+
+# Google — remote
+[[dns.rules]]
+domain_keyword = "google"
+resolve = "remote"
+
+[runtime]
+connect_timeout_secs = 10
+read_timeout_secs = 300
+write_timeout_secs = 60
+idle_timeout_secs = 600
+max_connections = 1024

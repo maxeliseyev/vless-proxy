@@ -9,7 +9,9 @@
 
 pub mod config;
 pub mod dns;
+pub mod dns_cache;
 pub mod http;
+pub mod reality;
 pub mod runtime;
 pub mod socks5;
 pub mod tls;
@@ -17,9 +19,10 @@ pub mod url;
 pub mod vless;
 
 pub use config::{
-    Config, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig, InboundProtocol,
-    RuntimeConfig, ServerConfig, TransportSecurity,
+    Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
+    InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity,
 };
-pub use dns::ResolverPolicy;
+pub use dns_cache::DnsCache;
+pub use reality::RealityClient;
 pub use runtime::{serve, ProxyClient};
 pub use url::VlessUrl;

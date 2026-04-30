@@ -9,7 +9,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use vproxy::{
-    serve, socks5, vless, Config, DnsConfig, InboundConfig, RuntimeConfig, ServerConfig,
+    serve, socks5, vless, Config, DnsCacheConfig, DnsConfig, InboundConfig, RuntimeConfig,
+    ServerConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -219,6 +220,8 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             uuid: Uuid::nil(),
             use_tls: false,
             security: "none".to_string(),
+            reality_public_key: None,
+            reality_short_id: None,
         },
         inbound: InboundConfig {
             address: Ipv4Addr::LOCALHOST.to_string(),
@@ -228,6 +231,8 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
         dns: DnsConfig {
             mode: "remote".to_string(),
             strategy: "prefer_ipv4".to_string(),
+            rules: vec![],
+            cache: DnsCacheConfig::default(),
         },
         runtime: RuntimeConfig {
             connect_timeout_secs: 5,

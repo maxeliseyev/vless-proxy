@@ -11,6 +11,9 @@ pub struct VlessUrl {
     pub sni: Option<String>,
     pub encryption: String,
     pub remark: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub flow: Option<String>,
 }
 
 impl VlessUrl {
@@ -58,6 +61,9 @@ impl VlessUrl {
             .get("encryption")
             .cloned()
             .unwrap_or_else(|| "none".to_string());
+        let reality_public_key = params.get("pbk").cloned();
+        let reality_short_id = params.get("sid").cloned();
+        let flow = params.get("flow").cloned();
 
         Ok(VlessUrl {
             uuid,
@@ -67,6 +73,9 @@ impl VlessUrl {
             sni,
             encryption,
             remark: fragment,
+            reality_public_key,
+            reality_short_id,
+            flow,
         })
     }
 

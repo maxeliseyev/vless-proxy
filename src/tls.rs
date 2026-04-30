@@ -57,6 +57,7 @@ impl TlsClient {
 pub enum MaybeTlsStream<T> {
     Plain(T),
     Tls(tokio_rustls::client::TlsStream<T>),
+    Reality(crate::reality::RealityStream<T>),
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<T> {
@@ -68,6 +69,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<T> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Reality(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -81,6 +83,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Reality(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -88,6 +91,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Reality(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -95,6 +99,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Reality(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

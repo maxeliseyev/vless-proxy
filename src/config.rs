@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub enum TransportSecurity {
     None,
     Tls,
+    Reality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,10 @@ pub struct ServerConfig {
     pub use_tls: bool,
     #[serde(default = "default_security")]
     pub security: String,
+    #[serde(default)]
+    pub reality_public_key: Option<String>,
+    #[serde(default)]
+    pub reality_short_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +70,69 @@ pub struct DnsConfig {
     pub mode: String,
     #[serde(default = "default_dns_strategy")]
     pub strategy: String,
+    #[serde(default)]
+    pub rules: Vec<DnsRule>,
+    #[serde(default)]
+    pub cache: DnsCacheConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsCacheConfig {
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_secs: u64,
+    #[serde(default = "default_cache_min_ttl")]
+    pub min_ttl_secs: u64,
+    #[serde(default = "default_cache_max_ttl")]
+    pub max_ttl_secs: u64,
+}
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            max_entries: default_cache_max_entries(),
+            ttl_secs: default_cache_ttl(),
+            min_ttl_secs: default_cache_min_ttl(),
+            max_ttl_secs: default_cache_max_ttl(),
+        }
+    }
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_max_entries() -> usize {
+    1000
+}
+
+fn default_cache_ttl() -> u64 {
+    300
+}
+
+fn default_cache_min_ttl() -> u64 {
+    30
+}
+
+fn default_cache_max_ttl() -> u64 {
+    3600
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsRule {
+    pub domain: Option<String>,
+    pub domain_suffix: Option<String>,
+    pub domain_keyword: Option<String>,
+    #[serde(default = "default_rule_resolve")]
+    pub resolve: String,
+}
+
+fn default_rule_resolve() -> String {
+    "local".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +195,8 @@ fn default_dns_config() -> DnsConfig {
     DnsConfig {
         mode: default_dns_mode(),
         strategy: default_dns_strategy(),
+        rules: vec![],
+        cache: DnsCacheConfig::default(),
     }
 }
 
@@ -209,6 +279,7 @@ impl ServerConfig {
                 }
                 Ok(TransportSecurity::Tls)
             }
+            "reality" => Ok(TransportSecurity::Reality),
             "none" | "plain" => {
                 if self.use_tls {
                     bail!("security = \"none\" requires use_tls = false");
@@ -270,6 +341,8 @@ impl Config {
             uuid: url.uuid,
             use_tls: url.use_tls(),
             security: url.security.clone(),
+            reality_public_key: url.reality_public_key.clone(),
+            reality_short_id: url.reality_short_id.clone(),
         };
 
         let inbound = InboundConfig {
@@ -281,6 +354,8 @@ impl Config {
         let dns = DnsConfig {
             mode: "remote".to_string(),
             strategy: "prefer_ipv4".to_string(),
+            rules: vec![],
+            cache: DnsCacheConfig::default(),
         };
 
         let runtime = RuntimeConfig {
@@ -312,6 +387,8 @@ mod tests {
                 uuid: Uuid::nil(),
                 use_tls: true,
                 security: "tls".to_string(),
+                reality_public_key: None,
+                reality_short_id: None,
             },
             inbound: InboundConfig {
                 address: "127.0.0.1".to_string(),
@@ -321,6 +398,8 @@ mod tests {
             dns: DnsConfig {
                 mode: "remote".to_string(),
                 strategy: "prefer_ipv4".to_string(),
+                rules: vec![],
+                cache: DnsCacheConfig::default(),
             },
             runtime: RuntimeConfig {
                 connect_timeout_secs: default_connect_timeout(),

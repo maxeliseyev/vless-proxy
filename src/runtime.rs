@@ -668,6 +668,17 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
             let tls = tls::TlsClient::new(server.address.clone())?;
             tls.connect((server.address.as_str(), server.port)).await
         }
+        TransportSecurity::Reality => {
+            let pbk = server.reality_public_key.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("REALITY requires pbk (public key)"))?;
+            let sid = server.reality_short_id.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("REALITY requires sid (short ID)"))?;
+            let sni = server.address.clone();
+            
+            let reality = crate::reality::RealityClient::new(&server.address, &sni, pbk, sid)?;
+            let stream = reality.connect((server.address.as_str(), server.port)).await?;
+            Ok(MaybeTlsStream::Reality(stream))
+        }
         TransportSecurity::None => {
             let stream = TcpStream::connect((server.address.as_str(), server.port)).await?;
             Ok(MaybeTlsStream::Plain(stream))
