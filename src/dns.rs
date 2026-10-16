@@ -116,7 +116,7 @@ impl ResolverPolicy {
         let ip_addresses: Vec<IpAddr> = addresses.iter().map(|addr| addr.ip()).collect();
         self.cache.insert(domain, ip_addresses.clone(), ttl).await;
 
-        let ip = select_ip(addresses.into_iter(), self.strategy)
+        let ip = select_ip(addresses, self.strategy)
             .ok_or_else(|| anyhow::anyhow!("No DNS answer matched strategy for {domain}"))?;
 
         Ok(match ip {
@@ -155,8 +155,8 @@ fn select_ip_from_vec(addresses: &[IpAddr], strategy: DnsIpStrategy) -> Option<I
 
     for &addr in addresses {
         match addr {
-            IpAddr::V4(ip) if ipv4.is_none() => ipv4 = Some(addr),
-            IpAddr::V6(ip) if ipv6.is_none() => ipv6 = Some(addr),
+            IpAddr::V4(_) if ipv4.is_none() => ipv4 = Some(addr),
+            IpAddr::V6(_) if ipv6.is_none() => ipv6 = Some(addr),
             _ => {}
         }
     }
