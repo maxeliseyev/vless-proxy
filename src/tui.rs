@@ -207,7 +207,11 @@ impl App {
             ]),
         ];
         frame.render_widget(
-            Paragraph::new(header).block(Block::default().borders(Borders::ALL).title(" vproxy ")),
+            Paragraph::new(header).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" vproxy {} ", env!("CARGO_PKG_VERSION"))),
+            ),
             chunks[0],
         );
 

@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         None
     };
 
+    info!("vproxy {} starting", env!("CARGO_PKG_VERSION"));
     let (mut config, servers) = load_config(args.clone())?;
     if args.tun || args.print_tun_config {
         config.tun.enabled = true;
