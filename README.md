@@ -32,9 +32,12 @@
   - работает поверх форка `rustls` с одним хуком (`ClientConfig::session_id_hook`), см. `[patch.crates-io]` в `Cargo.toml`
   - принимает `vless://` ссылки с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`
   - `vproxy --probe` делает один handshake и показывает результат
-- **XTLS Vision через xray-core sidecar**
-  - `flow=xtls-rprx-vision` пока не реализован нативно и автоматически уходит в `xray-core`
-  - для этого нужен установленный `xray-core` binary
+- **Native XTLS Vision** (`flow=xtls-rprx-vision`, `xtls-rprx-vision-udp443`)
+  - порт `proxy/proxy.go` из Xray-core: паддинг на время внутреннего TLS handshake, затем прямая пересылка TCP (direct copy) для TLS 1.3 без двойного шифрования
+  - для TLS 1.2 и не-TLS трафика паддинг завершается командой End, трафик идёт через внешний TLS как обычно
+  - REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз, поэтому момент переключения на raw-копирование известен точно
+  - UDP на порт 443 отклоняется (как в Xray), чтобы QUIC упал на TCP; `-udp443` разрешает
+- **xray-core sidecar** остаётся только для Vision поверх обычного `security=tls`
 - **минимальная DNS policy**
   - `remote` resolve по умолчанию
   - опциональный `local` resolve через system DNS
@@ -87,12 +90,16 @@
 
 `reality` содержит чистые примитивы протокола REALITY (без I/O), проверенные на векторах, сгенерированных Go-криптографией из Xray-core. `reality_tls` встраивает их в rustls: своя X25519 key-exchange группа (чтобы знать секрет key share), хук на `session_id` первого ClientHello и `ServerCertVerifier`, который принимает только сертификат, подписанный HMAC от выведенного auth key. Для этого используется форк rustls ([maxeliseyev/rustls](https://github.com/maxeliseyev/rustls), ветка `reality-0.23`) с патчем в ~75 строк.
 
+### `vision` и `vless::VlessStream`
+
+`vision` — чистая машина состояний XTLS Vision (паддинг, распаковка, классификатор TLS-трафика), покрытая тестами, включая обмен клиент/сервер между двумя экземплярами. `VlessStream` применяет её к сессии: отправляет заголовок запроса вместе с первыми данными клиента (или с пустым паддинг-блоком через 500 мс, как Xray), лениво читает заголовок ответа и переключает транспорт в direct-режим по команде пира.
+
 ### `xray_sidecar`
 
-Для `flow = "xtls-rprx-vision"` используется `xray-core` как sidecar-процесс, пока Vision не реализован нативно. Переключатель `runtime.reality_engine`:
+`xray-core` как sidecar-процесс нужен только для Vision поверх `security = "tls"` (REALITY + Vision работают нативно). Переключатель `runtime.reality_engine`:
 
-- `auto` (default) — нативный REALITY, sidecar только если нужен Vision
-- `native` — всегда нативно; конфиг с Vision отклоняется
+- `auto` (default) — нативно; sidecar только для Vision поверх plain TLS
+- `native` — всегда нативно; Vision поверх plain TLS отклоняется
 - `xray` — всегда sidecar для REALITY/Vision
 
 ### `socks5` и `http`
@@ -355,7 +362,7 @@ Options:
 
 - полноценный DNS engine / cache / DNS rules
 - MUX
-- native Rust реализация XTLS Vision (`xtls-rprx-vision`)
+- XTLS Vision поверх обычного `security = "tls"` (сейчас только REALITY)
 - мимикрия ClientHello под браузерный отпечаток (uTLS-style)
 - встроенный FFI-safe API для Swift/Objective-C
 - production-oriented service management внутри самого приложения

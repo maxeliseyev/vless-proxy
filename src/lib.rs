@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod socks5;
 pub mod tls;
 pub mod url;
+pub mod vision;
 pub mod vless;
 pub mod xray_sidecar;
 

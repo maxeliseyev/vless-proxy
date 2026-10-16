@@ -26,10 +26,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use sha2::{Sha256, Sha512};
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 use x509_parser::oid_registry::OID_SIG_ED25519;
 use x509_parser::prelude::*;
@@ -341,57 +338,6 @@ fn parse_short_id(short_id: &str) -> Result<[u8; SHORT_ID_LEN]> {
     let mut out = [0u8; SHORT_ID_LEN];
     out[..bytes.len()].copy_from_slice(&bytes);
     Ok(out)
-}
-
-/// A REALITY-authenticated TLS 1.3 stream (see [`crate::reality_tls`]).
-pub struct RealityStream<T> {
-    inner: tokio_rustls::client::TlsStream<T>,
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> RealityStream<T> {
-    pub fn new(inner: tokio_rustls::client::TlsStream<T>) -> Self {
-        Self { inner }
-    }
-
-    pub fn get_ref(&self) -> &tokio_rustls::client::TlsStream<T> {
-        &self.inner
-    }
-
-    pub fn get_mut(&mut self) -> &mut tokio_rustls::client::TlsStream<T> {
-        &mut self.inner
-    }
-
-    pub fn into_inner(self) -> tokio_rustls::client::TlsStream<T> {
-        self.inner
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }
 
 pub(crate) mod hex {

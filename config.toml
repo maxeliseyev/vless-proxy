@@ -22,8 +22,8 @@ mode = "remote"
 strategy = "prefer_ipv4"
 
 [runtime]
-# auto   = native Rust REALITY, xray-core sidecar only for flow = "xtls-rprx-vision"
-# native = always native (configs with Vision are rejected)
+# auto   = native Rust REALITY + Vision; xray-core sidecar only for Vision over plain TLS
+# native = always native (Vision over plain TLS is rejected)
 # xray   = always xray-core sidecar for REALITY / Vision
 reality_engine = "auto"
 # Path to xray-core binary for sidecar mode

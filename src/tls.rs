@@ -57,7 +57,7 @@ impl TlsClient {
 pub enum MaybeTlsStream<T> {
     Plain(T),
     Tls(tokio_rustls::client::TlsStream<T>),
-    Reality(crate::reality::RealityStream<T>),
+    Reality(crate::reality_tls::RealityStream<T>),
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<T> {
@@ -100,6 +100,24 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTlsStream::Reality(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl<T> crate::vless::XtlsDirect for MaybeTlsStream<T> {
+    fn supports_direct(&self) -> bool {
+        matches!(self, MaybeTlsStream::Reality(_))
+    }
+
+    fn switch_read_direct(&mut self) {
+        if let MaybeTlsStream::Reality(s) = self {
+            s.switch_read_direct();
+        }
+    }
+
+    fn switch_write_direct(&mut self) {
+        if let MaybeTlsStream::Reality(s) = self {
+            s.switch_write_direct();
         }
     }
 }

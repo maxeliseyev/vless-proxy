@@ -7,7 +7,8 @@ use crate::reality::RealityClient;
 use crate::reality_tls::RealityConnector;
 use crate::socks5;
 use crate::tls::{self, MaybeTlsStream};
-use crate::vless::{self, Address, Request, VlessStream};
+use crate::vision::{Vision, FLOW_VISION};
+use crate::vless::{self, Address, Request, VlessStream, XtlsDirect};
 use crate::xray_sidecar;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -21,6 +22,9 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 use tracing::{debug, error, info, warn};
+
+/// A VLESS session to the configured server, ready for relaying.
+pub type RemoteStream = VlessStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Clone)]
 pub struct ProxyClient {
@@ -50,20 +54,12 @@ impl ProxyClient {
         &self.runtime
     }
 
-    pub async fn connect_target(
-        &self,
-        address: Address,
-        port: u16,
-    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
+    pub async fn connect_target(&self, address: Address, port: u16) -> Result<RemoteStream> {
         self.connect_with_command(vless::Command::Tcp, address, port)
             .await
     }
 
-    pub async fn connect_udp_target(
-        &self,
-        address: Address,
-        port: u16,
-    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
+    pub async fn connect_udp_target(&self, address: Address, port: u16) -> Result<RemoteStream> {
         self.connect_with_command(vless::Command::Udp, address, port)
             .await
     }
@@ -73,12 +69,29 @@ impl ProxyClient {
         command: vless::Command,
         address: Address,
         port: u16,
-    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
+    ) -> Result<RemoteStream> {
         let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
 
-        let mut remote = timeout(connect_timeout, connect_remote(&self.server))
+        let vision_flow = self.server.vision_flow()?;
+        if command == vless::Command::Udp && port == 443 {
+            if let Some(flow) = vision_flow {
+                if !flow.allows_udp443() {
+                    // Like Xray: make QUIC fall back to TCP so Vision can splice it.
+                    anyhow::bail!(
+                        "XTLS rejected UDP/443 traffic (use flow xtls-rprx-vision-udp443 to allow)"
+                    );
+                }
+            }
+        }
+
+        let remote = timeout(connect_timeout, connect_remote(&self.server))
             .await
             .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+
+        // Vision applies to TCP sessions only (UDP keeps an empty flow), and
+        // needs a transport that can hand us the raw socket.
+        let use_vision =
+            command == vless::Command::Tcp && vision_flow.is_some() && remote.supports_direct();
 
         let request_address = self.resolver.resolve(address.clone(), port).await?;
         let request = Request {
@@ -86,13 +99,15 @@ impl ProxyClient {
             command,
             port,
             address: request_address.clone(),
+            flow: use_vision.then(|| FLOW_VISION.to_string()),
         };
 
-        // The server answers with the VLESS response header only together with
-        // the first downstream bytes, so the header is consumed lazily by
-        // `VlessStream` instead of being awaited here.
-        send_vless_request(&mut remote, &request).await?;
-        let remote = VlessStream::new(remote);
+        // The header is sent together with the first payload, and the response
+        // header is consumed lazily, because that is how Xray-core behaves.
+        let mut remote = VlessStream::new(remote, request.encode()?);
+        if use_vision {
+            remote = remote.with_vision(Vision::new(*self.server.uuid.as_bytes()));
+        }
         if request_address != address {
             debug!(
                 "Resolved target locally before VLESS connect: {}:{} -> {}:{}",
@@ -267,6 +282,7 @@ async fn handle_socks5_tcp_request(
         connector.server().endpoint()
     );
     socks5::send_success(&mut client).await?;
+    prime_remote(&mut client, &mut remote, write_timeout).await?;
 
     let result = copy_bidirectional_with_timeouts(
         &mut client,
@@ -432,6 +448,7 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
             .await
             .map_err(|_| anyhow::anyhow!("Flush timeout"))??;
     }
+    prime_remote(&mut client, &mut remote, write_timeout).await?;
 
     let result = copy_bidirectional_with_timeouts(
         &mut client,
@@ -738,12 +755,31 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
     }
 }
 
-async fn send_vless_request(
-    remote: &mut MaybeTlsStream<TcpStream>,
-    request: &Request,
+/// Send the VLESS request header the way Xray-core does: bundled with the
+/// first client payload, or, if none arrives within 500 ms, with an empty
+/// Vision padding block (or alone when Vision is off).
+async fn prime_remote(
+    client: &mut TcpStream,
+    remote: &mut RemoteStream,
+    write_timeout: Duration,
 ) -> Result<()> {
-    request.write_to(remote).await?;
-    remote.flush().await?;
+    if !remote.header_pending() {
+        return Ok(());
+    }
+    let mut buf = vec![0u8; 8192];
+    match timeout(Duration::from_millis(500), client.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            timeout(write_timeout, remote.write_all(&buf[..n]))
+                .await
+                .map_err(|_| anyhow::anyhow!("Write timeout to remote"))??;
+        }
+        Ok(Ok(_)) => {} // client closed already; still send the header so the relay ends cleanly
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => remote.queue_vision_camouflage(),
+    }
+    timeout(write_timeout, remote.flush())
+        .await
+        .map_err(|_| anyhow::anyhow!("Flush timeout to remote"))??;
     Ok(())
 }
 

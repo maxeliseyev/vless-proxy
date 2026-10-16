@@ -80,6 +80,14 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 12. **Native XTLS Vision (2026-10-16)**
+     - `src/vision.rs`: порт `VisionWriter`/`VisionReader`/`XtlsPadding`/`XtlsUnpadding`/`XtlsFilterTls` из `proxy/proxy.go`
+     - `RealityStream` переписан как собственный драйвер поверх `rustls::ClientConnection`, кормит его по одной TLS-записи, поэтому байты после команды Direct не теряются (у Xray это `unsafe`-доступ к `input`/`rawInput` в `tls.Conn`)
+     - `VlessStream`: заголовок запроса уходит вместе с первыми данными или пустым паддинг-блоком через 500 мс, как у Xray
+     - `flow` кодируется в addons как protobuf; UDP/443 отклоняется без `-udp443`
+     - проверено против локального xray-core 26.7.28: TLS 1.3 → direct copy в обе стороны (5 МБ, хэш совпал, ~7 МБ/с), TLS 1.2 → путь End (upload 300 КБ и download 2 МБ, хэши совпали)
+     - **Комментарий:** sidecar теперь нужен только для Vision поверх plain TLS.
+
  11. **Native REALITY (2026-10-16)**
      - `src/reality.rs`: примитивы протокола, тесты на векторах из Go-криптографии Xray-core
      - форк rustls ([maxeliseyev/rustls](https://github.com/maxeliseyev/rustls), ветка `reality-0.23`) с хуком `ClientConfig::session_id_hook`
@@ -281,15 +289,16 @@ Core логика должна жить в библиотеке, а не в би
 
 ### XTLS/REALITY и расширенные transport-режимы
 
-**REALITY реализован нативно (milestone 11). Vision пока через `xray-core` sidecar.**
+**REALITY и XTLS Vision реализованы нативно (milestones 11–12).**
 
 Что уже закрыто:
 - нативный REALITY handshake в Rust runtime (`reality.rs` + `reality_tls.rs` + форк rustls)
-- `vless://` URLs с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`
-- рабочий route для `flow=xtls-rprx-vision` через upstream `xray-core`
+- нативный Vision (`vision.rs` + `VlessStream`): паддинг, direct copy для TLS 1.3, End-путь для TLS 1.2
+- `vless://` URLs с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`, `flow`
+- `xray-core` sidecar остаётся только для Vision поверх plain TLS
 
 **Следующие шаги именно в этом порядке:**
-1. **XTLS Vision нативно** — порт `proxy/proxy.go` из Xray-core: паддинг первых записей и переход на сырую пересылку TCP после завершения внутреннего TLS 1.3 handshake. После него sidecar можно будет убрать совсем.
+1. **Vision поверх plain TLS** — нужен тот же record-драйвер для `security = "tls"` (сейчас там tokio-rustls), после чего sidecar можно убрать совсем.
 2. **Отпечаток ClientHello.** REALITY-сервер его не проверяет, но пересылает наш ClientHello на `dest` и зеркалит размеры ответа. rustls шлёт не-браузерный hello (свой набор шифров, случайный порядок расширений, без GREASE). Делать только если DPI или конкретные `dest` начнут ломать соединение.
 3. Поддерживать патч rustls маленьким, чтобы переносить его на новые 0.23.x одной командой.
 
@@ -328,7 +337,7 @@ Core логика должна жить в библиотеке, а не в би
 
 Если продолжать прямо отсюда, следующий практический milestone:
 
-1. **Native XTLS Vision** — последний кусок, ради которого ещё нужен sidecar
+1. **Проверка против реальных REALITY-серверов** (`vproxy --probe`, затем трафик) — отпечаток ClientHello может потребоваться раньше остального
 2. **Service/ops слой** — systemd/launchd примеры
 3. **MUX / transport extensions** only if still justified
 

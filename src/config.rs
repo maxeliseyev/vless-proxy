@@ -165,6 +165,21 @@ pub struct RuntimeConfig {
     pub reality_engine: String,
 }
 
+/// `server.flow` values understood natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionFlow {
+    /// `xtls-rprx-vision`: UDP to port 443 is rejected so QUIC falls back to TCP.
+    Vision,
+    /// `xtls-rprx-vision-udp443`: same, but UDP/443 is allowed through.
+    VisionUdp443,
+}
+
+impl VisionFlow {
+    pub fn allows_udp443(self) -> bool {
+        matches!(self, VisionFlow::VisionUdp443)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealityEngine {
     Auto,
@@ -287,15 +302,16 @@ impl Config {
             self.server.transport_security()?,
             TransportSecurity::Reality
         );
-        let vision = self.server.flow.as_deref() == Some("xtls-rprx-vision");
+        let vision = self.server.vision_flow()?.is_some();
         match self.runtime.reality_engine()? {
             RealityEngine::Xray => Ok(reality || vision),
-            RealityEngine::Auto => Ok(vision),
+            // Native REALITY and Vision; Vision over plain TLS still needs xray-core.
+            RealityEngine::Auto => Ok(vision && !reality),
             RealityEngine::Native => {
-                if vision {
+                if vision && !reality {
                     bail!(
-                        "flow = \"xtls-rprx-vision\" is not supported by the native engine yet; \
-                         set runtime.reality_engine = \"xray\" or \"auto\""
+                        "XTLS Vision over security = \"tls\" is not supported natively; \
+                         use security = \"reality\" or runtime.reality_engine = \"xray\""
                     );
                 }
                 Ok(false)
@@ -365,11 +381,7 @@ impl ServerConfig {
             bail!("server.flow is only supported with security = \"reality\"");
         }
 
-        if let Some(flow) = &self.flow {
-            if flow != "xtls-rprx-vision" {
-                bail!("Unsupported server.flow value: {flow}");
-            }
-        }
+        self.vision_flow()?;
 
         match self.transport_security()? {
             TransportSecurity::Tls | TransportSecurity::None => Ok(()),
@@ -409,8 +421,18 @@ impl ServerConfig {
     pub fn needs_xray_sidecar(&self) -> Result<bool> {
         Ok(
             matches!(self.transport_security()?, TransportSecurity::Reality)
-                || self.flow.as_deref() == Some("xtls-rprx-vision"),
+                || self.vision_flow()?.is_some(),
         )
+    }
+
+    /// Parsed `server.flow`; `None` for no flow control.
+    pub fn vision_flow(&self) -> Result<Option<VisionFlow>> {
+        match self.flow.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(crate::vision::FLOW_VISION) => Ok(Some(VisionFlow::Vision)),
+            Some(crate::vision::FLOW_VISION_UDP443) => Ok(Some(VisionFlow::VisionUdp443)),
+            Some(other) => bail!("Unsupported server.flow value: {other}"),
+        }
     }
 
     pub fn reality_fingerprint(&self) -> &str {
