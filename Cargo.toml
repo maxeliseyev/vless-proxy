@@ -28,6 +28,8 @@ hmac = "0.12"
 x509-parser = "0.16"
 aws-lc-rs = "1"
 libc = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [patch.crates-io]
 # vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook for REALITY.

@@ -15,20 +15,35 @@ struct Args {
     probe: bool,
     tun: bool,
     print_tun_config: bool,
+    tui: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_max_level(if args.verbose {
-            Level::DEBUG
-        } else {
-            Level::INFO
-        })
-        .init();
+    let level = if args.verbose {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
+    let tui_logs = if args.tui {
+        let logs = vproxy::tui::LogBuffer::new(1000);
+        tracing_subscriber::fmt()
+            .with_writer(vproxy::tui::LogSink(logs.clone()))
+            .with_timer(tracing_subscriber::fmt::time::uptime())
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(level)
+            .init();
+        Some(logs)
+    } else {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .with_max_level(level)
+            .init();
+        None
+    };
 
     let mut config = load_config(args.clone())?;
     if args.tun || args.print_tun_config {
@@ -75,7 +90,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    serve(config).await
+    match tui_logs {
+        Some(logs) => {
+            let server = tokio::spawn(serve(config.clone()));
+            vproxy::tui::run(config, logs, server).await
+        }
+        None => serve(config).await,
+    }
 }
 
 /// First `vless://` link in a text file (blank lines and `#` comment lines skipped).
@@ -134,6 +155,7 @@ fn parse_args() -> Result<Args> {
     let mut probe = false;
     let mut tun = false;
     let mut print_tun_config = false;
+    let mut tui = false;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -177,6 +199,7 @@ fn parse_args() -> Result<Args> {
             Some("--probe") => probe = true,
             Some("--tun") => tun = true,
             Some("--print-tun-config") => print_tun_config = true,
+            Some("--tui") => tui = true,
             Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
@@ -209,6 +232,7 @@ fn parse_args() -> Result<Args> {
         probe,
         tun,
         print_tun_config,
+        tui,
     })
 }
 
@@ -230,6 +254,7 @@ Options:
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
       --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
       --print-tun-config    Print the generated sing-box config for --tun and exit
+      --tui                 Terminal UI with live counters and logs (q to quit)
   -h, --help                Show this help
 
 Examples:
@@ -238,6 +263,7 @@ Examples:
   vproxy -u 'vless://...' -p 8080
   vproxy -f server.txt -p 1080
   sudo vproxy --tun -f server.txt
+  sudo vproxy --tui --tun -f server.txt
 "
     );
 }

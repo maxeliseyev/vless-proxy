@@ -227,6 +227,7 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             reality_short_id: None,
             flow: None,
             spider_x: None,
+            remark: None,
         },
         inbound: InboundConfig {
             address: Ipv4Addr::LOCALHOST.to_string(),

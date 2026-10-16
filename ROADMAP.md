@@ -80,6 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 14. **Минимальный TUI (2026-10-16)**
+     - `src/stats.rs`: счётчики соединений/байт/ошибок, хуки в runtime (TCP relay и UDP-сессии)
+     - `src/tui.rs`: ratatui, шапка (сервер, security/flow/sni, engine, TUN, uptime), трафик со скоростью, панель логов через перехват tracing, `q` → graceful shutdown через SIGINT
+     - `server.remark` из `#fragment` ссылки показывается как имя сервера
+     - **Комментарий:** интерфейс намеренно без управления конфигом; переключение серверов и правил — отдельный этап.
+
  13. **TUN-режим и service/ops (2026-10-16)**
      - `src/tun.rs`: генератор конфига sing-box (tun-inbound → socks-outbound на наш inbound) и sidecar-процесс, живущий вместе с сервером; `--tun`, `--print-tun-config`, секция `[tun]`
      - защита от петли: process_name (vproxy, sing-box, xray) и адрес сервера → direct, их DNS → direct; остальной DNS через туннель по умолчанию

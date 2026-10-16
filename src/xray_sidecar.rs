@@ -136,6 +136,7 @@ mod tests {
                 reality_short_id: Some("b59cfeedfabf9f".to_string()),
                 flow: Some("xtls-rprx-vision".to_string()),
                 spider_x: Some("/".to_string()),
+                remark: None,
             },
             inbound: InboundConfig {
                 address: "127.0.0.1".to_string(),

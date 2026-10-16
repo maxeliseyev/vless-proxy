@@ -6,6 +6,7 @@ use crate::http;
 use crate::reality::RealityClient;
 use crate::reality_tls::RealityConnector;
 use crate::socks5;
+use crate::stats::STATS;
 use crate::tls::{self, MaybeTlsStream};
 use crate::vision::{Vision, FLOW_VISION};
 use crate::vless::{self, Address, Request, VlessStream, XtlsDirect};
@@ -173,10 +174,12 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
 
     // Give the TUN sidecar time to restore routes/DNS before we exit.
     let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(Duration::from_secs(6), &mut tun_failed).await {
-        Ok(Err(e)) if result.is_ok() => warn!("TUN sidecar stopped with error: {e}"),
-        Err(_) => warn!("TUN sidecar did not stop in time"),
-        _ => {}
+    if config.tun.enabled {
+        match tokio::time::timeout(Duration::from_secs(6), &mut tun_failed).await {
+            Ok(Err(e)) if result.is_ok() => warn!("TUN sidecar stopped with error: {e}"),
+            Err(_) => warn!("TUN sidecar did not stop in time"),
+            _ => {}
+        }
     }
 
     result
@@ -243,11 +246,14 @@ async fn serve_socks5_with_limits(
                 let connection_count = connection_count.clone();
                 let permit = semaphore.clone().acquire_owned().await?;
 
+                STATS.connection_opened();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_socks5_connection(client, connector).await {
+                        STATS.error();
                         error!("Connection error: {}", error);
                     }
+                    STATS.connection_closed();
                     let prev = connection_count.fetch_sub(1, Ordering::Relaxed);
                     debug!("Connection closed (active: {})", prev - 1);
                 });
@@ -405,11 +411,14 @@ async fn serve_http_with_limits(
                 let connection_count = connection_count.clone();
                 let permit = semaphore.clone().acquire_owned().await?;
 
+                STATS.connection_opened();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_http_connection(client, connector).await {
+                        STATS.error();
                         error!("Connection error: {}", error);
                     }
+                    STATS.connection_closed();
                     let prev = connection_count.fetch_sub(1, Ordering::Relaxed);
                     debug!("Connection closed (active: {})", prev - 1);
                 });
@@ -529,6 +538,7 @@ where
                 b.flush().await?;
 
                 a_to_b += n as u64;
+                STATS.add_up(n);
                 last_activity = Instant::now();
             }
             result = timeout(read_timeout, b.read(&mut buf_b)) => {
@@ -549,6 +559,7 @@ where
                 a.flush().await?;
 
                 b_to_a += n as u64;
+                STATS.add_down(n);
                 last_activity = Instant::now();
             }
             _ = tokio::time::sleep_until(last_activity + idle_deadline) => {
@@ -690,6 +701,7 @@ async fn create_udp_tunnel(
                         debug!("Failed to write VLESS UDP frame: {}", error);
                         break;
                     }
+                    STATS.add_up(payload.len());
                     if let Err(error) = writer.flush().await {
                         debug!("Failed to flush VLESS UDP frame: {}", error);
                         break;
@@ -711,7 +723,10 @@ async fn create_udp_tunnel(
                 }
                 payload = vless::read_udp_frame(&mut reader) => {
                     let payload = match payload {
-                        Ok(payload) => payload,
+                        Ok(payload) => {
+                            STATS.add_down(payload.len());
+                            payload
+                        }
                         Err(error) => {
                             debug!("Failed to read VLESS UDP frame: {}", error);
                             break;

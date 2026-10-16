@@ -109,6 +109,9 @@ impl TunConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    /// Display name (the `#fragment` of a vless:// link).
+    #[serde(default)]
+    pub remark: Option<String>,
     pub address: String,
     pub port: u16,
     pub uuid: Uuid,
@@ -623,6 +626,7 @@ impl Config {
             reality_short_id: url.reality_short_id.clone(),
             flow: url.flow.clone(),
             spider_x: url.spider_x.clone(),
+            remark: url.remark.clone(),
         };
 
         let inbound = InboundConfig {
@@ -677,6 +681,7 @@ mod tests {
                 reality_short_id: None,
                 flow: None,
                 spider_x: None,
+                remark: None,
             },
             inbound: InboundConfig {
                 address: "127.0.0.1".to_string(),
