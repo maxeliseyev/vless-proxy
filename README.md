@@ -30,6 +30,8 @@
 - **Native REALITY transport** (Rust, без xray-core)
   - клиентская часть протокола REALITY портирована из Xray-core: auth key через X25519 + HKDF, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512
   - работает поверх форка `rustls` с одним хуком (`ClientConfig::session_id_hook`), см. `[patch.crates-io]` в `Cargo.toml`
+  - key share X25519MLKEM768 + X25519 (как у браузеров): современные REALITY-серверы отклоняют ClientHello без гибридной группы; ML-KEM-768 из `aws-lc-rs`, X25519-половина своя, чтобы из неё выводить auth key
+  - проверено на боевом REALITY-сервере с `flow=xtls-rprx-vision`
   - принимает `vless://` ссылки с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`
   - `vproxy --probe` делает один handshake и показывает результат
 - **Native XTLS Vision** (`flow=xtls-rprx-vision`, `xtls-rprx-vision-udp443`)

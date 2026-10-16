@@ -15,6 +15,7 @@ use crate::reality::{
     seal_session_id, session_id_plaintext, unix_time_now, RealityClient, RealityHandshake,
 };
 use anyhow::{bail, Context as _, Result};
+use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, ML_KEM_768};
 use rand::rngs::OsRng;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ClientHelloSessionIdHook, Resumption};
@@ -23,7 +24,8 @@ use rustls::crypto::{
 };
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, Error, NamedGroup, SignatureScheme,
+    ClientConfig, ClientConnection, DigitallySignedStruct, Error, NamedGroup, ProtocolVersion,
+    SignatureScheme,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -61,11 +63,22 @@ impl fmt::Debug for ConnectionSlot {
 // Key exchange
 // ---------------------------------------------------------------------------
 
-/// Secrets of key shares that have been generated but not yet consumed by the
-/// session-id hook, keyed by their public key. `SupportedKxGroup` instances
-/// must be `'static`, so this registry is how a stateless group hands the
-/// secret to the per-connection hook.
+/// Secrets of X25519 key shares that have been generated but not yet consumed
+/// by the session-id hook, keyed by the X25519 public key (for the hybrid
+/// group that is the last 32 bytes of the key share). `SupportedKxGroup`
+/// instances must be `'static`, so this registry is how a stateless group
+/// hands the secret to the per-connection hook.
 static PENDING_KEY_SHARES: Mutex<Vec<([u8; 32], [u8; 32])>> = Mutex::new(Vec::new());
+
+const ML_KEM_768_EK_LEN: usize = 1184;
+const ML_KEM_768_CT_LEN: usize = 1088;
+
+fn x25519_tail(key_share_public: &[u8]) -> Option<[u8; 32]> {
+    key_share_public
+        .get(key_share_public.len().checked_sub(32)?..)?
+        .try_into()
+        .ok()
+}
 
 fn register_key_share(public: [u8; 32], secret: [u8; 32]) {
     PENDING_KEY_SHARES
@@ -135,13 +148,127 @@ impl Drop for RealityKeyExchange {
     }
 }
 
+/// X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem): key share is
+/// `ml_kem_768_ek || x25519_pub`, the peer answers `ml_kem_ct || x25519_pub`,
+/// and the shared secret is `ml_kem_ss || x25519_ss`.
+///
+/// Current REALITY servers refuse a ClientHello without this group, and take
+/// the plain X25519 share rustls adds alongside it (see
+/// `ActiveKeyExchange::hybrid_component`) for the auth key, so the X25519
+/// half must be ours.
+#[derive(Debug)]
+struct RealityX25519MlKem768;
+
+static REALITY_X25519MLKEM768: RealityX25519MlKem768 = RealityX25519MlKem768;
+
+impl SupportedKxGroup for RealityX25519MlKem768 {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        let kem = DecapsulationKey::generate(&ML_KEM_768)
+            .map_err(|_| Error::General("ML-KEM-768 key generation failed".into()))?;
+        let ek = kem
+            .encapsulation_key()
+            .and_then(|ek| ek.key_bytes())
+            .map_err(|_| Error::General("ML-KEM-768 encapsulation key export failed".into()))?;
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let x25519_public = PublicKey::from(&secret).to_bytes();
+        let mut public = Vec::with_capacity(ML_KEM_768_EK_LEN + 32);
+        public.extend_from_slice(ek.as_ref());
+        public.extend_from_slice(&x25519_public);
+        register_key_share(x25519_public, secret.to_bytes());
+        Ok(Box::new(HybridKeyExchange {
+            kem,
+            secret,
+            x25519_public,
+            public,
+        }))
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::X25519MLKEM768
+    }
+
+    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
+        version == ProtocolVersion::TLSv1_3
+    }
+}
+
+struct HybridKeyExchange {
+    kem: DecapsulationKey,
+    secret: StaticSecret,
+    x25519_public: [u8; 32],
+    public: Vec<u8>,
+}
+
+impl HybridKeyExchange {
+    fn x25519(&self, peer: &[u8]) -> Result<[u8; 32], Error> {
+        let peer: [u8; 32] = peer
+            .try_into()
+            .map_err(|_| Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare))?;
+        let shared = self.secret.diffie_hellman(&PublicKey::from(peer));
+        if !shared.was_contributory() {
+            return Err(Error::PeerMisbehaved(
+                rustls::PeerMisbehaved::InvalidKeyShare,
+            ));
+        }
+        Ok(shared.to_bytes())
+    }
+}
+
+impl ActiveKeyExchange for HybridKeyExchange {
+    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+        if peer_pub_key.len() != ML_KEM_768_CT_LEN + 32 {
+            return Err(Error::PeerMisbehaved(
+                rustls::PeerMisbehaved::InvalidKeyShare,
+            ));
+        }
+        let (ct, x_peer) = peer_pub_key.split_at(ML_KEM_768_CT_LEN);
+        let kem_ss = self
+            .kem
+            .decapsulate(Ciphertext::from(ct))
+            .map_err(|_| Error::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare))?;
+        let x_ss = self.x25519(x_peer)?;
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(kem_ss.as_ref());
+        out.extend_from_slice(&x_ss);
+        Ok(SharedSecret::from(out.as_slice()))
+    }
+
+    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+        Some((NamedGroup::X25519, &self.x25519_public))
+    }
+
+    fn complete_hybrid_component(
+        self: Box<Self>,
+        peer_pub_key: &[u8],
+    ) -> Result<SharedSecret, Error> {
+        let x_ss = self.x25519(peer_pub_key)?;
+        Ok(SharedSecret::from(x_ss.as_slice()))
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.public
+    }
+
+    fn group(&self) -> NamedGroup {
+        NamedGroup::X25519MLKEM768
+    }
+}
+
+impl Drop for HybridKeyExchange {
+    fn drop(&mut self) {
+        let _ = take_key_share(&self.x25519_public);
+    }
+}
+
 fn reality_provider() -> Arc<CryptoProvider> {
     static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
     PROVIDER
         .get_or_init(|| {
             let base = rustls::crypto::aws_lc_rs::default_provider();
             Arc::new(CryptoProvider {
-                kx_groups: vec![&REALITY_X25519],
+                // Same order as browsers: hybrid first, classical X25519 second.
+                // rustls sends the X25519 half of the hybrid as a second key share.
+                kx_groups: vec![&REALITY_X25519MLKEM768, &REALITY_X25519],
                 ..base
             })
         })
@@ -165,7 +292,9 @@ impl ClientHelloSessionIdHook for SessionIdHook {
         key_share_public: Option<&[u8]>,
         raw_client_hello: &[u8],
     ) -> Option<[u8; 32]> {
-        let public: [u8; 32] = key_share_public?.try_into().ok()?;
+        // For X25519MLKEM768 the X25519 half is the last 32 bytes; for plain
+        // X25519 that is the whole share.
+        let public = x25519_tail(key_share_public?)?;
         let secret = take_key_share(&public)?;
         let mut handshake = self.client.begin_with_secret(secret);
         let auth_key = handshake.derive_auth_key(client_random);
@@ -605,6 +734,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::kem::EncapsulationKey;
 
     #[test]
     fn key_share_registry_hands_secret_to_hook_once() {
@@ -635,6 +765,52 @@ mod tests {
         let expected = peer.diffie_hellman(&PublicKey::from(public));
         let shared = kx.complete(PublicKey::from(&peer).as_bytes()).unwrap();
         assert_eq!(shared.secret_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn hybrid_share_is_mlkem_ek_then_x25519_and_registers_x25519_secret() {
+        let kx = REALITY_X25519MLKEM768.start().unwrap();
+        assert_eq!(kx.group(), NamedGroup::X25519MLKEM768);
+        assert_eq!(kx.pub_key().len(), ML_KEM_768_EK_LEN + 32);
+        let (group, component) = kx.hybrid_component().unwrap();
+        assert_eq!(group, NamedGroup::X25519);
+        assert_eq!(component, &kx.pub_key()[ML_KEM_768_EK_LEN..]);
+        let x_pub = x25519_tail(kx.pub_key()).unwrap();
+        let secret = take_key_share(&x_pub).expect("x25519 half registered");
+        assert_eq!(
+            PublicKey::from(&StaticSecret::from(secret)).to_bytes(),
+            x_pub
+        );
+    }
+
+    #[test]
+    fn hybrid_complete_matches_server_side_encapsulation() {
+        let kx = REALITY_X25519MLKEM768.start().unwrap();
+        let x_pub = x25519_tail(kx.pub_key()).unwrap();
+        // Server side: encapsulate to our ML-KEM key, X25519 with our public key.
+        let ek = EncapsulationKey::new(&ML_KEM_768, &kx.pub_key()[..ML_KEM_768_EK_LEN]).unwrap();
+        let (ct, kem_ss) = ek.encapsulate().unwrap();
+        let server_x = StaticSecret::random_from_rng(OsRng);
+        let x_ss = server_x.diffie_hellman(&PublicKey::from(x_pub));
+        let mut server_share = ct.as_ref().to_vec();
+        server_share.extend_from_slice(PublicKey::from(&server_x).as_bytes());
+
+        let shared = kx.complete(&server_share).unwrap();
+        let mut expected = kem_ss.as_ref().to_vec();
+        expected.extend_from_slice(x_ss.as_bytes());
+        assert_eq!(shared.secret_bytes(), expected.as_slice());
+
+        // Server picked plain X25519 instead: only the classical half is used.
+        let kx = REALITY_X25519MLKEM768.start().unwrap();
+        let x_pub = x25519_tail(kx.pub_key()).unwrap();
+        let x_ss = server_x.diffie_hellman(&PublicKey::from(x_pub));
+        let shared = kx
+            .complete_hybrid_component(PublicKey::from(&server_x).as_bytes())
+            .unwrap();
+        assert_eq!(shared.secret_bytes(), x_ss.as_bytes());
+
+        let kx = REALITY_X25519MLKEM768.start().unwrap();
+        assert!(kx.complete(&[0u8; 100]).is_err());
     }
 
     #[test]
