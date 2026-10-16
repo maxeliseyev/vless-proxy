@@ -357,6 +357,23 @@ async fn spawn_proxy_full(
     })
 }
 
+/// The mock must see the path and Host header vproxy was configured with.
+#[allow(clippy::result_large_err)]
+fn check_ws_upgrade(
+    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    assert_eq!(req.uri().path(), "/vless-test");
+    assert_eq!(
+        req.headers().get("host").and_then(|h| h.to_str().ok()),
+        Some("mock.example")
+    );
+    Ok(resp)
+}
+
 /// Like `spawn_mock_vless_server`, but speaks WebSocket (plain, no TLS).
 async fn spawn_mock_vless_ws_server<F, Fut>(handler: F) -> Result<MockServerHarness>
 where
@@ -369,19 +386,7 @@ where
         let (stream, _) = timeout(TEST_TIMEOUT, listener.accept())
             .await
             .map_err(|_| anyhow!("mock VLESS ws server accept timed out"))??;
-        let ws = tokio_tungstenite::accept_hdr_async(
-            stream,
-            |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-             resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                assert_eq!(req.uri().path(), "/vless-test");
-                assert_eq!(
-                    req.headers().get("host").and_then(|h| h.to_str().ok()),
-                    Some("mock.example")
-                );
-                Ok(resp)
-            },
-        )
-        .await?;
+        let ws = tokio_tungstenite::accept_hdr_async(stream, check_ws_upgrade).await?;
         handler(WsStream::new(ws)).await
     });
 
