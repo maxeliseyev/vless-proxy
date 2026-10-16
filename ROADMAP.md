@@ -84,6 +84,7 @@
      - поиск ссылки: `./server.txt` → `~/.config/vproxy/config.toml` → `~/.config/vproxy/server.txt`
      - интерактивный запрос `vless://` ссылки со stdin (без shell-кавычек), валидация, до трёх попыток, сохранение в `~/.config/vproxy/server.txt`
      - без терминала (launchd/systemd) — понятная ошибка вместо зависания
+     - README переписан компактно: установка, быстрый старт, конфиг, достижения; релиз v0.3.0
 
  16. **Релизы и установка (2026-10-16)**
      - `.github/workflows/ci.yml`: fmt, clippy, тесты на ubuntu и macos
