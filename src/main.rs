@@ -111,12 +111,113 @@ fn read_url_file(path: &PathBuf) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("No vless:// link found in {}", path.display()))
 }
 
+/// `~/.config/vproxy`
+fn user_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("vproxy"))
+}
+
+enum DiscoveredSource {
+    Url(String),
+    ConfigFile(PathBuf),
+}
+
+/// Without explicit arguments look for `./server.txt`, then
+/// `~/.config/vproxy/config.toml`, then `~/.config/vproxy/server.txt`.
+fn discover_source() -> Result<Option<DiscoveredSource>> {
+    let local = PathBuf::from("server.txt");
+    if local.is_file() {
+        info!("Using link from {}", local.display());
+        return Ok(Some(DiscoveredSource::Url(read_url_file(&local)?)));
+    }
+    if let Some(dir) = user_config_dir() {
+        let toml = dir.join("config.toml");
+        if toml.is_file() {
+            return Ok(Some(DiscoveredSource::ConfigFile(toml)));
+        }
+        let links = dir.join("server.txt");
+        if links.is_file() {
+            info!("Using link from {}", links.display());
+            return Ok(Some(DiscoveredSource::Url(read_url_file(&links)?)));
+        }
+    }
+    Ok(None)
+}
+
+/// Normalise a pasted link: trim, drop surrounding quotes, accept a bare value.
+fn clean_pasted_link(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| s.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(s);
+    s.trim().to_string()
+}
+
+/// First run: ask for a vless:// link on the terminal, validate it and save it
+/// to `~/.config/vproxy/server.txt` so the next start needs no arguments.
+fn ask_for_link() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "No config provided. Use --config, --url, --url-file, put a vless:// link into ./server.txt \
+             or ~/.config/vproxy/server.txt, or run vproxy in a terminal to be asked for one"
+        );
+    }
+    let mut stderr = std::io::stderr();
+    let stdin = std::io::stdin();
+    for attempt in 1..=3 {
+        write!(stderr, "Paste your vless:// link and press Enter: ")?;
+        stderr.flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            anyhow::bail!("No link entered");
+        }
+        let link = clean_pasted_link(&line);
+        match VlessUrl::parse(&link) {
+            Ok(url) => {
+                if let Some(dir) = user_config_dir() {
+                    let path = dir.join("server.txt");
+                    match std::fs::create_dir_all(&dir)
+                        .and_then(|_| std::fs::write(&path, format!("{link}\n")))
+                    {
+                        Ok(()) => info!(
+                            "Saved to {} ({}); next time just run `vproxy`",
+                            path.display(),
+                            url.remark.as_deref().unwrap_or(&url.host)
+                        ),
+                        Err(e) => eprintln!(
+                            "warning: could not save the link to {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+                return Ok(link);
+            }
+            Err(e) => {
+                eprintln!(
+                    "That does not look like a valid vless:// link ({e}). Attempt {attempt}/3."
+                );
+            }
+        }
+    }
+    anyhow::bail!("No valid vless:// link entered")
+}
+
 fn load_config(args: Args) -> Result<Config> {
-    let vless_url = match (args.vless_url, args.url_file.as_ref()) {
+    let mut vless_url = match (args.vless_url, args.url_file.as_ref()) {
         (Some(url), _) => Some(url),
         (None, Some(path)) => Some(read_url_file(path)?),
         (None, None) => None,
     };
+    let mut config_path = args.config_path;
+    if vless_url.is_none() && config_path.is_none() {
+        match discover_source()? {
+            Some(DiscoveredSource::Url(url)) => vless_url = Some(url),
+            Some(DiscoveredSource::ConfigFile(path)) => config_path = Some(path),
+            None => vless_url = Some(ask_for_link()?),
+        }
+    }
     if let Some(url_str) = vless_url {
         let url = VlessUrl::parse(&url_str)?;
         let inbound_port = args.inbound_port.unwrap_or(1080);
@@ -135,13 +236,11 @@ fn load_config(args: Args) -> Result<Config> {
         );
 
         Ok(config)
-    } else if let Some(config_path) = args.config_path {
+    } else if let Some(config_path) = config_path {
         info!("Loading config from: {}", config_path.display());
         Config::load(&config_path)
     } else {
-        anyhow::bail!(
-            "No config provided. Use --config, --url, --url-file, or provide a config path"
-        );
+        anyhow::bail!("No config provided");
     }
 }
 
@@ -248,6 +347,10 @@ vproxy - terminal VLESS client
 Usage:
   vproxy [OPTIONS] [config-path|vless://...]
 
+Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
+~/.config/vproxy/server.txt; if none exists it asks for a vless:// link (pasted as
+is, no quoting) and saves it to ~/.config/vproxy/server.txt.
+
 Options:
   -c, --config <PATH>       Path to TOML config
   -u, --url <VLESS_URL>     VLESS link (vless://...), quote it in the shell
@@ -271,4 +374,22 @@ Examples:
   sudo vproxy --tui --tun -f server.txt
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_pasted_link;
+
+    #[test]
+    fn pasted_links_are_cleaned() {
+        assert_eq!(
+            clean_pasted_link("  vless://a@b:1?x=1&y=2#n \n"),
+            "vless://a@b:1?x=1&y=2#n"
+        );
+        assert_eq!(
+            clean_pasted_link("'vless://a@b:1?x=1'"),
+            "vless://a@b:1?x=1"
+        );
+        assert_eq!(clean_pasted_link("\"vless://a@b:1\"\r\n"), "vless://a@b:1");
+    }
 }

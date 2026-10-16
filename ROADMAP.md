@@ -80,6 +80,11 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 17. **Первый запуск без аргументов (2026-10-16)**
+     - поиск ссылки: `./server.txt` → `~/.config/vproxy/config.toml` → `~/.config/vproxy/server.txt`
+     - интерактивный запрос `vless://` ссылки со stdin (без shell-кавычек), валидация, до трёх попыток, сохранение в `~/.config/vproxy/server.txt`
+     - без терминала (launchd/systemd) — понятная ошибка вместо зависания
+
  16. **Релизы и установка (2026-10-16)**
      - `.github/workflows/ci.yml`: fmt, clippy, тесты на ubuntu и macos
      - `.github/workflows/release.yml`: по тегу `v*` сборки macOS arm64, macOS x86_64 (кросс с arm64-раннера), Linux x86_64; tar.gz + sha256 в GitHub Release
@@ -368,7 +373,7 @@ Core логика должна жить в библиотеке, а не в би
 
 1. **Живая проверка `--tun`** под sudo при выключенном Happ (sing-box из Homebrew или из бандла Happ)
 2. **MUX / transport extensions** only if still justified
-3. **Переключение серверов в TUI** (несколько ссылок в `server.txt`)
+3. **Переключение серверов в TUI** (несколько ссылок в `~/.config/vproxy/server.txt`)
 3. **MUX / transport extensions** only if still justified
 
 Именно в таком порядке.

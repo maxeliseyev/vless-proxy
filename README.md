@@ -389,6 +389,14 @@ Options:
 - встроенный FFI-safe API для Swift/Objective-C
 - production-oriented service management внутри самого приложения
 
+## Быстрый старт
+
+```
+vproxy
+```
+
+Без аргументов vproxy ищет ссылку в `./server.txt`, затем `~/.config/vproxy/config.toml` или `~/.config/vproxy/server.txt`. Если ничего нет, просит вставить `vless://` ссылку прямо в терминал (кавычки не нужны, `&` и `#` обрабатываются), проверяет её и сохраняет в `~/.config/vproxy/server.txt`, так что дальше достаточно просто `vproxy`, `vproxy --tui` или `sudo vproxy --tun`.
+
 ## Установка
 
 Готовые сборки (macOS Apple Silicon, macOS Intel, Linux x86-64) публикуются в GitHub Releases:
