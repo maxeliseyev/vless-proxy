@@ -29,6 +29,28 @@ reality_engine = "auto"
 # Path to xray-core binary for sidecar mode
 xray_path = "xray"
 
+[routing]
+# Where targets go when no rule matches: "proxy" (default) or "direct".
+final = "proxy"
+# Rules are checked in order, first match wins. Inside one rule every listed
+# field must match (AND, like sing-box); keep different kinds of conditions in
+# separate rules. geoip/geosite use sing-box rule-sets and apply in TUN mode only.
+[[routing.rules]]
+outbound = "direct"
+ip_private = true
+[[routing.rules]]
+outbound = "direct"
+domain_suffix = ["ru", "su", "yandex.net"]
+[[routing.rules]]
+outbound = "direct"
+geoip = ["ru"]
+[[routing.rules]]
+outbound = "direct"
+geosite = ["category-ru"]
+# [[routing.rules]]
+# outbound = "block"
+# domain_keyword = ["ads"]
+
 [tun]
 # System-wide mode: a sing-box sidecar owns a TUN interface and forwards all
 # traffic to the SOCKS5 inbound above. Needs root (sudo) and a sing-box binary

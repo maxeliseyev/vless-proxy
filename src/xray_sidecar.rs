@@ -159,6 +159,7 @@ mod tests {
                 reality_engine: "auto".to_string(),
             },
             tun: Default::default(),
+            routing: Default::default(),
         }
     }
 

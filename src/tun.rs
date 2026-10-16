@@ -8,6 +8,7 @@
 //! server address, and those processes resolve DNS directly as well.
 
 use crate::config::{Config, InboundProtocol};
+use crate::routing::Outbound;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -93,6 +94,75 @@ pub fn build_sing_box_config(config: &Config, self_name: Option<&str>) -> Result
         route_rules.push(json!({ "ip_cidr": tun.bypass_cidrs, "outbound": "direct" }));
     }
 
+    // [routing] rules, 1:1 (same AND/OR semantics as sing-box).
+    let mut rule_sets: Vec<Value> = Vec::new();
+    for rule in &config.routing.rules {
+        let outbound = Outbound::parse(&rule.outbound)?;
+        let mut r = serde_json::Map::new();
+        if !rule.domain.is_empty() {
+            r.insert("domain".into(), json!(rule.domain));
+        }
+        if !rule.domain_suffix.is_empty() {
+            r.insert("domain_suffix".into(), json!(rule.domain_suffix));
+        }
+        if !rule.domain_keyword.is_empty() {
+            r.insert("domain_keyword".into(), json!(rule.domain_keyword));
+        }
+        if !rule.ip_cidr.is_empty() {
+            r.insert("ip_cidr".into(), json!(rule.ip_cidr));
+        }
+        if rule.ip_private {
+            r.insert("ip_is_private".into(), json!(true));
+        }
+        if !rule.port.is_empty() {
+            r.insert("port".into(), json!(rule.port));
+        }
+        let mut tags: Vec<String> = Vec::new();
+        for g in &rule.geoip {
+            let tag = format!("geoip-{g}");
+            if !rule_sets.iter().any(|s| s["tag"] == tag) {
+                rule_sets.push(json!({
+                    "type": "remote", "tag": tag, "format": "binary",
+                    "url": format!("https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-{g}.srs"),
+                    "download_detour": "proxy"
+                }));
+            }
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        for g in &rule.geosite {
+            let tag = format!("geosite-{g}");
+            if !rule_sets.iter().any(|s| s["tag"] == tag) {
+                rule_sets.push(json!({
+                    "type": "remote", "tag": tag, "format": "binary",
+                    "url": format!("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{g}.srs"),
+                    "download_detour": "proxy"
+                }));
+            }
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        if !tags.is_empty() {
+            r.insert("rule_set".into(), json!(tags));
+        }
+        match outbound {
+            Outbound::Block => {
+                r.insert("action".into(), json!("reject"));
+            }
+            other => {
+                r.insert("outbound".into(), json!(other.as_str()));
+            }
+        }
+        route_rules.push(Value::Object(r));
+    }
+    let final_outbound = if config.routing.final_outbound.trim().is_empty() {
+        Outbound::Proxy
+    } else {
+        Outbound::parse(&config.routing.final_outbound)?
+    };
+
     Ok(json!({
         "log": { "level": if tun.log_level.is_empty() { "warn" } else { tun.log_level.as_str() }, "timestamp": true },
         "dns": {
@@ -128,7 +198,8 @@ pub fn build_sing_box_config(config: &Config, self_name: Option<&str>) -> Result
         ],
         "route": {
             "auto_detect_interface": true,
-            "final": "proxy",
+            "final": final_outbound.as_str(),
+            "rule_set": rule_sets,
             "rules": route_rules
         }
     }))
@@ -227,6 +298,7 @@ mod tests {
             .iter()
             .any(|r| r["ip_cidr"] == json!(["195.60.237.42/32"]) && r["outbound"] == "direct"));
         assert_eq!(v["route"]["final"], "proxy");
+        assert_eq!(v["route"]["rule_set"].as_array().unwrap().len(), 0);
         assert_eq!(v["outbounds"][0]["server_port"], 1080);
         assert_eq!(v["dns"]["rules"][0]["server"], "dns-direct");
         assert_eq!(v["dns"]["final"], "dns-proxy");
@@ -258,5 +330,52 @@ mod tests {
             cfg("vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?security=tls");
         config.inbound.protocol = "http".to_string();
         assert!(build_sing_box_config(&config, None).is_err());
+    }
+
+    #[test]
+    fn translates_routing_rules_and_rule_sets() {
+        use crate::config::RoutingRule;
+        let mut config =
+            cfg("vless://00000000-0000-0000-0000-000000000000@1.2.3.4:443?security=tls");
+        config.routing.final_outbound = "direct".into();
+        config.routing.rules = vec![
+            RoutingRule {
+                outbound: "proxy".into(),
+                geoip: vec!["ru".into()],
+                geosite: vec!["category-ru".into(), "category-ru".into()],
+                ..Default::default()
+            },
+            RoutingRule {
+                outbound: "block".into(),
+                domain_suffix: vec!["ads.example".into()],
+                port: vec![80, 443],
+                ..Default::default()
+            },
+            RoutingRule {
+                outbound: "direct".into(),
+                ip_private: true,
+                ..Default::default()
+            },
+        ];
+        let v = build_sing_box_config(&config, Some("vproxy")).unwrap();
+        assert_eq!(v["route"]["final"], "direct");
+        let sets = v["route"]["rule_set"].as_array().unwrap();
+        assert_eq!(sets.len(), 2, "duplicate geosite tag collapsed");
+        assert!(sets.iter().any(
+            |s| s["tag"] == "geoip-ru" && s["url"].as_str().unwrap().ends_with("geoip-ru.srs")
+        ));
+        let rules = v["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(
+            |r| r["rule_set"] == json!(["geoip-ru", "geosite-category-ru"])
+                && r["outbound"] == "proxy"
+        ));
+        assert!(rules
+            .iter()
+            .any(|r| r["domain_suffix"] == json!(["ads.example"])
+                && r["port"] == json!([80, 443])
+                && r["action"] == "reject"));
+        assert!(rules
+            .iter()
+            .any(|r| r["ip_is_private"] == true && r["outbound"] == "direct"));
     }
 }

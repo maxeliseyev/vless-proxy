@@ -1,10 +1,12 @@
 use crate::config::{
-    Config, DnsConfig, InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity,
+    Config, DnsConfig, InboundProtocol, RoutingConfig, RuntimeConfig, ServerConfig,
+    TransportSecurity,
 };
 use crate::dns::ResolverPolicy;
 use crate::http;
 use crate::reality::RealityClient;
 use crate::reality_tls::RealityConnector;
+use crate::routing::{Outbound, Router};
 use crate::socks5;
 use crate::stats::STATS;
 use crate::tls::{self, MaybeTlsStream};
@@ -17,7 +19,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
@@ -27,20 +29,144 @@ use tracing::{debug, error, info, warn};
 /// A VLESS session to the configured server, ready for relaying.
 pub type RemoteStream = VlessStream<MaybeTlsStream<TcpStream>>;
 
+/// Where a TCP connection ended up after routing.
+pub enum OutboundStream {
+    Proxy(Box<RemoteStream>),
+    Direct(TcpStream),
+}
+
+impl OutboundStream {
+    pub fn is_direct(&self) -> bool {
+        matches!(self, OutboundStream::Direct(_))
+    }
+}
+
+impl AsyncRead for OutboundStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for OutboundStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Where a UDP session ended up after routing.
+pub enum UdpOutbound {
+    Proxy(Box<RemoteStream>),
+    Direct(UdpSocket),
+}
+
 #[derive(Clone)]
 pub struct ProxyClient {
     server: ServerConfig,
     resolver: ResolverPolicy,
     runtime: RuntimeConfig,
+    router: Arc<Router>,
 }
 
 impl ProxyClient {
-    pub fn new(server: ServerConfig, dns: DnsConfig, runtime: RuntimeConfig) -> Result<Self> {
+    pub fn new(
+        server: ServerConfig,
+        dns: DnsConfig,
+        runtime: RuntimeConfig,
+        routing: &RoutingConfig,
+    ) -> Result<Self> {
+        let router = Router::new(routing)?;
+        if router.has_geo_rules() {
+            warn!("routing: geoip/geosite rules are only applied in TUN mode (sing-box); the local proxy ignores them");
+        }
         Ok(Self {
             server,
             resolver: ResolverPolicy::new(dns)?,
             runtime,
+            router: Arc::new(router),
         })
+    }
+
+    pub fn router(&self) -> &Router {
+        &self.router
+    }
+
+    /// Route a TCP target: VLESS session, direct connection, or `block`.
+    pub async fn open_tcp(&self, address: Address, port: u16) -> Result<OutboundStream> {
+        match self.router.decide(&address, port) {
+            Outbound::Block => anyhow::bail!("blocked by routing rules: {address}:{port}"),
+            Outbound::Direct => {
+                debug!("route direct: {address}:{port}");
+                let stream = timeout(
+                    Duration::from_secs(self.runtime.connect_timeout_secs),
+                    TcpStream::connect(direct_target(&address, port)),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Direct connection timeout"))??;
+                Ok(OutboundStream::Direct(stream))
+            }
+            Outbound::Proxy => Ok(OutboundStream::Proxy(
+                self.connect_target(address, port).await?,
+            )),
+        }
+    }
+
+    /// Route a UDP target: VLESS UDP session, a direct connected socket, or `block`.
+    pub async fn open_udp(&self, address: Address, port: u16) -> Result<UdpOutbound> {
+        match self.router.decide(&address, port) {
+            Outbound::Block => anyhow::bail!("blocked by routing rules: {address}:{port}"),
+            Outbound::Direct => {
+                debug!("route direct (udp): {address}:{port}");
+                let target = tokio::net::lookup_host(direct_target(&address, port))
+                    .await?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("cannot resolve {address}"))?;
+                let bind: std::net::SocketAddr = if target.is_ipv4() {
+                    "0.0.0.0:0".parse().unwrap()
+                } else {
+                    "[::]:0".parse().unwrap()
+                };
+                let socket = UdpSocket::bind(bind).await?;
+                socket.connect(target).await?;
+                Ok(UdpOutbound::Direct(socket))
+            }
+            Outbound::Proxy => Ok(UdpOutbound::Proxy(Box::new(
+                self.connect_udp_target(address, port).await?,
+            ))),
+        }
     }
 
     pub fn server(&self) -> &ServerConfig {
@@ -212,6 +338,7 @@ async fn serve_socks5_with_limits(
         config.server.clone(),
         config.dns.clone(),
         config.runtime.clone(),
+        &config.routing,
     )?;
 
     info!(
@@ -295,7 +422,7 @@ async fn handle_socks5_tcp_request(
 
     let remote = match timeout(
         Duration::from_secs(connector.runtime().connect_timeout_secs),
-        connector.connect_target(request.address, request.port),
+        connector.open_tcp(request.address, request.port),
     )
     .await
     {
@@ -311,10 +438,14 @@ async fn handle_socks5_tcp_request(
     };
 
     let mut remote = remote;
-    debug!(
-        "Connected to VLESS server {}",
-        connector.server().endpoint()
-    );
+    if remote.is_direct() {
+        debug!("Connected directly");
+    } else {
+        debug!(
+            "Connected to VLESS server {}",
+            connector.server().endpoint()
+        );
+    }
     socks5::send_success(&mut client).await?;
     prime_remote(&mut client, &mut remote, write_timeout).await?;
 
@@ -377,6 +508,7 @@ async fn serve_http_with_limits(
         config.server.clone(),
         config.dns.clone(),
         config.runtime.clone(),
+        &config.routing,
     )?;
 
     info!(
@@ -454,7 +586,7 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
 
     let remote = match timeout(
         Duration::from_secs(connector.runtime().connect_timeout_secs),
-        connector.connect_target(request.address.clone(), request.port),
+        connector.open_tcp(request.address.clone(), request.port),
     )
     .await
     {
@@ -470,10 +602,14 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     };
 
     let mut remote = remote;
-    debug!(
-        "Connected to VLESS server {}",
-        connector.server().endpoint()
-    );
+    if remote.is_direct() {
+        debug!("Connected directly");
+    } else {
+        debug!(
+            "Connected to VLESS server {}",
+            connector.server().endpoint()
+        );
+    }
 
     if request.is_connect {
         http::send_connect_success(&mut client).await?;
@@ -634,7 +770,7 @@ async fn run_udp_association(
                                 // UDP/443 under Vision) must not end the whole
                                 // association; just drop this datagram.
                                 let text = error.to_string();
-                                if text.contains("XTLS rejected") {
+                                if text.contains("XTLS rejected") || text.contains("blocked by routing") {
                                     debug!("Dropping UDP to {}:{}: {}", key.0, key.1, text);
                                 } else {
                                     warn!("Failed to open UDP session to {}:{}: {}", key.0, key.1, text);
@@ -680,7 +816,12 @@ async fn create_udp_tunnel(
     client_addr: std::net::SocketAddr,
     shutdown: watch::Receiver<bool>,
 ) -> Result<UdpTunnel> {
-    let remote = connector.connect_udp_target(address.clone(), port).await?;
+    let remote = match connector.open_udp(address.clone(), port).await? {
+        UdpOutbound::Proxy(remote) => *remote,
+        UdpOutbound::Direct(udp) => {
+            return create_direct_udp_tunnel(udp, address, port, socket, client_addr, shutdown);
+        }
+    };
     let (mut reader, mut writer) = tokio::io::split(remote);
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(64);
 
@@ -818,10 +959,14 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
 /// Vision padding block (or alone when Vision is off).
 async fn prime_remote(
     client: &mut TcpStream,
-    remote: &mut RemoteStream,
+    remote: &mut OutboundStream,
     write_timeout: Duration,
 ) -> Result<()> {
-    if !remote.header_pending() {
+    let pending = match remote {
+        OutboundStream::Proxy(r) => r.header_pending(),
+        OutboundStream::Direct(_) => false,
+    };
+    if !pending {
         return Ok(());
     }
     let mut buf = vec![0u8; 8192];
@@ -833,7 +978,11 @@ async fn prime_remote(
         }
         Ok(Ok(_)) => {} // client closed already; still send the header so the relay ends cleanly
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => remote.queue_vision_camouflage(),
+        Err(_) => {
+            if let OutboundStream::Proxy(r) = remote {
+                r.queue_vision_camouflage();
+            }
+        }
     }
     timeout(write_timeout, remote.flush())
         .await
@@ -847,6 +996,89 @@ async fn wait_for_tcp_close(stream: &mut TcpStream) -> Result<()> {
         if stream.read(&mut buffer).await? == 0 {
             return Ok(());
         }
+    }
+}
+
+/// Direct UDP session: datagrams go straight to the target from this machine.
+fn create_direct_udp_tunnel(
+    udp: UdpSocket,
+    address: Address,
+    port: u16,
+    socket: Arc<UdpSocket>,
+    client_addr: std::net::SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> Result<UdpTunnel> {
+    let udp = Arc::new(udp);
+    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(64);
+
+    let writer_udp = udp.clone();
+    let mut writer_shutdown = shutdown.clone();
+    let writer_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = writer_shutdown.changed() => {
+                    if changed.is_err() || *writer_shutdown.borrow() {
+                        break;
+                    }
+                }
+                payload = receiver.recv() => {
+                    let Some(payload) = payload else { break };
+                    if let Err(error) = writer_udp.send(&payload).await {
+                        debug!("Failed to send direct UDP datagram: {}", error);
+                        break;
+                    }
+                    STATS.add_up(payload.len());
+                }
+            }
+        }
+    });
+
+    let mut reader_shutdown = shutdown;
+    let reader_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            tokio::select! {
+                changed = reader_shutdown.changed() => {
+                    if changed.is_err() || *reader_shutdown.borrow() {
+                        break;
+                    }
+                }
+                received = udp.recv(&mut buf) => {
+                    let n = match received {
+                        Ok(n) => n,
+                        Err(error) => {
+                            debug!("Failed to receive direct UDP datagram: {}", error);
+                            break;
+                        }
+                    };
+                    STATS.add_down(n);
+                    let packet = match socks5::build_udp_packet(&address, port, &buf[..n]) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            debug!("Failed to encode SOCKS5 UDP packet: {}", error);
+                            break;
+                        }
+                    };
+                    if let Err(error) = socket.send_to(&packet, client_addr).await {
+                        debug!("Failed to send SOCKS5 UDP response: {}", error);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(UdpTunnel {
+        sender,
+        writer_task,
+        reader_task,
+    })
+}
+
+fn direct_target(address: &Address, port: u16) -> String {
+    match address {
+        Address::Ipv6(ip) => format!("[{ip}]:{port}"),
+        other => format!("{other}:{port}"),
     }
 }
 

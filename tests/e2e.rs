@@ -9,8 +9,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use vproxy::{
-    serve, socks5, vless, Config, DnsCacheConfig, DnsConfig, InboundConfig, RuntimeConfig,
-    ServerConfig,
+    serve, socks5, vless, Config, DnsCacheConfig, DnsConfig, InboundConfig, RoutingConfig,
+    RoutingRule, RuntimeConfig, ServerConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -211,7 +211,58 @@ struct ObservedVlessRequest {
     port: u16,
 }
 
+#[tokio::test]
+async fn routing_direct_rule_bypasses_the_vless_server() -> Result<()> {
+    // A plain TCP echo target that must be reached without any VLESS framing.
+    let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let target_addr = target.local_addr()?;
+    let echo = tokio::spawn(async move {
+        let (mut s, _) = target.accept().await?;
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"hello");
+        s.write_all(b"world").await?;
+        s.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // The mock VLESS server must never be contacted.
+    let server = spawn_mock_vless_server(|_stream| async move {
+        panic!("direct-routed connection reached the VLESS server")
+    })
+    .await?;
+    let routing = RoutingConfig {
+        final_outbound: "proxy".to_string(),
+        rules: vec![RoutingRule {
+            outbound: "direct".to_string(),
+            ip_private: true,
+            ..Default::default()
+        }],
+    };
+    let proxy = spawn_proxy_with_routing("socks5", server.addr, routing).await?;
+
+    let mut client = timeout(TEST_TIMEOUT, TcpStream::connect(proxy.addr)).await??;
+    socks5_connect_ip(&mut client, target_addr).await?;
+    client.write_all(b"hello").await?;
+    let mut reply = [0u8; 5];
+    timeout(TEST_TIMEOUT, client.read_exact(&mut reply)).await??;
+    assert_eq!(&reply, b"world");
+
+    timeout(TEST_TIMEOUT, echo).await???;
+    proxy.stop();
+    drop(server);
+    Ok(())
+}
+
 async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHarness> {
+    spawn_proxy_with_routing(protocol, server_addr, RoutingConfig::default()).await
+}
+
+async fn spawn_proxy_with_routing(
+    protocol: &str,
+    server_addr: SocketAddr,
+    routing: RoutingConfig,
+) -> Result<ProxyHarness> {
     let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserve_port()?));
     let config = Config {
         server: ServerConfig {
@@ -250,6 +301,7 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             reality_engine: "auto".to_string(),
         },
         tun: Default::default(),
+        routing,
     };
 
     let task = tokio::spawn(async move { serve(Arc::new(config)).await });
@@ -285,6 +337,27 @@ async fn wait_for_listener(addr: SocketAddr) -> Result<()> {
         sleep(Duration::from_millis(20)).await;
     }
     Err(anyhow!("listener did not start on {addr}"))
+}
+
+async fn socks5_connect_ip(stream: &mut TcpStream, target: SocketAddr) -> Result<()> {
+    let SocketAddr::V4(target) = target else {
+        return Err(anyhow!("test expects an IPv4 target"));
+    };
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut auth_reply = [0u8; 2];
+    stream.read_exact(&mut auth_reply).await?;
+    if auth_reply != [5, 0] {
+        return Err(anyhow!("unexpected SOCKS5 auth reply: {auth_reply:?}"));
+    }
+    stream.write_all(&[5, 1, 0, 1]).await?;
+    stream.write_all(&target.ip().octets()).await?;
+    stream.write_all(&target.port().to_be_bytes()).await?;
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await?;
+    if reply[1] != socks5::Reply::Succeeded as u8 {
+        return Err(anyhow!("unexpected SOCKS5 connect reply: {reply:?}"));
+    }
+    Ok(())
 }
 
 async fn socks5_connect(stream: &mut TcpStream, host: &str, port: u16) -> Result<()> {

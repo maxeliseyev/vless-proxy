@@ -13,6 +13,7 @@ pub mod dns_cache;
 pub mod http;
 pub mod reality;
 pub mod reality_tls;
+pub mod routing;
 pub mod runtime;
 pub mod socks5;
 pub mod stats;
@@ -26,7 +27,8 @@ pub mod xray_sidecar;
 
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
-    InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity, TunConfig,
+    InboundProtocol, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, TransportSecurity,
+    TunConfig,
 };
 pub use dns_cache::DnsCache;
 pub use reality::RealityClient;

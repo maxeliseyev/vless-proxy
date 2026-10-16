@@ -40,6 +40,9 @@
   - REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз, поэтому момент переключения на raw-копирование известен точно
   - UDP на порт 443 отклоняется (как в Xray), чтобы QUIC упал на TCP; `-udp443` разрешает
 - **xray-core sidecar** остаётся только для Vision поверх обычного `security=tls`
+- **Routing-правила** (`[routing]`): `direct` / `proxy` / `block` по `domain`, `domain_suffix`, `domain_keyword`, `ip_cidr`, `ip_private`, `port`; `geoip`/`geosite` через rule-set sing-box в TUN-режиме. Семантика правил как у sing-box: поля внутри правила — AND, списки — OR, первое совпадение побеждает, `final` для остального
+  - в локальном режиме vproxy сам открывает direct-соединения (TCP и UDP) мимо сервера
+  - в TUN-режиме те же правила транслируются в конфиг sing-box один в один
 - **TUI** (`--tui`): сервер и режим, активные соединения, трафик и скорость ↑↓, последние логи; `q` корректно останавливает прокси и sing-box. Совместим с `--tun`.
 - **TUN-режим (весь системный трафик)** через `sing-box` sidecar: `sudo vproxy --tun ...`
   - sing-box держит TUN-интерфейс и отдаёт всё в локальный SOCKS5 vproxy, как это устроено в Happ
@@ -108,6 +111,10 @@
 - `auto` (default) — нативно; sidecar только для Vision поверх plain TLS
 - `native` — всегда нативно; Vision поверх plain TLS отклоняется
 - `xray` — всегда sidecar для REALITY/Vision
+
+### `routing`
+
+`routing.rs` компилирует `[routing]` в матчер и принимает решение для каждой TCP/UDP-сессии до подключения к серверу: `proxy` (VLESS), `direct` (vproxy подключается сам, домены резолвятся системным DNS) или `block`. IP-правила сравниваются только с IP-целями: при `dns.mode = "remote"` домен уходит на сервер нерезолвленным и по `ip_cidr` не матчится. В TUN-режиме `tun.rs` транслирует те же правила в sing-box, где дополнительно работают `geoip`/`geosite` (rule-set `SagerNet/sing-geoip` и `sing-geosite`, скачиваются через прокси). Пример набора правил «российские сайты и локальная сеть напрямую» есть в `config.toml`.
 
 ### `stats` и `tui`
 

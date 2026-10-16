@@ -41,6 +41,42 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub tun: TunConfig,
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+/// Per-connection routing (see `routing.rs`); also translated for sing-box in TUN mode.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// `proxy` (default) or `direct` for targets no rule matches.
+    #[serde(rename = "final")]
+    pub final_outbound: String,
+    pub rules: Vec<RoutingRule>,
+}
+
+/// One rule: every listed field must match (AND), lists are OR, first match wins.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingRule {
+    /// `proxy` | `direct` | `block`
+    pub outbound: String,
+    pub domain: Vec<String>,
+    pub domain_suffix: Vec<String>,
+    pub domain_keyword: Vec<String>,
+    pub ip_cidr: Vec<String>,
+    pub ip_private: bool,
+    pub port: Vec<u16>,
+    /// sing-box rule-set tags such as `ru`, `cn` (TUN mode only).
+    pub geoip: Vec<String>,
+    /// sing-box rule-set tags such as `category-ru` (TUN mode only).
+    pub geosite: Vec<String>,
+}
+
+impl RoutingConfig {
+    pub fn is_default(&self) -> bool {
+        self.rules.is_empty() && (self.final_outbound.is_empty() || self.final_outbound == "proxy")
+    }
 }
 
 /// System-wide mode through a `sing-box` TUN sidecar (see `tun.rs`).
@@ -410,6 +446,7 @@ impl Config {
         self.dns.resolve_mode()?;
         self.needs_xray_sidecar()?;
         self.tun.validate()?;
+        crate::routing::Router::new(&self.routing)?;
         if self.tun.enabled && !matches!(self.inbound.protocol_kind()?, InboundProtocol::Socks5) {
             bail!("tun.enabled requires inbound.protocol = \"socks5\"");
         }
@@ -658,6 +695,7 @@ impl Config {
             dns,
             runtime,
             tun: TunConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -704,6 +742,7 @@ mod tests {
                 reality_engine: default_reality_engine(),
             },
             tun: TunConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 

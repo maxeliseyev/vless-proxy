@@ -80,6 +80,13 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 15. **Routing-правила (2026-10-16)**
+     - `src/routing.rs`: `[routing]` с семантикой sing-box (AND внутри правила, OR в списках, первое совпадение); direct/proxy/block по domain*, ip_cidr, ip_private, port
+     - runtime: `OutboundStream`/`UdpOutbound` — direct TCP и UDP мимо сервера, block → отказ
+     - `tun.rs`: трансляция 1:1 в sing-box плюс `geoip`/`geosite` как remote rule-set; `block` → `action: reject`; проверено `sing-box check`
+     - e2e-тест: direct-правило не касается VLESS-сервера
+     - **Комментарий:** geoip/geosite локально не реализованы намеренно: в локальном режиме это редко нужно, а в TUN их делает sing-box.
+
  14. **Минимальный TUI (2026-10-16)**
      - `src/stats.rs`: счётчики соединений/байт/ошибок, хуки в runtime (TCP relay и UDP-сессии)
      - `src/tui.rs`: ratatui, шапка (сервер, security/flow/sni, engine, TUN, uptime), трафик со скоростью, панель логов через перехват tracing, `q` → graceful shutdown через SIGINT
@@ -354,7 +361,7 @@ Core логика должна жить в библиотеке, а не в би
 Если продолжать прямо отсюда, следующий практический milestone:
 
 1. **Живая проверка `--tun`** под sudo при выключенном Happ (sing-box из Homebrew или из бандла Happ)
-2. **Routing-правила** (domain/geoip → direct/proxy) — сейчас только bypass-списки в `[tun]`; у Happ это шаблоны `routing.rules`
+2. **GitHub Actions релизы** (macOS arm64/x86_64, Linux x86_64) и `install.sh`
 3. **MUX / transport extensions** only if still justified
 3. **MUX / transport extensions** only if still justified
 
