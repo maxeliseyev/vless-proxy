@@ -181,7 +181,10 @@ mod tests {
         list.persist_first(2).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         // unknown lines are kept (never destroy the user's file), comments stay on top
-        assert_eq!(content, format!("# my servers\n{C}\n{A}\nnot a link\n{B}\n"));
+        assert_eq!(
+            content,
+            format!("# my servers\n{C}\n{A}\nnot a link\n{B}\n")
+        );
 
         let reloaded = ServerList::from_file(&path, 1080).unwrap();
         assert_eq!(reloaded.entries[0].name, "1.2.3.4:443");
