@@ -185,10 +185,19 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
         }
         _ = shutdown.changed() => {
             info!("Stopping sing-box TUN sidecar");
-            if let Err(e) = child.start_kill() {
-                warn!("Failed to signal sing-box: {e}");
+            // SIGTERM lets sing-box remove its routes and DNS settings;
+            // tokio's kill() would be SIGKILL.
+            if let Some(pid) = child.id() {
+                // SAFETY: plain syscall on a pid we own.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
             }
-            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!("sing-box did not exit after SIGTERM, killing it");
+                    let _ = child.kill().await;
+                }
+            }
             Ok(())
         }
     }

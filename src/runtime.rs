@@ -146,23 +146,38 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
             serve_with_shutdown(config.clone(), shutdown_rx.clone()).await
         }
     };
-    let tun = async {
-        if config.tun.enabled {
-            crate::tun::run(config.clone(), shutdown_rx.clone()).await
-        } else {
-            std::future::pending().await
+    let mut tun_task = config
+        .tun
+        .enabled
+        .then(|| tokio::spawn(crate::tun::run(config.clone(), shutdown_rx.clone())));
+    let tun_failed = async {
+        match tun_task.as_mut() {
+            Some(task) => match task.await {
+                Ok(result) => result,
+                Err(e) => Err(anyhow::anyhow!("TUN sidecar task failed: {e}")),
+            },
+            None => std::future::pending().await,
         }
     };
+    tokio::pin!(tun_failed);
 
     let result = tokio::select! {
         result = core => result,
-        result = tun => result,
+        result = &mut tun_failed => result,
         _ = shutdown_signal => {
             info!("Shutdown signal received, stopping server");
             let _ = shutdown_tx.send(true);
             Ok(())
         }
     };
+
+    // Give the TUN sidecar time to restore routes/DNS before we exit.
+    let _ = shutdown_tx.send(true);
+    match tokio::time::timeout(Duration::from_secs(6), &mut tun_failed).await {
+        Ok(Err(e)) if result.is_ok() => warn!("TUN sidecar stopped with error: {e}"),
+        Err(_) => warn!("TUN sidecar did not stop in time"),
+        _ => {}
+    }
 
     result
 }
@@ -250,7 +265,7 @@ async fn handle_socks5_connection(mut client: TcpStream, connector: ProxyClient)
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timeout"))??;
 
-    info!(
+    debug!(
         "SOCKS5 {:?} request: target {}:{}",
         request.command, request.address, request.port
     );
@@ -290,7 +305,7 @@ async fn handle_socks5_tcp_request(
     };
 
     let mut remote = remote;
-    info!(
+    debug!(
         "Connected to VLESS server {}",
         connector.server().endpoint()
     );
@@ -306,7 +321,7 @@ async fn handle_socks5_tcp_request(
     )
     .await;
 
-    info!("Connection closed");
+    debug!("Connection closed");
     result.map(|_| ())
 }
 
@@ -321,7 +336,7 @@ async fn handle_socks5_udp_associate(
     let bind_addr = udp_socket.local_addr()?;
 
     socks5::send_success_with_addr(&mut control, bind_addr).await?;
-    info!(
+    debug!(
         "SOCKS5 UDP association ready on {} for client hint {}:{}",
         bind_addr, request.address, request.port
     );
@@ -420,7 +435,7 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
         }
     };
 
-    info!(
+    debug!(
         "HTTP {} request: target {}:{}",
         request.method, request.address, request.port
     );
@@ -446,7 +461,7 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     };
 
     let mut remote = remote;
-    info!(
+    debug!(
         "Connected to VLESS server {}",
         connector.server().endpoint()
     );
@@ -472,7 +487,7 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     )
     .await;
 
-    info!("Connection closed");
+    debug!("Connection closed");
     result.map(|_| ())
 }
 
@@ -592,7 +607,7 @@ async fn run_udp_association(
 
                 loop {
                     if !tunnels.contains_key(&key) {
-                        let tunnel = create_udp_tunnel(
+                        let tunnel = match create_udp_tunnel(
                             connector.clone(),
                             key.0.clone(),
                             key.1,
@@ -600,7 +615,22 @@ async fn run_udp_association(
                             client_addr,
                             shutdown.clone(),
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(tunnel) => tunnel,
+                            Err(error) => {
+                                // One destination failing (or being refused, e.g.
+                                // UDP/443 under Vision) must not end the whole
+                                // association; just drop this datagram.
+                                let text = error.to_string();
+                                if text.contains("XTLS rejected") {
+                                    debug!("Dropping UDP to {}:{}: {}", key.0, key.1, text);
+                                } else {
+                                    warn!("Failed to open UDP session to {}:{}: {}", key.0, key.1, text);
+                                }
+                                break;
+                            }
+                        };
                         tunnels.insert(key.clone(), tunnel);
                     }
 
