@@ -15,6 +15,7 @@ pub mod reality;
 pub mod reality_tls;
 pub mod routing;
 pub mod runtime;
+pub mod servers;
 pub mod socks5;
 pub mod stats;
 pub mod tls;
@@ -34,5 +35,6 @@ pub use config::{
 };
 pub use dns_cache::DnsCache;
 pub use reality::RealityClient;
-pub use runtime::{serve, ProxyClient};
+pub use runtime::{serve, serve_with_server, ActiveServer, ProxyClient};
+pub use servers::{ServerEntry, ServerList};
 pub use url::VlessUrl;

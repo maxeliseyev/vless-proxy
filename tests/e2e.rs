@@ -10,8 +10,8 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use vproxy::ws::WsStream;
 use vproxy::{
-    serve, socks5, vless, Config, DnsCacheConfig, DnsConfig, InboundConfig, RoutingConfig,
-    RoutingRule, RuntimeConfig, ServerConfig,
+    serve, serve_with_server, socks5, vless, ActiveServer, Config, DnsCacheConfig, DnsConfig,
+    InboundConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -213,6 +213,54 @@ struct ObservedVlessRequest {
 }
 
 #[tokio::test]
+async fn switching_the_active_server_affects_new_sessions_only() -> Result<()> {
+    let echo = |tag: &'static [u8]| {
+        move |mut stream: TcpStream| async move {
+            let _ = read_vless_request(&mut stream).await?;
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).await?;
+            send_vless_response(&mut stream).await?;
+            stream.write_all(tag).await?;
+            stream.flush().await?;
+            Ok(())
+        }
+    };
+    let server_a = spawn_mock_vless_server(echo(b"AAAA")).await?;
+    let server_b = spawn_mock_vless_server(echo(b"BBBB")).await?;
+    let (proxy, active, config) = spawn_switchable_proxy(server_a.addr).await?;
+
+    let ask = |proxy_addr: SocketAddr| async move {
+        let mut client = timeout(TEST_TIMEOUT, TcpStream::connect(proxy_addr)).await??;
+        socks5_connect(&mut client, "echo.example", 7000).await?;
+        client.write_all(b"ping").await?;
+        let mut reply = [0u8; 4];
+        timeout(TEST_TIMEOUT, client.read_exact(&mut reply)).await??;
+        Ok::<_, anyhow::Error>(reply)
+    };
+
+    assert_eq!(&ask(proxy.addr).await?, b"AAAA");
+
+    let mut server_b_config = config.server.clone();
+    server_b_config.address = server_b.addr.ip().to_string();
+    server_b_config.port = server_b.addr.port();
+    active.swap(server_b_config, &config)?;
+    assert_eq!(&ask(proxy.addr).await?, b"BBBB");
+
+    // A server that needs the xray sidecar is refused and the active one stays.
+    let mut needs_sidecar = config.server.clone();
+    needs_sidecar.use_tls = true;
+    needs_sidecar.security = "tls".to_string();
+    needs_sidecar.flow = Some("xtls-rprx-vision".to_string());
+    assert!(active.swap(needs_sidecar, &config).is_err());
+    assert_eq!(active.get().port, server_b.addr.port());
+
+    server_a.finish().await?;
+    server_b.finish().await?;
+    proxy.stop();
+    Ok(())
+}
+
+#[tokio::test]
 async fn websocket_transport_carries_the_vless_session() -> Result<()> {
     let server = spawn_mock_vless_ws_server(|mut stream| async move {
         let request = read_vless_request(&mut stream).await?;
@@ -306,7 +354,52 @@ async fn spawn_proxy_full(
     transport: &str,
 ) -> Result<ProxyHarness> {
     let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserve_port()?));
-    let config = Config {
+    let config = proxy_config(protocol, proxy_addr, server_addr, routing, transport);
+    let task = tokio::spawn(async move { serve(Arc::new(config)).await });
+    wait_for_listener(proxy_addr).await?;
+    Ok(ProxyHarness {
+        addr: proxy_addr,
+        task,
+    })
+}
+
+/// Proxy whose active server can be swapped at runtime.
+async fn spawn_switchable_proxy(
+    server_addr: SocketAddr,
+) -> Result<(ProxyHarness, ActiveServer, Config)> {
+    let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserve_port()?));
+    let config = proxy_config(
+        "socks5",
+        proxy_addr,
+        server_addr,
+        RoutingConfig::default(),
+        "tcp",
+    );
+    let active = ActiveServer::new(config.server.clone());
+    let config = Arc::new(config);
+    let task = {
+        let (config, active) = (config.clone(), active.clone());
+        tokio::spawn(async move { serve_with_server(config, active).await })
+    };
+    wait_for_listener(proxy_addr).await?;
+    Ok((
+        ProxyHarness {
+            addr: proxy_addr,
+            task,
+        },
+        active,
+        (*config).clone(),
+    ))
+}
+
+fn proxy_config(
+    protocol: &str,
+    proxy_addr: SocketAddr,
+    server_addr: SocketAddr,
+    routing: RoutingConfig,
+    transport: &str,
+) -> Config {
+    Config {
         server: ServerConfig {
             address: server_addr.ip().to_string(),
             port: server_addr.port(),
@@ -347,14 +440,7 @@ async fn spawn_proxy_full(
         },
         tun: Default::default(),
         routing,
-    };
-
-    let task = tokio::spawn(async move { serve(Arc::new(config)).await });
-    wait_for_listener(proxy_addr).await?;
-    Ok(ProxyHarness {
-        addr: proxy_addr,
-        task,
-    })
+    }
 }
 
 /// The mock must see the path and Host header vproxy was configured with.

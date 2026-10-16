@@ -94,9 +94,47 @@ pub enum UdpOutbound {
     Direct(UdpSocket),
 }
 
+/// The server new sessions are opened to. Swappable at runtime: existing
+/// sessions keep their server, new ones use the replacement.
+#[derive(Clone)]
+pub struct ActiveServer(Arc<std::sync::RwLock<ServerConfig>>);
+
+impl ActiveServer {
+    pub fn new(server: ServerConfig) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(server)))
+    }
+
+    pub fn get(&self) -> ServerConfig {
+        self.0.read().expect("active server lock poisoned").clone()
+    }
+
+    /// Validate `server` in the context of `config` (same inbound, dns,
+    /// runtime, routing) and make it the active one. Servers that need the
+    /// xray-core sidecar cannot be switched to live.
+    pub fn swap(&self, server: ServerConfig, config: &Config) -> Result<()> {
+        let mut probe = config.clone();
+        probe.server = server;
+        probe.validate()?;
+        if probe.needs_xray_sidecar()? {
+            anyhow::bail!(
+                "{} needs the xray-core sidecar; restart vproxy with it as the first server",
+                probe.server.endpoint()
+            );
+        }
+        let name = probe
+            .server
+            .remark
+            .clone()
+            .unwrap_or_else(|| probe.server.endpoint());
+        *self.0.write().expect("active server lock poisoned") = probe.server;
+        info!("Switched to server {name}");
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyClient {
-    server: ServerConfig,
+    server: ActiveServer,
     resolver: ResolverPolicy,
     runtime: RuntimeConfig,
     router: Arc<Router>,
@@ -104,7 +142,7 @@ pub struct ProxyClient {
 
 impl ProxyClient {
     pub fn new(
-        server: ServerConfig,
+        server: ActiveServer,
         dns: DnsConfig,
         runtime: RuntimeConfig,
         routing: &RoutingConfig,
@@ -170,8 +208,9 @@ impl ProxyClient {
         }
     }
 
-    pub fn server(&self) -> &ServerConfig {
-        &self.server
+    /// Snapshot of the currently active server.
+    pub fn server(&self) -> ServerConfig {
+        self.server.get()
     }
 
     pub fn dns_policy(&self) -> &ResolverPolicy {
@@ -199,8 +238,9 @@ impl ProxyClient {
         port: u16,
     ) -> Result<RemoteStream> {
         let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
+        let server = self.server.get();
 
-        let vision_flow = self.server.vision_flow()?;
+        let vision_flow = server.vision_flow()?;
         if command == vless::Command::Udp && port == 443 {
             if let Some(flow) = vision_flow {
                 if !flow.allows_udp443() {
@@ -212,7 +252,7 @@ impl ProxyClient {
             }
         }
 
-        let remote = timeout(connect_timeout, connect_remote(&self.server))
+        let remote = timeout(connect_timeout, connect_remote(&server))
             .await
             .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
 
@@ -223,7 +263,7 @@ impl ProxyClient {
 
         let request_address = self.resolver.resolve(address.clone(), port).await?;
         let request = Request {
-            uuid: self.server.uuid,
+            uuid: server.uuid,
             command,
             port,
             address: request_address.clone(),
@@ -234,7 +274,7 @@ impl ProxyClient {
         // header is consumed lazily, because that is how Xray-core behaves.
         let mut remote = VlessStream::new(remote, request.encode()?);
         if use_vision {
-            remote = remote.with_vision(Vision::new(*self.server.uuid.as_bytes()));
+            remote = remote.with_vision(Vision::new(*server.uuid.as_bytes()));
         }
         if request_address != address {
             debug!(
@@ -248,6 +288,13 @@ impl ProxyClient {
 }
 
 pub async fn serve(config: Arc<Config>) -> Result<()> {
+    let active = ActiveServer::new(config.server.clone());
+    serve_with_server(config, active).await
+}
+
+/// Like [`serve`], with an [`ActiveServer`] handle the caller can use to
+/// switch servers while running (the TUI does this).
+pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let use_sidecar = xray_sidecar::should_use(config.as_ref())?;
 
@@ -271,7 +318,7 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         if use_sidecar {
             xray_sidecar::run(config.clone()).await
         } else {
-            serve_with_shutdown(config.clone(), shutdown_rx.clone()).await
+            serve_with_shutdown(config.clone(), active.clone(), shutdown_rx.clone()).await
         }
     };
     let mut tun_task = config
@@ -312,35 +359,40 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
     result
 }
 
-async fn serve_with_shutdown(config: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn serve_with_shutdown(
+    config: Arc<Config>,
+    active: ActiveServer,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let max_connections = config.runtime.max_connections;
     let semaphore = Arc::new(Semaphore::new(max_connections));
+    let connector = ProxyClient::new(
+        active,
+        config.dns.clone(),
+        config.runtime.clone(),
+        &config.routing,
+    )?;
 
     match config.inbound_protocol()? {
         InboundProtocol::Socks5 => {
-            serve_socks5_with_limits(config, shutdown, connection_count, semaphore).await
+            serve_socks5_with_limits(config, connector, shutdown, connection_count, semaphore).await
         }
         InboundProtocol::Http => {
-            serve_http_with_limits(config, shutdown, connection_count, semaphore).await
+            serve_http_with_limits(config, connector, shutdown, connection_count, semaphore).await
         }
     }
 }
 
 async fn serve_socks5_with_limits(
     config: Arc<Config>,
+    connector: ProxyClient,
     mut shutdown: watch::Receiver<bool>,
     connection_count: Arc<AtomicUsize>,
     semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(
-        config.server.clone(),
-        config.dns.clone(),
-        config.runtime.clone(),
-        &config.routing,
-    )?;
 
     info!(
         "Listening on {} (inbound: {}, max_connections: {})",
@@ -499,18 +551,13 @@ async fn handle_socks5_udp_associate(
 
 async fn serve_http_with_limits(
     config: Arc<Config>,
+    connector: ProxyClient,
     mut shutdown: watch::Receiver<bool>,
     connection_count: Arc<AtomicUsize>,
     semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(
-        config.server.clone(),
-        config.dns.clone(),
-        config.runtime.clone(),
-        &config.routing,
-    )?;
 
     info!(
         "Listening on {} (inbound: {}, max_connections: {})",

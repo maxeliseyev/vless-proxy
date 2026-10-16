@@ -80,6 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 19. **Переключение серверов в TUI (2026-10-16)**
+     - `src/servers.rs`: список серверов из файла ссылок (невалидные строки пропускаются с warning), выбранный записывается первым
+     - `runtime::ActiveServer`: активный сервер в `RwLock`, `ProxyClient` берёт снимок на каждое соединение; `swap` валидирует и отвергает серверы, которым нужен sidecar
+     - TUI: панель серверов (появляется при ≥2), ↑↓/jk и Enter; listener и sing-box не перезапускаются, старые соединения доживают
+     - e2e-тест: первое соединение к A, после `swap` — к B, sidecar-сервер отвергается; живая проверка в pty на двух боевых серверах
+
  18. **WebSocket-транспорт и импорт Xray JSON (2026-10-16)**
      - `src/ws.rs`: WS поверх TLS или TCP через tokio-tungstenite (без его TLS), бинарные фреймы, адаптер AsyncRead/AsyncWrite; `type=ws` + `path`/`host` в ссылках, `server.transport`/`ws_path`/`ws_host` в TOML
      - `src/xray_import.rs`: `vproxy -c happ.json` — vless-outbound, socks-inbound, `routing.rules` (domain:/full:/keyword:/geosite:, geoip:, cidr, порты)
@@ -380,7 +386,7 @@ Core логика должна жить в библиотеке, а не в би
 
 1. **Живая проверка `--tun`** под sudo при выключенном Happ (sing-box из Homebrew или из бандла Happ)
 2. **MUX / transport extensions** only if still justified
-3. **Переключение серверов в TUI** (несколько ссылок в `~/.config/vproxy/server.txt`)
+3. **Добавление сервера из TUI** (вставить ссылку, не выходя из интерфейса) и удаление
 3. **MUX / transport extensions** only if still justified
 
 Именно в таком порядке.

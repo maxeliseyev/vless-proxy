@@ -2,13 +2,15 @@
 //! `q` (or Esc / Ctrl-C) shuts the proxy down gracefully.
 
 use crate::config::Config;
+use crate::runtime::ActiveServer;
+use crate::servers::ServerList;
 use crate::stats::{human_bytes, Snapshot, STATS};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::VecDeque;
 use std::io;
@@ -90,6 +92,10 @@ impl<'a> MakeWriter<'a> for LogSink {
 
 struct App {
     config: Arc<Config>,
+    servers: ServerList,
+    active: ActiveServer,
+    active_index: usize,
+    selected: usize,
     logs: Arc<LogBuffer>,
     started: Instant,
     last: Snapshot,
@@ -112,18 +118,52 @@ impl App {
         }
     }
 
+    fn select(&mut self, delta: i32) {
+        let n = self.servers.len() as i32;
+        if n == 0 {
+            return;
+        }
+        self.selected = ((self.selected as i32 + delta).rem_euclid(n)) as usize;
+    }
+
+    fn switch_to_selected(&mut self) {
+        let Some(entry) = self.servers.entries.get(self.selected) else {
+            return;
+        };
+        if self.selected == self.active_index {
+            self.status = format!("{} is already active", entry.name);
+            return;
+        }
+        match self.active.swap(entry.server.clone(), &self.config) {
+            Ok(()) => {
+                self.active_index = self.selected;
+                self.status = format!("switched to {} (new connections only)", entry.name);
+                if let Err(e) = self.servers.persist_first(self.selected) {
+                    self.status = format!("switched to {}; not saved: {e}", entry.name);
+                }
+            }
+            Err(e) => self.status = format!("cannot switch: {e}"),
+        }
+    }
+
     fn draw(&self, frame: &mut Frame) {
+        let list_height = if self.servers.len() > 1 {
+            (self.servers.len() as u16 + 2).min(8)
+        } else {
+            0
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(5),
+                Constraint::Length(list_height),
                 Constraint::Length(3),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
             .split(frame.area());
 
-        let server = &self.config.server;
+        let server = &self.active.get();
         let name = server
             .remark
             .as_deref()
@@ -171,6 +211,42 @@ impl App {
             chunks[0],
         );
 
+        if list_height > 0 {
+            let items: Vec<ListItem> = self
+                .servers
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let marker = if i == self.active_index { "● " } else { "  " };
+                    let line = format!(
+                        "{marker}{:<28} {:<16} {}",
+                        e.name,
+                        e.server.endpoint(),
+                        e.kind()
+                    );
+                    let style = if i == self.active_index {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::from(Span::styled(line, style)))
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(self.selected));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" servers (↑↓ select, Enter switch) "),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▶ ");
+            frame.render_stateful_widget(list, chunks[1], &mut state);
+        }
+
         let s = STATS.snapshot();
         let stats = Line::from(vec![
             Span::raw(format!("conns {} active / {} total   ", s.active, s.total)),
@@ -197,10 +273,10 @@ impl App {
         ]);
         frame.render_widget(
             Paragraph::new(stats).block(Block::default().borders(Borders::ALL).title(" traffic ")),
-            chunks[1],
+            chunks[2],
         );
 
-        let height = chunks[2].height.saturating_sub(2) as usize;
+        let height = chunks[3].height.saturating_sub(2) as usize;
         let lines: Vec<Line> = self
             .logs
             .tail(height)
@@ -222,16 +298,20 @@ impl App {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" log ")),
-            chunks[2],
+            chunks[3],
         );
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                Span::raw(" quit   "),
+                Span::raw(" quit  "),
+                Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" server  "),
+                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" switch   "),
                 Span::styled(&self.status, Style::default().fg(Color::Yellow)),
             ])),
-            chunks[3],
+            chunks[4],
         );
     }
 }
@@ -239,12 +319,25 @@ impl App {
 /// Run the UI until the user quits or the server task ends.
 pub async fn run(
     config: Arc<Config>,
+    servers: ServerList,
+    active: ActiveServer,
     logs: Arc<LogBuffer>,
     mut server: JoinHandle<Result<()>>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
+    let active_index = servers
+        .entries
+        .iter()
+        .position(|e| {
+            e.server.endpoint() == config.server.endpoint() && e.server.uuid == config.server.uuid
+        })
+        .unwrap_or(0);
     let mut app = App {
         config,
+        servers,
+        active,
+        active_index,
+        selected: active_index,
         logs,
         started: Instant::now(),
         last: STATS.snapshot(),
@@ -266,6 +359,12 @@ pub async fn run(
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind != KeyEventKind::Press {
                     continue;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => app.select(-1),
+                    KeyCode::Down | KeyCode::Char('j') => app.select(1),
+                    KeyCode::Enter => app.switch_to_selected(),
+                    _ => {}
                 }
                 let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
                     || (key.code == KeyCode::Char('c')

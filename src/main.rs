@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, Level};
-use vproxy::{serve, Config, VlessUrl};
+use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList, VlessUrl};
 
 #[derive(Clone)]
 struct Args {
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut config = load_config(args.clone())?;
+    let (mut config, servers) = load_config(args.clone())?;
     if args.tun || args.print_tun_config {
         config.tun.enabled = true;
         config.validate()?;
@@ -92,8 +92,9 @@ async fn main() -> Result<()> {
 
     match tui_logs {
         Some(logs) => {
-            let server = tokio::spawn(serve(config.clone()));
-            vproxy::tui::run(config, logs, server).await
+            let active = ActiveServer::new(config.server.clone());
+            let server = tokio::spawn(serve_with_server(config.clone(), active.clone()));
+            vproxy::tui::run(config, servers, active, logs, server).await
         }
         None => serve(config).await,
     }
@@ -117,7 +118,8 @@ fn user_config_dir() -> Option<PathBuf> {
 }
 
 enum DiscoveredSource {
-    Url(String),
+    /// First link and the links file it came from.
+    Url(String, PathBuf),
     ConfigFile(PathBuf),
 }
 
@@ -127,7 +129,7 @@ fn discover_source() -> Result<Option<DiscoveredSource>> {
     let local = PathBuf::from("server.txt");
     if local.is_file() {
         info!("Using link from {}", local.display());
-        return Ok(Some(DiscoveredSource::Url(read_url_file(&local)?)));
+        return Ok(Some(DiscoveredSource::Url(read_url_file(&local)?, local)));
     }
     if let Some(dir) = user_config_dir() {
         let toml = dir.join("config.toml");
@@ -137,7 +139,7 @@ fn discover_source() -> Result<Option<DiscoveredSource>> {
         let links = dir.join("server.txt");
         if links.is_file() {
             info!("Using link from {}", links.display());
-            return Ok(Some(DiscoveredSource::Url(read_url_file(&links)?)));
+            return Ok(Some(DiscoveredSource::Url(read_url_file(&links)?, links)));
         }
     }
     Ok(None)
@@ -204,7 +206,10 @@ fn ask_for_link() -> Result<String> {
     anyhow::bail!("No valid vless:// link entered")
 }
 
-fn load_config(args: Args) -> Result<Config> {
+/// Returns the config to start with and every server the TUI may switch to.
+fn load_config(args: Args) -> Result<(Config, ServerList)> {
+    let inbound_port = args.inbound_port.unwrap_or(1080);
+    let mut links_file: Option<PathBuf> = args.url_file.clone();
     let mut vless_url = match (args.vless_url, args.url_file.as_ref()) {
         (Some(url), _) => Some(url),
         (None, Some(path)) => Some(read_url_file(path)?),
@@ -213,16 +218,34 @@ fn load_config(args: Args) -> Result<Config> {
     let mut config_path = args.config_path;
     if vless_url.is_none() && config_path.is_none() {
         match discover_source()? {
-            Some(DiscoveredSource::Url(url)) => vless_url = Some(url),
+            Some(DiscoveredSource::Url(url, path)) => {
+                vless_url = Some(url);
+                links_file = Some(path);
+            }
             Some(DiscoveredSource::ConfigFile(path)) => config_path = Some(path),
-            None => vless_url = Some(ask_for_link()?),
+            None => {
+                vless_url = Some(ask_for_link()?);
+                links_file = user_config_dir().map(|d| d.join("server.txt"));
+            }
         }
     }
     if let Some(url_str) = vless_url {
         let url = VlessUrl::parse(&url_str)?;
-        let inbound_port = args.inbound_port.unwrap_or(1080);
         let config = Config::from_vless_url(&url, inbound_port);
         config.validate()?;
+        let servers = match links_file.as_deref().filter(|p| p.is_file()) {
+            Some(path) => match ServerList::from_file(path, inbound_port) {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::warn!("Server list not loaded ({e}); switching disabled");
+                    ServerList::single(config.server.clone())
+                }
+            },
+            None => ServerList::single(config.server.clone()),
+        };
+        if servers.len() > 1 {
+            info!("{} servers available (switch in --tui)", servers.len());
+        }
 
         if let Some(remark) = &url.remark {
             info!("Using VLESS server: {}", remark);
@@ -235,7 +258,7 @@ fn load_config(args: Args) -> Result<Config> {
             url.use_tls()
         );
 
-        Ok(config)
+        Ok((config, servers))
     } else if let Some(config_path) = config_path {
         info!("Loading config from: {}", config_path.display());
         if config_path
@@ -243,6 +266,7 @@ fn load_config(args: Args) -> Result<Config> {
             .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         {
             let config = vproxy::xray_import::load(&config_path, args.inbound_port)?;
+            let servers = ServerList::single(config.server.clone());
             info!(
                 "Imported Xray config: {} {}:{} ({} over {}{})",
                 config.server.remark.as_deref().unwrap_or("-"),
@@ -256,9 +280,11 @@ fn load_config(args: Args) -> Result<Config> {
                     format!(", {} routing rules", config.routing.rules.len())
                 }
             );
-            return Ok(config);
+            return Ok((config, servers));
         }
-        Config::load(&config_path)
+        let config = Config::load(&config_path)?;
+        let servers = ServerList::single(config.server.clone());
+        Ok((config, servers))
     } else {
         anyhow::bail!("No config provided");
     }
@@ -369,7 +395,8 @@ Usage:
 
 Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
 ~/.config/vproxy/server.txt; if none exists it asks for a vless:// link (pasted as
-is, no quoting) and saves it to ~/.config/vproxy/server.txt.
+is, no quoting) and saves it to ~/.config/vproxy/server.txt. A links file may hold
+several servers (one per line): the first is used, --tui switches between them.
 
 Options:
   -c, --config <PATH>       Path to TOML config, or an Xray/Happ JSON config (*.json)
