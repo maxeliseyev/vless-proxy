@@ -300,6 +300,11 @@ impl App {
             Err(_) => "?",
         };
         let flow = server.flow.as_deref().unwrap_or("-");
+        let mux = match self.config.mux.sessions_per_connection() {
+            Some(n) if server.flow.is_none() => format!("mux {n}"),
+            Some(_) => "mux off (vision)".to_string(),
+            None => "mux off".to_string(),
+        };
         let tun = if self.config.tun.enabled { "ON" } else { "off" };
         let uptime = self.started.elapsed().as_secs();
         let header = vec![
@@ -310,11 +315,12 @@ impl App {
             Line::from(vec![
                 Span::styled("security ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!(
-                    "{}  flow {}  sni {}  engine {}",
+                    "{}  flow {}  sni {}  engine {}  {}",
                     server.security,
                     flow,
                     server.tls_server_name(),
-                    engine
+                    engine,
+                    mux
                 )),
             ]),
             Line::from(vec![

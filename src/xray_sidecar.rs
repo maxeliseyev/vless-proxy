@@ -163,6 +163,7 @@ mod tests {
             },
             tun: Default::default(),
             routing: Default::default(),
+            mux: Default::default(),
         }
     }
 

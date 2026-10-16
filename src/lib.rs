@@ -11,6 +11,7 @@ pub mod config;
 pub mod dns;
 pub mod dns_cache;
 pub mod http;
+pub mod mux;
 pub mod reality;
 pub mod reality_tls;
 pub mod routing;
@@ -30,7 +31,7 @@ pub mod xray_sidecar;
 
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
-    InboundProtocol, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, Transport,
+    InboundProtocol, MuxConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, Transport,
     TransportSecurity, TunConfig,
 };
 pub use dns_cache::DnsCache;

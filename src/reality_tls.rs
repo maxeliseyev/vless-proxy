@@ -674,11 +674,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityStream<IO> {
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             }
-            // rustls may want to answer (key updates, alerts); do not block reads on it.
+            // rustls may want to answer (key updates, alerts): queue it for the
+            // write side. Never flush the socket from here: with the stream
+            // split across tasks that would register the reader's waker for
+            // write readiness and silently unpark the writer's.
             this.queue_tls_out()?;
-            if let Poll::Ready(Err(e)) = this.poll_flush_tls(cx) {
-                return Poll::Ready(Err(e));
-            }
             if this.try_feed_record()? {
                 continue;
             }

@@ -6,8 +6,8 @@
 //! metrics sections are ignored.
 
 use crate::config::{
-    Config, DnsCacheConfig, DnsConfig, InboundConfig, RoutingConfig, RoutingRule, RuntimeConfig,
-    ServerConfig, TunConfig,
+    Config, DnsCacheConfig, DnsConfig, InboundConfig, MuxConfig, RoutingConfig, RoutingRule,
+    RuntimeConfig, ServerConfig, TunConfig,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -127,9 +127,22 @@ pub fn from_json(text: &str, inbound_port: Option<u16>) -> Result<Config> {
         runtime: RuntimeConfig::default_values(),
         tun: TunConfig::default(),
         routing: import_routing(&root["routing"]),
+        mux: import_mux(&outbound["mux"]),
     };
     config.validate()?;
     Ok(config)
+}
+
+/// Xray outbound `mux` → `[mux]`.
+fn import_mux(mux: &Value) -> MuxConfig {
+    let mut out = MuxConfig::default();
+    if mux["enabled"].as_bool() == Some(true) {
+        out.enabled = true;
+        if let Some(c) = mux["concurrency"].as_i64() {
+            out.concurrency = c;
+        }
+    }
+    out
 }
 
 /// Xray `routing.rules` → `[routing]`. Rules bound to inbound tags (DNS/metrics

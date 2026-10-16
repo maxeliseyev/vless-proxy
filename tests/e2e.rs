@@ -8,10 +8,11 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
+use vproxy::mux;
 use vproxy::ws::WsStream;
 use vproxy::{
     serve, serve_with_server, socks5, vless, ActiveServer, Config, DnsCacheConfig, DnsConfig,
-    InboundConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig,
+    InboundConfig, MuxConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -292,6 +293,96 @@ async fn websocket_transport_carries_the_vless_session() -> Result<()> {
     Ok(())
 }
 
+/// The mock accepts exactly one TCP connection, so two sessions reaching it
+/// proves they were multiplexed. It upper-cases what it receives per session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mux_shares_one_vless_connection_between_sessions() -> Result<()> {
+    let server = spawn_mock_vless_server(|mut stream| async move {
+        let request = read_vless_request(&mut stream).await?;
+        assert_eq!(request.command, vless::Command::Mux);
+        assert_eq!(
+            request.address,
+            vless::Address::Domain(mux::MUX_COOL_ADDRESS.to_string())
+        );
+        send_vless_response(&mut stream).await?;
+
+        let mut opened = Vec::new();
+        let mut ended = 0;
+        while ended < 2 {
+            let frame = timeout(TEST_TIMEOUT, mux::read_frame(&mut stream))
+                .await
+                .map_err(|_| anyhow!("mock mux server timed out"))??
+                .ok_or_else(|| anyhow!("mux connection closed early"))?;
+            match frame.status {
+                mux::STATUS_NEW => opened.push((frame.id, frame.target())),
+                mux::STATUS_END => {
+                    ended += 1;
+                    stream
+                        .write_all(&mux::encode_frame(frame.id, mux::STATUS_END, 0, None, None))
+                        .await?;
+                }
+                _ => {}
+            }
+            if let Some(data) = frame.data {
+                let reply = data.to_ascii_uppercase();
+                stream
+                    .write_all(&mux::encode_frame(
+                        frame.id,
+                        mux::STATUS_KEEP,
+                        0,
+                        None,
+                        Some(&reply),
+                    ))
+                    .await?;
+            }
+            stream.flush().await?;
+        }
+        assert_eq!(
+            opened,
+            vec![
+                (
+                    1,
+                    Some((vless::Address::Domain("echo-a.example".to_string()), 7001))
+                ),
+                (
+                    2,
+                    Some((vless::Address::Domain("echo-b.example".to_string()), 7002))
+                ),
+            ]
+        );
+        Ok(())
+    })
+    .await?;
+    let proxy = spawn_mux_proxy(server.addr, 8).await?;
+
+    let mut a = TcpStream::connect(proxy.addr).await?;
+    socks5_connect(&mut a, "echo-a.example", 7001).await?;
+    let mut b = TcpStream::connect(proxy.addr).await?;
+    socks5_connect(&mut b, "echo-b.example", 7002).await?;
+
+    b.write_all(b"hello from b").await?;
+    a.write_all(b"hello from a").await?;
+    let mut reply = [0u8; 12];
+    timeout(TEST_TIMEOUT, a.read_exact(&mut reply)).await??;
+    assert_eq!(&reply, b"HELLO FROM A");
+    timeout(TEST_TIMEOUT, b.read_exact(&mut reply)).await??;
+    assert_eq!(&reply, b"HELLO FROM B");
+
+    // Client EOF ends the session (End frame); the server's End closes our side.
+    a.shutdown().await?;
+    b.shutdown().await?;
+    let mut rest = Vec::new();
+    timeout(TEST_TIMEOUT, a.read_to_end(&mut rest)).await??;
+    timeout(TEST_TIMEOUT, b.read_to_end(&mut rest)).await??;
+    assert!(rest.is_empty());
+
+    timeout(TEST_TIMEOUT, server.task)
+        .await
+        .map_err(|_| anyhow!("mock mux server did not finish"))???;
+    proxy.task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn routing_direct_rule_bypasses_the_vless_server() -> Result<()> {
     // A plain TCP echo target that must be reached without any VLESS framing.
@@ -333,6 +424,28 @@ async fn routing_direct_rule_bypasses_the_vless_server() -> Result<()> {
     proxy.stop();
     drop(server);
     Ok(())
+}
+
+/// Proxy with `[mux]` on: TCP sessions share VLESS connections.
+async fn spawn_mux_proxy(server_addr: SocketAddr, concurrency: i64) -> Result<ProxyHarness> {
+    let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserve_port()?));
+    let mut config = proxy_config(
+        "socks5",
+        proxy_addr,
+        server_addr,
+        RoutingConfig::default(),
+        "tcp",
+    );
+    config.mux = MuxConfig {
+        enabled: true,
+        concurrency,
+    };
+    let task = tokio::spawn(async move { serve(Arc::new(config)).await });
+    wait_for_listener(proxy_addr).await?;
+    Ok(ProxyHarness {
+        addr: proxy_addr,
+        task,
+    })
 }
 
 async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHarness> {
@@ -440,6 +553,7 @@ fn proxy_config(
         },
         tun: Default::default(),
         routing,
+        mux: Default::default(),
     }
 }
 
@@ -599,10 +713,15 @@ async fn read_vless_request<S: AsyncRead + AsyncWrite + Unpin>(
     let command = match stream.read_u8().await? {
         1 => vless::Command::Tcp,
         2 => vless::Command::Udp,
+        3 => vless::Command::Mux,
         other => return Err(anyhow!("unexpected VLESS command: {other}")),
     };
-    let port = stream.read_u16().await?;
-    let address = read_vless_address(stream).await?;
+    // Like Xray, a Mux request carries no target: frames follow the header.
+    let (port, address) = if command == vless::Command::Mux {
+        (0, vless::Address::Domain(mux::MUX_COOL_ADDRESS.to_string()))
+    } else {
+        (stream.read_u16().await?, read_vless_address(stream).await?)
+    };
 
     Ok(ObservedVlessRequest {
         command,

@@ -43,6 +43,42 @@ pub struct Config {
     pub tun: TunConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub mux: MuxConfig,
+}
+
+/// Mux.Cool: several TCP sessions over one VLESS connection (`[mux]`).
+/// Ignored for servers using XTLS Vision, which cannot be multiplexed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MuxConfig {
+    pub enabled: bool,
+    /// Live sessions per connection, 1..=1024 (Xray default 8). Like Xray,
+    /// `-1` disables TCP multiplexing.
+    pub concurrency: i64,
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            concurrency: 8,
+        }
+    }
+}
+
+impl MuxConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled && self.concurrency > 1024 {
+            bail!("mux.concurrency must be between 1 and 1024 (or -1 to disable)");
+        }
+        Ok(())
+    }
+
+    /// Sessions per connection when multiplexing is on, else `None`.
+    pub fn sessions_per_connection(&self) -> Option<usize> {
+        (self.enabled && self.concurrency > 0).then_some(self.concurrency as usize)
+    }
 }
 
 /// Per-connection routing (see `routing.rs`); also translated for sing-box in TUN mode.
@@ -477,6 +513,7 @@ impl Config {
         }
         self.dns.ip_strategy()?;
         self.runtime.validate()?;
+        self.mux.validate()?;
 
         Ok(())
     }
@@ -755,6 +792,7 @@ impl Config {
             runtime,
             tun: TunConfig::default(),
             routing: RoutingConfig::default(),
+            mux: MuxConfig::default(),
         }
     }
 }
@@ -805,6 +843,7 @@ mod tests {
             },
             tun: TunConfig::default(),
             routing: RoutingConfig::default(),
+            mux: MuxConfig::default(),
         }
     }
 

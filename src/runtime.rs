@@ -1,9 +1,10 @@
 use crate::config::{
-    Config, DnsConfig, InboundProtocol, RoutingConfig, RuntimeConfig, ServerConfig, Transport,
-    TransportSecurity,
+    Config, DnsConfig, InboundProtocol, MuxConfig, RoutingConfig, RuntimeConfig, ServerConfig,
+    Transport, TransportSecurity,
 };
 use crate::dns::ResolverPolicy;
 use crate::http;
+use crate::mux::{MuxManager, MuxStream, MUX_COOL_ADDRESS, MUX_COOL_PORT};
 use crate::reality::RealityClient;
 use crate::reality_tls::RealityConnector;
 use crate::routing::{Outbound, Router};
@@ -16,15 +17,17 @@ use crate::ws::WsStream;
 use crate::xray_sidecar;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 /// A VLESS session to the configured server, ready for relaying.
@@ -33,6 +36,8 @@ pub type RemoteStream = VlessStream<MaybeTlsStream<TcpStream>>;
 /// Where a TCP connection ended up after routing.
 pub enum OutboundStream {
     Proxy(Box<RemoteStream>),
+    /// A session multiplexed over a shared VLESS connection.
+    Mux(MuxStream),
     Direct(TcpStream),
 }
 
@@ -50,6 +55,7 @@ impl AsyncRead for OutboundStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -63,6 +69,7 @@ impl AsyncWrite for OutboundStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -73,6 +80,7 @@ impl AsyncWrite for OutboundStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
@@ -83,6 +91,7 @@ impl AsyncWrite for OutboundStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -138,6 +147,7 @@ pub struct ProxyClient {
     resolver: ResolverPolicy,
     runtime: RuntimeConfig,
     router: Arc<Router>,
+    mux: Option<Arc<MuxManager>>,
 }
 
 impl ProxyClient {
@@ -146,17 +156,30 @@ impl ProxyClient {
         dns: DnsConfig,
         runtime: RuntimeConfig,
         routing: &RoutingConfig,
+        mux: &MuxConfig,
     ) -> Result<Self> {
         let router = Router::new(routing)?;
         if router.has_geo_rules() {
             warn!("routing: geoip/geosite rules are only applied in TUN mode (sing-box); the local proxy ignores them");
         }
+        let mux = mux.sessions_per_connection().map(|concurrency| {
+            if server.get().vision_flow().ok().flatten().is_some() {
+                warn!("mux: ignored for XTLS Vision servers (Mux.Cool cannot be combined with Vision)");
+            }
+            Arc::new(MuxManager::new(concurrency))
+        });
         Ok(Self {
             server,
             resolver: ResolverPolicy::new(dns)?,
             runtime,
             router: Arc::new(router),
+            mux,
         })
+    }
+
+    /// Multiplexer, when `[mux]` is on.
+    pub fn mux(&self) -> Option<&MuxManager> {
+        self.mux.as_deref()
     }
 
     pub fn router(&self) -> &Router {
@@ -177,10 +200,50 @@ impl ProxyClient {
                 .map_err(|_| anyhow::anyhow!("Direct connection timeout"))??;
                 Ok(OutboundStream::Direct(stream))
             }
-            Outbound::Proxy => Ok(OutboundStream::Proxy(Box::new(
-                self.connect_target(address, port).await?,
-            ))),
+            Outbound::Proxy => {
+                if let Some(mux) = &self.mux {
+                    let server = self.server.get();
+                    // Vision cannot be multiplexed; such servers get plain sessions.
+                    if server.vision_flow()?.is_none() {
+                        return Ok(OutboundStream::Mux(
+                            self.open_mux_session(mux, server, address, port).await?,
+                        ));
+                    }
+                }
+                Ok(OutboundStream::Proxy(Box::new(
+                    self.connect_target(address, port).await?,
+                )))
+            }
         }
+    }
+
+    /// A Mux.Cool session to `address:port`, dialing a new multiplexed VLESS
+    /// connection in the background when none has room.
+    async fn open_mux_session(
+        &self,
+        mux: &MuxManager,
+        server: ServerConfig,
+        address: Address,
+        port: u16,
+    ) -> Result<MuxStream> {
+        let request_address = self.resolver.resolve(address, port).await?;
+        let key = format!("{}|{}", server.endpoint(), server.uuid);
+        let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
+        let dial = async move {
+            let remote = timeout(connect_timeout, connect_remote(&server))
+                .await
+                .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+            let request = Request {
+                uuid: server.uuid,
+                command: vless::Command::Mux,
+                port: MUX_COOL_PORT,
+                address: Address::Domain(MUX_COOL_ADDRESS.to_string()),
+                flow: None,
+            };
+            debug!("Connected to VLESS server {} (mux)", server.endpoint());
+            Ok(VlessStream::new(remote, request.encode()?))
+        };
+        Ok(mux.open(&key, (request_address, port), dial))
     }
 
     /// Route a UDP target: VLESS UDP session, a direct connected socket, or `block`.
@@ -372,6 +435,7 @@ async fn serve_with_shutdown(
         config.dns.clone(),
         config.runtime.clone(),
         &config.routing,
+        &config.mux,
     )?;
 
     match config.inbound_protocol()? {
@@ -684,6 +748,13 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     result.map(|_| ())
 }
 
+/// Relay both directions until either side reads EOF or an error. The two
+/// directions make progress independently (a stalled write towards one peer
+/// never stops reads from the other), which matters for multiplexed sessions
+/// where several relays share one connection. Timeouts: a single write
+/// pending longer than `write_timeout`, or no bytes moving in either
+/// direction for `min(read_timeout, idle_timeout)`, end the relay with an
+/// error.
 async fn copy_bidirectional_with_timeouts<A, B>(
     a: &mut A,
     b: &mut B,
@@ -695,64 +766,140 @@ where
     A: AsyncReadExt + AsyncWriteExt + Unpin + Send,
     B: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    let mut a_to_b = 0u64;
-    let mut b_to_a = 0u64;
-    let mut last_activity = Instant::now();
-    let idle_deadline = idle_timeout;
-    let mut buf_a = vec![0u8; 8192];
-    let mut buf_b = vec![0u8; 8192];
+    let activity_timeout = read_timeout.min(idle_timeout);
+    let mut a_to_b = RelayDirection::new("remote", write_timeout, true);
+    let mut b_to_a = RelayDirection::new("client", write_timeout, false);
+    let mut activity = Box::pin(tokio::time::sleep(activity_timeout));
 
-    loop {
-        tokio::select! {
-            result = timeout(read_timeout, a.read(&mut buf_a)) => {
-                let n = match result {
-                    Ok(Ok(n)) => {
-                        if n == 0 {
-                            break;
-                        }
-                        n
-                    }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => return Err(anyhow::anyhow!("Read timeout from client")),
-                };
-
-                timeout(write_timeout, b.write_all(&buf_a[..n]))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Write timeout to remote"))??;
-                b.flush().await?;
-
-                a_to_b += n as u64;
-                STATS.add_up(n);
-                last_activity = Instant::now();
+    std::future::poll_fn(|cx| {
+        let mut progress = false;
+        let up = a_to_b.poll(cx, &mut *a, &mut *b, &mut progress);
+        let down = b_to_a.poll(cx, &mut *b, &mut *a, &mut progress);
+        match (up, down) {
+            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => return Poll::Ready(Err(e)),
+            (Poll::Ready(Ok(())), _) | (_, Poll::Ready(Ok(()))) => {
+                return Poll::Ready(Ok((a_to_b.copied, b_to_a.copied)));
             }
-            result = timeout(read_timeout, b.read(&mut buf_b)) => {
-                let n = match result {
-                    Ok(Ok(n)) => {
-                        if n == 0 {
-                            break;
-                        }
-                        n
-                    }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => return Err(anyhow::anyhow!("Read timeout from remote")),
-                };
+            _ => {}
+        }
+        if progress {
+            activity
+                .as_mut()
+                .reset(tokio::time::Instant::now() + activity_timeout);
+        }
+        if activity.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(anyhow::anyhow!("Idle timeout")));
+        }
+        Poll::Pending
+    })
+    .await
+}
 
-                timeout(write_timeout, a.write_all(&buf_b[..n]))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Write timeout to client"))??;
-                a.flush().await?;
+/// One direction of a relay: a buffer being filled from the reader and
+/// drained into the writer.
+struct RelayDirection {
+    buf: Box<[u8]>,
+    pos: usize,
+    cap: usize,
+    eof: bool,
+    copied: u64,
+    peer: &'static str,
+    write_timeout: Duration,
+    write_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    upstream: bool,
+}
 
-                b_to_a += n as u64;
-                STATS.add_down(n);
-                last_activity = Instant::now();
-            }
-            _ = tokio::time::sleep_until(last_activity + idle_deadline) => {
-                return Err(anyhow::anyhow!("Idle timeout"));
-            }
+impl RelayDirection {
+    fn new(peer: &'static str, write_timeout: Duration, upstream: bool) -> Self {
+        Self {
+            buf: vec![0u8; 16 * 1024].into_boxed_slice(),
+            pos: 0,
+            cap: 0,
+            eof: false,
+            copied: 0,
+            peer,
+            write_timeout,
+            write_deadline: None,
+            upstream,
         }
     }
 
-    Ok((a_to_b, b_to_a))
+    /// `Ready(Ok(()))` once the reader hit EOF and everything buffered was
+    /// written and flushed; `Pending` while waiting on either side.
+    fn poll<R, W>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        reader: &mut R,
+        writer: &mut W,
+        progress: &mut bool,
+    ) -> Poll<Result<()>>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        loop {
+            if self.pos == self.cap && !self.eof {
+                let mut read_buf = tokio::io::ReadBuf::new(&mut self.buf);
+                match std::pin::Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = read_buf.filled().len();
+                        if n == 0 {
+                            self.eof = true;
+                        } else {
+                            self.pos = 0;
+                            self.cap = n;
+                            *progress = true;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            while self.pos < self.cap {
+                match std::pin::Pin::new(&mut *writer).poll_write(cx, &self.buf[self.pos..self.cap])
+                {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(anyhow::anyhow!(
+                            "{} stopped accepting data",
+                            self.peer
+                        )))
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        self.pos += n;
+                        self.copied += n as u64;
+                        if self.upstream {
+                            STATS.add_up(n);
+                        } else {
+                            STATS.add_down(n);
+                        }
+                        self.write_deadline = None;
+                        *progress = true;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                    Poll::Pending => {
+                        let deadline = self.write_deadline.get_or_insert_with(|| {
+                            Box::pin(tokio::time::sleep(self.write_timeout))
+                        });
+                        if deadline.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(Err(anyhow::anyhow!(
+                                "Write timeout to {}",
+                                self.peer
+                            )));
+                        }
+                        return Poll::Pending;
+                    }
+                }
+            }
+            match std::pin::Pin::new(&mut *writer).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Pending => return Poll::Pending,
+            }
+            if self.eof {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
 }
 
 async fn run_udp_association(
@@ -1034,7 +1181,9 @@ async fn prime_remote(
 ) -> Result<()> {
     let pending = match remote {
         OutboundStream::Proxy(r) => r.header_pending(),
-        OutboundStream::Direct(_) => false,
+        // A mux session opens with its first payload, or alone when the
+        // local side reads first; nothing to wait for here.
+        OutboundStream::Mux(_) | OutboundStream::Direct(_) => false,
     };
     if !pending {
         return Ok(());

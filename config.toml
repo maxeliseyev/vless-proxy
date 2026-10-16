@@ -32,6 +32,13 @@ reality_engine = "auto"
 # Path to xray-core binary for sidecar mode
 xray_path = "xray"
 
+[mux]
+# Mux.Cool: several TCP sessions over one VLESS connection (fewer TLS/WebSocket
+# handshakes). Ignored for XTLS Vision servers, which cannot be multiplexed.
+enabled = false
+# Live sessions per connection, 1..=1024 (Xray default 8)
+concurrency = 8
+
 [routing]
 # Where targets go when no rule matches: "proxy" (default) or "direct".
 final = "proxy"

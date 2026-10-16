@@ -60,6 +60,10 @@ impl Request {
             _ => out.push(0),
         }
         out.push(self.command as u8);
+        if self.command == Command::Mux {
+            // Mux.Cool requests carry no target (Xray `EncodeRequestHeader`).
+            return Ok(out);
+        }
         out.extend_from_slice(&self.port.to_be_bytes());
         match &self.address {
             Address::Ipv4(addr) => {
@@ -541,6 +545,21 @@ mod tests {
         server.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"client-first");
         assert!(!stream.response_received());
+    }
+
+    #[test]
+    fn mux_request_has_no_target() {
+        let request = Request {
+            uuid: Uuid::nil(),
+            command: Command::Mux,
+            port: 9527,
+            address: Address::Domain("v1.mux.cool".to_string()),
+            flow: None,
+        };
+        let bytes = request.encode().unwrap();
+        assert_eq!(bytes.len(), 1 + 16 + 1 + 1);
+        assert_eq!(bytes[17], 0);
+        assert_eq!(bytes[18], Command::Mux as u8);
     }
 
     #[test]
