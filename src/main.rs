@@ -8,6 +8,7 @@ use vproxy::{serve, Config, VlessUrl};
 struct Args {
     config_path: Option<PathBuf>,
     vless_url: Option<String>,
+    url_file: Option<PathBuf>,
     inbound_port: Option<u16>,
     verbose: bool,
     check_config: bool,
@@ -77,8 +78,25 @@ async fn main() -> Result<()> {
     serve(config).await
 }
 
+/// First `vless://` link in a text file (blank lines and `#` comment lines skipped).
+fn read_url_file(path: &PathBuf) -> Result<String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", path.display()))?;
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("No vless:// link found in {}", path.display()))
+}
+
 fn load_config(args: Args) -> Result<Config> {
-    if let Some(url_str) = args.vless_url {
+    let vless_url = match (args.vless_url, args.url_file.as_ref()) {
+        (Some(url), _) => Some(url),
+        (None, Some(path)) => Some(read_url_file(path)?),
+        (None, None) => None,
+    };
+    if let Some(url_str) = vless_url {
         let url = VlessUrl::parse(&url_str)?;
         let inbound_port = args.inbound_port.unwrap_or(1080);
         let config = Config::from_vless_url(&url, inbound_port);
@@ -100,13 +118,16 @@ fn load_config(args: Args) -> Result<Config> {
         info!("Loading config from: {}", config_path.display());
         Config::load(&config_path)
     } else {
-        anyhow::bail!("No config provided. Use --config, --url, or provide a config path");
+        anyhow::bail!(
+            "No config provided. Use --config, --url, --url-file, or provide a config path"
+        );
     }
 }
 
 fn parse_args() -> Result<Args> {
     let mut config_path = None;
     let mut vless_url = None;
+    let mut url_file = None;
     let mut inbound_port = None;
     let mut verbose = false;
     let mut check_config = false;
@@ -132,6 +153,12 @@ fn parse_args() -> Result<Args> {
                         .into_string()
                         .map_err(|_| anyhow::anyhow!("Invalid URL encoding"))?,
                 );
+            }
+            Some("-f") | Some("--url-file") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--url-file requires a path"))?;
+                url_file = Some(PathBuf::from(value));
             }
             Some("-p") | Some("--inbound-port") => {
                 let value = args
@@ -175,6 +202,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         config_path,
         vless_url,
+        url_file,
         inbound_port,
         verbose,
         check_config,
@@ -194,7 +222,8 @@ Usage:
 
 Options:
   -c, --config <PATH>       Path to TOML config
-  -u, --url <VLESS_URL>     VLESS subscription URL (vless://...)
+  -u, --url <VLESS_URL>     VLESS link (vless://...), quote it in the shell
+  -f, --url-file <PATH>     Read the vless:// link from a file (first non-comment line)
   -p, --inbound-port <PORT> Local inbound port (default: 1080)
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
@@ -207,7 +236,8 @@ Examples:
   vproxy config.toml
   vproxy --url 'vless://uuid@host:port?security=tls'
   vproxy -u 'vless://...' -p 8080
-  sudo vproxy --tun -u 'vless://...'
+  vproxy -f server.txt -p 1080
+  sudo vproxy --tun -f server.txt
 "
     );
 }
