@@ -12,7 +12,7 @@
 curl -fsSL https://raw.githubusercontent.com/maxeliseyev/vless-proxy/main/install.sh | sh
 ```
 
-Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.4.0`, `VPROXY_PREFIX=~/.local/bin`.
+Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.5.0`, `VPROXY_PREFIX=~/.local/bin`.
 
 Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически).
 
