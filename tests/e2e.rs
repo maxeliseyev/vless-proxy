@@ -248,6 +248,7 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             xray_path: "xray".to_string(),
             reality_engine: "auto".to_string(),
         },
+        tun: Default::default(),
     };
 
     let task = tokio::spawn(async move { serve(Arc::new(config)).await });

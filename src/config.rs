@@ -39,6 +39,72 @@ pub struct Config {
     pub dns: DnsConfig,
     #[serde(default = "default_runtime_config")]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub tun: TunConfig,
+}
+
+/// System-wide mode through a `sing-box` TUN sidecar (see `tun.rs`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TunConfig {
+    pub enabled: bool,
+    pub sing_box_path: String,
+    /// Interface address, CIDR.
+    pub address: String,
+    pub mtu: u32,
+    /// `mixed` | `system` | `gvisor`
+    pub stack: String,
+    pub strict_route: bool,
+    /// Upstream DNS used for everything caught by the tunnel.
+    pub dns: String,
+    /// Send DNS queries through the proxy (true) or directly (false).
+    pub dns_via_proxy: bool,
+    /// Domain suffixes / CIDRs that must not go through the proxy.
+    pub bypass_domains: Vec<String>,
+    pub bypass_cidrs: Vec<String>,
+    pub log_level: String,
+}
+
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sing_box_path: "sing-box".to_string(),
+            address: "172.18.0.1/30".to_string(),
+            mtu: 1500,
+            stack: "mixed".to_string(),
+            strict_route: true,
+            dns: "8.8.8.8".to_string(),
+            dns_via_proxy: true,
+            bypass_domains: Vec::new(),
+            bypass_cidrs: Vec::new(),
+            log_level: "warn".to_string(),
+        }
+    }
+}
+
+impl TunConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.sing_box_path.trim().is_empty() {
+            bail!("tun.sing_box_path must not be empty");
+        }
+        if !self.address.contains('/') {
+            bail!("tun.address must be an interface address in CIDR form, e.g. 172.18.0.1/30");
+        }
+        if !(576..=65535).contains(&self.mtu) {
+            bail!("tun.mtu must be between 576 and 65535");
+        }
+        if !matches!(self.stack.as_str(), "mixed" | "system" | "gvisor") {
+            bail!("tun.stack must be \"mixed\", \"system\" or \"gvisor\"");
+        }
+        if self.dns.parse::<std::net::IpAddr>().is_err() {
+            bail!("tun.dns must be an IP address");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +406,10 @@ impl Config {
         self.inbound.protocol_kind()?;
         self.dns.resolve_mode()?;
         self.needs_xray_sidecar()?;
+        self.tun.validate()?;
+        if self.tun.enabled && !matches!(self.inbound.protocol_kind()?, InboundProtocol::Socks5) {
+            bail!("tun.enabled requires inbound.protocol = \"socks5\"");
+        }
         self.dns.ip_strategy()?;
         self.runtime.validate()?;
 
@@ -583,6 +653,7 @@ impl Config {
             inbound,
             dns,
             runtime,
+            tun: TunConfig::default(),
         }
     }
 }
@@ -627,6 +698,7 @@ mod tests {
                 xray_path: default_xray_path(),
                 reality_engine: default_reality_engine(),
             },
+            tun: TunConfig::default(),
         }
     }
 

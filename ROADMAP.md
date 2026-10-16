@@ -80,6 +80,14 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 13. **TUN-режим и service/ops (2026-10-16)**
+     - `src/tun.rs`: генератор конфига sing-box (tun-inbound → socks-outbound на наш inbound) и sidecar-процесс, живущий вместе с сервером; `--tun`, `--print-tun-config`, секция `[tun]`
+     - защита от петли: process_name (vproxy, sing-box, xray) и адрес сервера → direct, их DNS → direct; остальной DNS через туннель по умолчанию
+     - конфиг проверен `sing-box check` (1.12.12); живой запуск требует root и выключенного Happ (два TUN не уживутся)
+     - `docs/launchd/*.plist` и `docs/systemd/vproxy.service` как примеры автозапуска
+     - логи переведены в stderr, stdout только для данных
+     - **Комментарий:** ровно схема Happ, без собственного TUN-стека; покрывает пункт 3 из раздела 4.
+
  12. **Native XTLS Vision (2026-10-16)**
      - `src/vision.rs`: порт `VisionWriter`/`VisionReader`/`XtlsPadding`/`XtlsUnpadding`/`XtlsFilterTls` из `proxy/proxy.go`
      - `RealityStream` переписан как собственный драйвер поверх `rustls::ClientConnection`, кормит его по одной TLS-записи, поэтому байты после команды Direct не теряются (у Xray это `unsafe`-доступ к `input`/`rawInput` в `tls.Conn`)
@@ -339,8 +347,9 @@ Core логика должна жить в библиотеке, а не в би
 
 Если продолжать прямо отсюда, следующий практический milestone:
 
-1. **Service/ops слой** — systemd/launchd примеры
-2. **TUN-режим по схеме Happ** — sing-box с tun-inbound → локальный SOCKS vproxy, без своего TUN-стека
+1. **Живая проверка `--tun`** под sudo при выключенном Happ (sing-box из Homebrew или из бандла Happ)
+2. **Routing-правила** (domain/geoip → direct/proxy) — сейчас только bypass-списки в `[tun]`; у Happ это шаблоны `routing.rules`
+3. **MUX / transport extensions** only if still justified
 3. **MUX / transport extensions** only if still justified
 
 Именно в таком порядке.

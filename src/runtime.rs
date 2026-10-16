@@ -120,11 +120,8 @@ impl ProxyClient {
 }
 
 pub async fn serve(config: Arc<Config>) -> Result<()> {
-    if xray_sidecar::should_use(config.as_ref())? {
-        return xray_sidecar::run(config).await;
-    }
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let use_sidecar = xray_sidecar::should_use(config.as_ref())?;
 
     let mut ctrl_c_stream =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -142,8 +139,24 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
         }
     };
 
+    let core = async {
+        if use_sidecar {
+            xray_sidecar::run(config.clone()).await
+        } else {
+            serve_with_shutdown(config.clone(), shutdown_rx.clone()).await
+        }
+    };
+    let tun = async {
+        if config.tun.enabled {
+            crate::tun::run(config.clone(), shutdown_rx.clone()).await
+        } else {
+            std::future::pending().await
+        }
+    };
+
     let result = tokio::select! {
-        result = serve_with_shutdown(config.clone(), shutdown_rx) => result,
+        result = core => result,
+        result = tun => result,
         _ = shutdown_signal => {
             info!("Shutdown signal received, stopping server");
             let _ = shutdown_tx.send(true);

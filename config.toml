@@ -28,3 +28,22 @@ strategy = "prefer_ipv4"
 reality_engine = "auto"
 # Path to xray-core binary for sidecar mode
 xray_path = "xray"
+
+[tun]
+# System-wide mode: a sing-box sidecar owns a TUN interface and forwards all
+# traffic to the SOCKS5 inbound above. Needs root (sudo) and a sing-box binary
+# (brew install sing-box). Same as `vproxy --tun`.
+enabled = false
+sing_box_path = "sing-box"
+address = "172.18.0.1/30"
+mtu = 1500
+# mixed | system | gvisor
+stack = "mixed"
+strict_route = true
+dns = "8.8.8.8"
+# DNS through the tunnel (true) or straight to `dns` (false)
+dns_via_proxy = true
+# Never proxied (in addition to the VLESS server itself and vproxy's own traffic)
+bypass_domains = []
+bypass_cidrs = []
+log_level = "warn"

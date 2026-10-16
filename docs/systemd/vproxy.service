@@ -1,0 +1,31 @@
+# System-wide vproxy on Linux. With tun.enabled = true the unit needs root
+# (CAP_NET_ADMIN) because sing-box creates the TUN interface.
+#
+# install:
+#   sudo cp target/release/vproxy /usr/local/bin/vproxy
+#   sudo mkdir -p /etc/vproxy && sudo cp config.toml /etc/vproxy/config.toml
+#   sudo cp docs/systemd/vproxy.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vproxy
+# logs:
+#   journalctl -u vproxy -f
+
+[Unit]
+Description=vproxy VLESS client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/vproxy --config /etc/vproxy/config.toml
+Restart=on-failure
+RestartSec=3
+# Drop these two lines to run as root for TUN mode; for a plain local proxy
+# an unprivileged user is enough.
+DynamicUser=yes
+AmbientCapabilities=
+# TUN mode as root instead:
+#   User=root
+#   AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

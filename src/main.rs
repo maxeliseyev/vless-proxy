@@ -12,12 +12,15 @@ struct Args {
     verbose: bool,
     check_config: bool,
     probe: bool,
+    tun: bool,
+    print_tun_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_target(false)
         .with_max_level(if args.verbose {
             Level::DEBUG
@@ -26,7 +29,12 @@ async fn main() -> Result<()> {
         })
         .init();
 
-    let config = Arc::new(load_config(args.clone())?);
+    let mut config = load_config(args.clone())?;
+    if args.tun || args.print_tun_config {
+        config.tun.enabled = true;
+        config.validate()?;
+    }
+    let config = Arc::new(config);
     let sidecar = if config.needs_xray_sidecar()? {
         config.runtime.xray_path.as_str()
     } else {
@@ -48,6 +56,15 @@ async fn main() -> Result<()> {
 
     if args.check_config {
         info!("Configuration is valid");
+        return Ok(());
+    }
+
+    if args.print_tun_config {
+        let rendered = vproxy::tun::build_sing_box_config(
+            config.as_ref(),
+            vproxy::tun::current_process_name().as_deref(),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
         return Ok(());
     }
 
@@ -94,6 +111,8 @@ fn parse_args() -> Result<Args> {
     let mut verbose = false;
     let mut check_config = false;
     let mut probe = false;
+    let mut tun = false;
+    let mut print_tun_config = false;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -129,6 +148,8 @@ fn parse_args() -> Result<Args> {
             Some("-v") | Some("--verbose") => verbose = true,
             Some("--check-config") => check_config = true,
             Some("--probe") => probe = true,
+            Some("--tun") => tun = true,
+            Some("--print-tun-config") => print_tun_config = true,
             Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
@@ -158,6 +179,8 @@ fn parse_args() -> Result<Args> {
         verbose,
         check_config,
         probe,
+        tun,
+        print_tun_config,
     })
 }
 
@@ -176,12 +199,15 @@ Options:
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
+      --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
+      --print-tun-config    Print the generated sing-box config for --tun and exit
   -h, --help                Show this help
 
 Examples:
   vproxy config.toml
   vproxy --url 'vless://uuid@host:port?security=tls'
   vproxy -u 'vless://...' -p 8080
+  sudo vproxy --tun -u 'vless://...'
 "
     );
 }

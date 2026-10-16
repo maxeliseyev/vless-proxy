@@ -16,6 +16,7 @@ pub mod reality_tls;
 pub mod runtime;
 pub mod socks5;
 pub mod tls;
+pub mod tun;
 pub mod url;
 pub mod vision;
 pub mod vless;
@@ -23,7 +24,7 @@ pub mod xray_sidecar;
 
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
-    InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity,
+    InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity, TunConfig,
 };
 pub use dns_cache::DnsCache;
 pub use reality::RealityClient;

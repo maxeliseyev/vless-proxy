@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  System-wide vproxy (TUN mode) as a launchd daemon on macOS.
+
+  install:
+    sudo cp target/release/vproxy /usr/local/bin/vproxy
+    sudo mkdir -p /usr/local/etc/vproxy && sudo cp config.toml /usr/local/etc/vproxy/config.toml   # set tun.enabled = true
+    sudo cp docs/launchd/com.vproxy.tun.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.vproxy.tun.plist
+  stop / remove:
+    sudo launchctl bootout system/com.vproxy.tun
+  logs:
+    tail -f /var/log/vproxy.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.vproxy.tun</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/vproxy</string>
+    <string>--config</string>
+    <string>/usr/local/etc/vproxy/config.toml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- so `sing-box` from Homebrew is found; or set tun.sing_box_path in config.toml -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/vproxy.log</string>
+  <key>StandardErrorPath</key><string>/var/log/vproxy.log</string>
+</dict>
+</plist>

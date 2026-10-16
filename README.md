@@ -40,6 +40,10 @@
   - REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз, поэтому момент переключения на raw-копирование известен точно
   - UDP на порт 443 отклоняется (как в Xray), чтобы QUIC упал на TCP; `-udp443` разрешает
 - **xray-core sidecar** остаётся только для Vision поверх обычного `security=tls`
+- **TUN-режим (весь системный трафик)** через `sing-box` sidecar: `sudo vproxy --tun ...`
+  - sing-box держит TUN-интерфейс и отдаёт всё в локальный SOCKS5 vproxy, как это устроено в Happ
+  - конфиг sing-box генерируется автоматически и исключает петли: трафик самого vproxy, sing-box, xray и адрес VLESS-сервера идут напрямую, их DNS тоже
+  - `--print-tun-config` печатает сгенерированный конфиг; секция `[tun]` в TOML управляет адресом, MTU, стеком, DNS и bypass-списками
 - **минимальная DNS policy**
   - `remote` resolve по умолчанию
   - опциональный `local` resolve через system DNS
@@ -103,6 +107,10 @@
 - `auto` (default) — нативно; sidecar только для Vision поверх plain TLS
 - `native` — всегда нативно; Vision поверх plain TLS отклоняется
 - `xray` — всегда sidecar для REALITY/Vision
+
+### `tun`
+
+Собственного TUN-стека нет и не планируется. `tun.rs` генерирует конфиг для `sing-box` (tun-inbound → socks-outbound на наш inbound) и запускает его sidecar-процессом рядом с сервером, останавливая по тому же сигналу. Требуется root и установленный `sing-box` (`brew install sing-box` или путь в `tun.sing_box_path`). Примеры автозапуска: `docs/launchd/` (macOS) и `docs/systemd/` (Linux).
 
 ### `socks5` и `http`
 

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Local SOCKS5/HTTP proxy only (no TUN), as a per-user launchd agent.
+
+  install:
+    mkdir -p ~/.config/vproxy && cp config.toml ~/.config/vproxy/config.toml
+    sed "s#HOME#$HOME#g" docs/launchd/com.vproxy.local.plist > ~/Library/LaunchAgents/com.vproxy.local.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vproxy.local.plist
+  stop / remove:
+    launchctl bootout gui/$(id -u)/com.vproxy.local
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.vproxy.local</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/vproxy</string>
+    <string>--config</string>
+    <string>HOME/.config/vproxy/config.toml</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>HOME/Library/Logs/vproxy.log</string>
+  <key>StandardErrorPath</key><string>HOME/Library/Logs/vproxy.log</string>
+</dict>
+</plist>

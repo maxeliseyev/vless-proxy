@@ -157,6 +157,7 @@ mod tests {
                 xray_path: "xray".to_string(),
                 reality_engine: "auto".to_string(),
             },
+            tun: Default::default(),
         }
     }
 
