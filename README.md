@@ -27,6 +27,14 @@
 - **async relay** через Tokio
 - **TOML-конфиг** с валидацией
 - **vless:// URL parser** для быстрого запуска без конфига
+- **Native REALITY transport** (Rust, без xray-core)
+  - клиентская часть протокола REALITY портирована из Xray-core: auth key через X25519 + HKDF, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512
+  - работает поверх форка `rustls` с одним хуком (`ClientConfig::session_id_hook`), см. `[patch.crates-io]` в `Cargo.toml`
+  - принимает `vless://` ссылки с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`
+  - `vproxy --probe` делает один handshake и показывает результат
+- **XTLS Vision через xray-core sidecar**
+  - `flow=xtls-rprx-vision` пока не реализован нативно и автоматически уходит в `xray-core`
+  - для этого нужен установленный `xray-core` binary
 - **минимальная DNS policy**
   - `remote` resolve по умолчанию
   - опциональный `local` resolve через system DNS
@@ -74,6 +82,18 @@
 - `serve(...)` поднимает локальный inbound и dispatch-ит его по протоколу
 
 Это уже готовит проект к встраиванию в другие приложения: CLI не содержит внутри себя сетевую логику, а использует ту же библиотеку, которую позже можно будет оборачивать в iOS bridge/FFI.
+
+### `reality` и `reality_tls`
+
+`reality` содержит чистые примитивы протокола REALITY (без I/O), проверенные на векторах, сгенерированных Go-криптографией из Xray-core. `reality_tls` встраивает их в rustls: своя X25519 key-exchange группа (чтобы знать секрет key share), хук на `session_id` первого ClientHello и `ServerCertVerifier`, который принимает только сертификат, подписанный HMAC от выведенного auth key. Для этого используется форк rustls (`../rustls`, ветка `reality-0.23`) с патчем в ~75 строк.
+
+### `xray_sidecar`
+
+Для `flow = "xtls-rprx-vision"` используется `xray-core` как sidecar-процесс, пока Vision не реализован нативно. Переключатель `runtime.reality_engine`:
+
+- `auto` (default) — нативный REALITY, sidecar только если нужен Vision
+- `native` — всегда нативно; конфиг с Vision отклоняется
+- `xray` — всегда sidecar для REALITY/Vision
 
 ### `socks5` и `http`
 
@@ -127,8 +147,17 @@ address = "194.87.235.91"
 port = 443
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 security = "reality"
+encryption = "none"
+sni = "www.intel.com"
+fingerprint = "chrome"
 reality_public_key = "T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8"
 reality_short_id = "b59cfeedfabf9f"
+flow = "xtls-rprx-vision"
+spider_x = "/"
+
+[runtime]
+reality_engine = "auto"
+xray_path = "xray"
 ```
 
 ### Runtime параметры
@@ -140,6 +169,8 @@ reality_short_id = "b59cfeedfabf9f"
 - `write_timeout_secs` (default: 60) — таймаут записи в сокет (1 мин)
 - `idle_timeout_secs` (default: 600) — таймаут бездействия (10 мин)
 - `max_connections` (default: 1024) — лимит одновременных соединений
+- `reality_engine` (default: `auto`) — `auto` / `native` / `xray`, см. раздел `xray_sidecar`
+- `xray_path` (default: `xray`) — путь к `xray-core` для sidecar mode (сейчас нужен только для Vision)
 
 ### DNS кэш
 
@@ -223,7 +254,10 @@ vless://uuid@host:port?security=tls&sni=example.com#remark
 - `sni` — SNI для TLS/REALITY
 - `encryption` — тип шифрования (default: `none`)
 - `pbk` — PUBLIC_KEY для REALITY
-- `sid` — SHORT_ID для REALITY (16 hex символов)
+- `sid` — SHORT_ID для REALITY (до 16 hex символов, чётное количество)
+- `fp` — fingerprint для REALITY (например `chrome`)
+- `flow` — flow для REALITY/Vision (сейчас поддерживается `xtls-rprx-vision`)
+- `spx` — spiderX для REALITY
 - Fragment (`#remark`) — название сервера (отображается в логах)
 
 Примеры URL:
@@ -231,8 +265,8 @@ vless://uuid@host:port?security=tls&sni=example.com#remark
 # TLS сервер
 vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls
 
-# REALITY сервер
-vless://uuid@host:port?security=reality&pbk=PUBLIC_KEY&sid=SHORT_ID&sni=www.example.com
+# REALITY / Vision сервер
+vless://uuid@host:port?type=tcp&security=reality&encryption=none&pbk=PUBLIC_KEY&sid=SHORT_ID&sni=www.example.com&fp=chrome&spx=%2F&flow=xtls-rprx-vision
 
 # С кастомным SNI
 vless://a1b2c3d4-e5f6-7890-abcd-ef1234567890@server.com:443?security=tls&sni=cdn.example.com
@@ -321,7 +355,8 @@ Options:
 
 - полноценный DNS engine / cache / DNS rules
 - MUX
-- XTLS/REALITY и другие расширения
+- native Rust реализация XTLS Vision (`xtls-rprx-vision`)
+- мимикрия ClientHello под браузерный отпечаток (uTLS-style)
 - встроенный FFI-safe API для Swift/Objective-C
 - production-oriented service management внутри самого приложения
 

@@ -26,10 +26,10 @@ async fn socks5_tcp_round_trip_works_end_to_end() -> Result<()> {
         );
         assert_eq!(request.port, 7000);
 
-        send_vless_response(&mut stream).await?;
         let mut payload = [0u8; 4];
         stream.read_exact(&mut payload).await?;
         assert_eq!(&payload, b"ping");
+        send_vless_response(&mut stream).await?;
         stream.write_all(&payload).await?;
         stream.flush().await?;
         Ok(())
@@ -61,10 +61,10 @@ async fn http_connect_round_trip_works_end_to_end() -> Result<()> {
         );
         assert_eq!(request.port, 443);
 
-        send_vless_response(&mut stream).await?;
         let mut payload = [0u8; 4];
         stream.read_exact(&mut payload).await?;
         assert_eq!(&payload, b"pong");
+        send_vless_response(&mut stream).await?;
         stream.write_all(&payload).await?;
         stream.flush().await?;
         Ok(())
@@ -100,12 +100,12 @@ async fn http_proxy_request_rewrites_to_origin_form() -> Result<()> {
         );
         assert_eq!(request.port, 80);
 
-        send_vless_response(&mut stream).await?;
         let request_headers = read_http_headers(&mut stream).await?;
         assert!(request_headers.starts_with("GET /path?q=1 HTTP/1.1\r\n"));
         assert!(request_headers.contains("Host: example.com\r\n"));
         assert!(!request_headers.contains("Proxy-Connection"));
 
+        send_vless_response(&mut stream).await?;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             .await?;
@@ -142,9 +142,9 @@ async fn socks5_udp_associate_relays_datagrams_end_to_end() -> Result<()> {
         );
         assert_eq!(request.port, 5353);
 
-        send_vless_response(&mut stream).await?;
         let payload = vless::read_udp_frame(&mut stream).await?;
         assert_eq!(payload, b"hello-udp");
+        send_vless_response(&mut stream).await?;
         vless::write_udp_frame(&mut stream, &payload).await?;
         stream.flush().await?;
         Ok(())
@@ -220,8 +220,13 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             uuid: Uuid::nil(),
             use_tls: false,
             security: "none".to_string(),
+            encryption: "none".to_string(),
+            sni: None,
+            fingerprint: None,
             reality_public_key: None,
             reality_short_id: None,
+            flow: None,
+            spider_x: None,
         },
         inbound: InboundConfig {
             address: Ipv4Addr::LOCALHOST.to_string(),
@@ -240,6 +245,8 @@ async fn spawn_proxy(protocol: &str, server_addr: SocketAddr) -> Result<ProxyHar
             write_timeout_secs: 10,
             idle_timeout_secs: 60,
             max_connections: 100,
+            xray_path: "xray".to_string(),
+            reality_engine: "auto".to_string(),
         },
     };
 
@@ -382,6 +389,8 @@ async fn read_vless_address(stream: &mut TcpStream) -> Result<vless::Address> {
     })
 }
 
+/// Like Xray-core, the mock only sends the VLESS response header together with
+/// the first downstream bytes.
 async fn send_vless_response(stream: &mut TcpStream) -> Result<()> {
     stream.write_all(&[vless::VERSION, 0]).await?;
     stream.flush().await?;

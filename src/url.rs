@@ -9,11 +9,13 @@ pub struct VlessUrl {
     pub port: u16,
     pub security: String,
     pub sni: Option<String>,
+    pub fingerprint: Option<String>,
     pub encryption: String,
     pub remark: Option<String>,
     pub reality_public_key: Option<String>,
     pub reality_short_id: Option<String>,
     pub flow: Option<String>,
+    pub spider_x: Option<String>,
 }
 
 impl VlessUrl {
@@ -49,6 +51,12 @@ impl VlessUrl {
             }
         }
 
+        if let Some(transport) = params.get("type") {
+            if !transport.eq_ignore_ascii_case("tcp") {
+                bail!("Only type=tcp is currently supported");
+            }
+        }
+
         let security = params
             .get("security")
             .cloned()
@@ -57,6 +65,7 @@ impl VlessUrl {
             .get("sni")
             .cloned()
             .or_else(|| params.get("host").cloned());
+        let fingerprint = params.get("fp").cloned();
         let encryption = params
             .get("encryption")
             .cloned()
@@ -64,6 +73,7 @@ impl VlessUrl {
         let reality_public_key = params.get("pbk").cloned();
         let reality_short_id = params.get("sid").cloned();
         let flow = params.get("flow").cloned();
+        let spider_x = params.get("spx").cloned();
 
         Ok(VlessUrl {
             uuid,
@@ -71,11 +81,13 @@ impl VlessUrl {
             port,
             security,
             sni,
+            fingerprint,
             encryption,
             remark: fragment,
             reality_public_key,
             reality_short_id,
             flow,
+            spider_x,
         })
     }
 
@@ -86,6 +98,7 @@ impl VlessUrl {
 
 fn parse_host_port(input: &str) -> Result<(String, u16)> {
     let input = input.split('?').next().unwrap_or(input);
+    let input = input.strip_suffix('/').unwrap_or(input);
 
     if input.starts_with('[') {
         let end_bracket = input
@@ -210,5 +223,26 @@ mod tests {
     fn rejects_non_vless_scheme() {
         let url = "http://example.com";
         assert!(VlessUrl::parse(url).is_err());
+    }
+
+    #[test]
+    fn parses_reality_vision_url() {
+        let url = "vless://1b71598d-e3cd-4cf0-8c99-d1ce08ad4881@194.87.235.91:443/?type=tcp&encryption=none&security=reality&pbk=T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8&fp=chrome&sni=www.intel.com&sid=b59cfeedfabf9f&spx=%2F&flow=xtls-rprx-vision#2ei7r2pe";
+        let parsed = VlessUrl::parse(url).unwrap();
+
+        assert_eq!(parsed.host, "194.87.235.91");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(parsed.security, "reality");
+        assert_eq!(parsed.encryption, "none");
+        assert_eq!(parsed.sni.as_deref(), Some("www.intel.com"));
+        assert_eq!(parsed.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(
+            parsed.reality_public_key.as_deref(),
+            Some("T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8")
+        );
+        assert_eq!(parsed.reality_short_id.as_deref(), Some("b59cfeedfabf9f"));
+        assert_eq!(parsed.spider_x.as_deref(), Some("/"));
+        assert_eq!(parsed.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(parsed.remark.as_deref(), Some("2ei7r2pe"));
     }
 }

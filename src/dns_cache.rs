@@ -76,7 +76,7 @@ impl DnsCache {
 
         if entries.len() >= self.config.max_entries {
             self.evict_expired(&mut entries).await;
-            
+
             if entries.len() >= self.config.max_entries {
                 self.evict_oldest(&mut entries).await;
             }
@@ -280,25 +280,41 @@ mod tests {
         });
 
         cache
-            .insert("first.com", vec![IpAddr::from([127u8, 0, 0, 1])], Duration::from_secs(10))
+            .insert(
+                "first.com",
+                vec![IpAddr::from([127u8, 0, 0, 1])],
+                Duration::from_secs(10),
+            )
             .await;
-        
+
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         cache
-            .insert("second.com", vec![IpAddr::from([127u8, 0, 0, 2])], Duration::from_secs(300))
+            .insert(
+                "second.com",
+                vec![IpAddr::from([127u8, 0, 0, 2])],
+                Duration::from_secs(300),
+            )
             .await;
-        
+
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         cache
-            .insert("third.com", vec![IpAddr::from([127u8, 0, 0, 3])], Duration::from_secs(300))
+            .insert(
+                "third.com",
+                vec![IpAddr::from([127u8, 0, 0, 3])],
+                Duration::from_secs(300),
+            )
             .await;
 
         assert_eq!(cache.len().await, 3);
 
         cache
-            .insert("fourth.com", vec![IpAddr::from([127u8, 0, 0, 4])], Duration::from_secs(300))
+            .insert(
+                "fourth.com",
+                vec![IpAddr::from([127u8, 0, 0, 4])],
+                Duration::from_secs(300),
+            )
             .await;
 
         assert_eq!(cache.len().await, 3);
@@ -311,10 +327,18 @@ mod tests {
         let cache = DnsCache::new(DnsCacheConfig::default());
 
         cache
-            .insert("example.com", vec![IpAddr::from([127u8, 0, 0, 1])], Duration::from_secs(60))
+            .insert(
+                "example.com",
+                vec![IpAddr::from([127u8, 0, 0, 1])],
+                Duration::from_secs(60),
+            )
             .await;
         cache
-            .insert("test.com", vec![IpAddr::from([127u8, 0, 0, 2])], Duration::from_secs(60))
+            .insert(
+                "test.com",
+                vec![IpAddr::from([127u8, 0, 0, 2])],
+                Duration::from_secs(60),
+            )
             .await;
 
         assert_eq!(cache.len().await, 2);
@@ -330,10 +354,18 @@ mod tests {
         let cache = DnsCache::new(DnsCacheConfig::default());
 
         cache
-            .insert("example.com", vec![IpAddr::from([127u8, 0, 0, 1])], Duration::from_secs(60))
+            .insert(
+                "example.com",
+                vec![IpAddr::from([127u8, 0, 0, 1])],
+                Duration::from_secs(60),
+            )
             .await;
         cache
-            .insert("test.com", vec![IpAddr::from([127u8, 0, 0, 2])], Duration::from_secs(60))
+            .insert(
+                "test.com",
+                vec![IpAddr::from([127u8, 0, 0, 2])],
+                Duration::from_secs(60),
+            )
             .await;
 
         assert_eq!(cache.len().await, 2);

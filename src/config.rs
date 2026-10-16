@@ -50,10 +50,20 @@ pub struct ServerConfig {
     pub use_tls: bool,
     #[serde(default = "default_security")]
     pub security: String,
+    #[serde(default = "default_encryption")]
+    pub encryption: String,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     #[serde(default)]
     pub reality_public_key: Option<String>,
     #[serde(default)]
     pub reality_short_id: Option<String>,
+    #[serde(default)]
+    pub flow: Option<String>,
+    #[serde(default)]
+    pub spider_x: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +157,19 @@ pub struct RuntimeConfig {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    #[serde(default = "default_xray_path")]
+    pub xray_path: String,
+    /// How REALITY connections are made: `auto` (native Rust unless the flow
+    /// needs XTLS Vision, which still requires xray-core), `native` or `xray`.
+    #[serde(default = "default_reality_engine")]
+    pub reality_engine: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealityEngine {
+    Auto,
+    Native,
+    Xray,
 }
 
 fn default_runtime_config() -> RuntimeConfig {
@@ -156,7 +179,13 @@ fn default_runtime_config() -> RuntimeConfig {
         write_timeout_secs: default_write_timeout(),
         idle_timeout_secs: default_idle_timeout(),
         max_connections: default_max_connections(),
+        xray_path: default_xray_path(),
+        reality_engine: default_reality_engine(),
     }
+}
+
+fn default_reality_engine() -> String {
+    "auto".to_string()
 }
 
 fn default_connect_timeout() -> u64 {
@@ -179,12 +208,20 @@ fn default_max_connections() -> usize {
     1024
 }
 
+fn default_xray_path() -> String {
+    "xray".to_string()
+}
+
 fn default_tls() -> bool {
     true
 }
 
 fn default_security() -> String {
     "tls".to_string()
+}
+
+fn default_encryption() -> String {
+    "none".to_string()
 }
 
 fn socks5() -> String {
@@ -240,6 +277,31 @@ impl Config {
     pub fn dns_ip_strategy(&self) -> Result<DnsIpStrategy> {
         self.dns.ip_strategy()
     }
+
+    /// Whether this configuration must be served by the xray-core sidecar.
+    ///
+    /// REALITY itself is handled natively; XTLS Vision (`flow = xtls-rprx-vision`)
+    /// is not implemented in Rust yet and still needs xray-core.
+    pub fn needs_xray_sidecar(&self) -> Result<bool> {
+        let reality = matches!(
+            self.server.transport_security()?,
+            TransportSecurity::Reality
+        );
+        let vision = self.server.flow.as_deref() == Some("xtls-rprx-vision");
+        match self.runtime.reality_engine()? {
+            RealityEngine::Xray => Ok(reality || vision),
+            RealityEngine::Auto => Ok(vision),
+            RealityEngine::Native => {
+                if vision {
+                    bail!(
+                        "flow = \"xtls-rprx-vision\" is not supported by the native engine yet; \
+                         set runtime.reality_engine = \"xray\" or \"auto\""
+                    );
+                }
+                Ok(false)
+            }
+        }
+    }
 }
 
 impl Config {
@@ -258,9 +320,12 @@ impl Config {
         }
 
         self.server.transport_security()?;
+        self.server.validate_transport_settings()?;
         self.inbound.protocol_kind()?;
         self.dns.resolve_mode()?;
+        self.needs_xray_sidecar()?;
         self.dns.ip_strategy()?;
+        self.runtime.validate()?;
 
         Ok(())
     }
@@ -288,6 +353,72 @@ impl ServerConfig {
             }
             other => bail!("Unsupported server.security value: {other}"),
         }
+    }
+
+    pub fn validate_transport_settings(&self) -> Result<()> {
+        if self.encryption.trim().to_ascii_lowercase() != "none" {
+            bail!("Only server.encryption = \"none\" is currently supported");
+        }
+
+        if self.flow.is_some() && !matches!(self.transport_security()?, TransportSecurity::Reality)
+        {
+            bail!("server.flow is only supported with security = \"reality\"");
+        }
+
+        if let Some(flow) = &self.flow {
+            if flow != "xtls-rprx-vision" {
+                bail!("Unsupported server.flow value: {flow}");
+            }
+        }
+
+        match self.transport_security()? {
+            TransportSecurity::Tls | TransportSecurity::None => Ok(()),
+            TransportSecurity::Reality => {
+                if !self.use_tls {
+                    bail!("security = \"reality\" requires use_tls = true");
+                }
+
+                let public_key = self
+                    .reality_public_key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("REALITY requires server.reality_public_key"))?;
+                if public_key.trim().is_empty() {
+                    bail!("REALITY public key must not be empty");
+                }
+
+                let short_id = self
+                    .reality_short_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("REALITY requires server.reality_short_id"))?;
+                validate_reality_short_id(short_id)?;
+
+                let sni = self.tls_server_name();
+                if sni.trim().is_empty() {
+                    bail!("REALITY requires server.sni or a non-empty server.address");
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    pub fn tls_server_name(&self) -> &str {
+        self.sni.as_deref().unwrap_or(&self.address)
+    }
+
+    pub fn needs_xray_sidecar(&self) -> Result<bool> {
+        Ok(
+            matches!(self.transport_security()?, TransportSecurity::Reality)
+                || self.flow.as_deref() == Some("xtls-rprx-vision"),
+        )
+    }
+
+    pub fn reality_fingerprint(&self) -> &str {
+        self.fingerprint.as_deref().unwrap_or("chrome")
+    }
+
+    pub fn reality_spider_x(&self) -> &str {
+        self.spider_x.as_deref().unwrap_or("/")
     }
 }
 
@@ -325,12 +456,64 @@ impl DnsConfig {
     }
 }
 
+impl RuntimeConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.connect_timeout_secs == 0 {
+            bail!("runtime.connect_timeout_secs must be > 0");
+        }
+        if self.read_timeout_secs == 0 {
+            bail!("runtime.read_timeout_secs must be > 0");
+        }
+        if self.write_timeout_secs == 0 {
+            bail!("runtime.write_timeout_secs must be > 0");
+        }
+        if self.idle_timeout_secs == 0 {
+            bail!("runtime.idle_timeout_secs must be > 0");
+        }
+        if self.max_connections == 0 {
+            bail!("runtime.max_connections must be > 0");
+        }
+        if self.xray_path.trim().is_empty() {
+            bail!("runtime.xray_path must not be empty");
+        }
+        self.reality_engine()?;
+        Ok(())
+    }
+
+    pub fn reality_engine(&self) -> Result<RealityEngine> {
+        match self.reality_engine.to_ascii_lowercase().as_str() {
+            "auto" => Ok(RealityEngine::Auto),
+            "native" => Ok(RealityEngine::Native),
+            "xray" => Ok(RealityEngine::Xray),
+            other => bail!(
+                "runtime.reality_engine must be \"auto\", \"native\" or \"xray\", got {other:?}"
+            ),
+        }
+    }
+}
+
 fn format_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn validate_reality_short_id(short_id: &str) -> Result<()> {
+    if short_id.is_empty() {
+        bail!("REALITY short ID must not be empty");
+    }
+    if short_id.len() > 16 {
+        bail!("REALITY short ID must be at most 16 hex chars");
+    }
+    if short_id.len() % 2 != 0 {
+        bail!("REALITY short ID must contain an even number of hex chars");
+    }
+    if !short_id.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("REALITY short ID must be hexadecimal");
+    }
+    Ok(())
 }
 
 impl Config {
@@ -341,8 +524,13 @@ impl Config {
             uuid: url.uuid,
             use_tls: url.use_tls(),
             security: url.security.clone(),
+            encryption: url.encryption.clone(),
+            sni: url.sni.clone(),
+            fingerprint: url.fingerprint.clone(),
             reality_public_key: url.reality_public_key.clone(),
             reality_short_id: url.reality_short_id.clone(),
+            flow: url.flow.clone(),
+            spider_x: url.spider_x.clone(),
         };
 
         let inbound = InboundConfig {
@@ -364,6 +552,8 @@ impl Config {
             write_timeout_secs: default_write_timeout(),
             idle_timeout_secs: default_idle_timeout(),
             max_connections: default_max_connections(),
+            xray_path: default_xray_path(),
+            reality_engine: default_reality_engine(),
         };
 
         Config {
@@ -387,8 +577,13 @@ mod tests {
                 uuid: Uuid::nil(),
                 use_tls: true,
                 security: "tls".to_string(),
+                encryption: "none".to_string(),
+                sni: None,
+                fingerprint: None,
                 reality_public_key: None,
                 reality_short_id: None,
+                flow: None,
+                spider_x: None,
             },
             inbound: InboundConfig {
                 address: "127.0.0.1".to_string(),
@@ -407,6 +602,8 @@ mod tests {
                 write_timeout_secs: default_write_timeout(),
                 idle_timeout_secs: default_idle_timeout(),
                 max_connections: default_max_connections(),
+                xray_path: default_xray_path(),
+                reality_engine: default_reality_engine(),
             },
         }
     }
@@ -515,6 +712,7 @@ mod tests {
         assert_eq!(config.runtime.write_timeout_secs, 60);
         assert_eq!(config.runtime.idle_timeout_secs, 600);
         assert_eq!(config.runtime.max_connections, 1024);
+        assert_eq!(config.runtime.xray_path, "xray");
     }
 
     #[test]
@@ -527,5 +725,53 @@ mod tests {
         assert_eq!(config.runtime.connect_timeout_secs, 5);
         assert_eq!(config.runtime.read_timeout_secs, 120);
         assert_eq!(config.runtime.max_connections, 500);
+    }
+
+    #[test]
+    fn accepts_reality_transport_settings() {
+        let mut config = base_config();
+        config.server.security = "reality".to_string();
+        config.server.encryption = "none".to_string();
+        config.server.sni = Some("www.intel.com".to_string());
+        config.server.fingerprint = Some("chrome".to_string());
+        config.server.reality_public_key =
+            Some("T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8".to_string());
+        config.server.reality_short_id = Some("b59cfeedfabf9f".to_string());
+        config.server.flow = Some("xtls-rprx-vision".to_string());
+        config.server.spider_x = Some("/".to_string());
+
+        assert_eq!(
+            config.server.transport_security().unwrap(),
+            TransportSecurity::Reality
+        );
+        assert!(config.server.needs_xray_sidecar().unwrap());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_reality_short_id() {
+        let mut config = base_config();
+        config.server.security = "reality".to_string();
+        config.server.reality_public_key = Some("key".to_string());
+        config.server.reality_short_id = Some("xyz".to_string());
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("REALITY short ID"));
+    }
+
+    #[test]
+    fn builds_config_from_reality_url() {
+        let url = VlessUrl::parse("vless://1b71598d-e3cd-4cf0-8c99-d1ce08ad4881@194.87.235.91:443/?type=tcp&encryption=none&security=reality&pbk=T7Rcq-PPtLm4PGQgW5IxLI9CUdH8sSDqo_tGiFPtXD8&fp=chrome&sni=www.intel.com&sid=b59cfeedfabf9f&spx=%2F&flow=xtls-rprx-vision#2ei7r2pe").unwrap();
+        let config = Config::from_vless_url(&url, 1080);
+
+        assert_eq!(config.server.address, "194.87.235.91");
+        assert_eq!(config.server.sni.as_deref(), Some("www.intel.com"));
+        assert_eq!(config.server.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(config.server.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(config.server.spider_x.as_deref(), Some("/"));
+        assert_eq!(
+            config.server.reality_short_id.as_deref(),
+            Some("b59cfeedfabf9f")
+        );
     }
 }

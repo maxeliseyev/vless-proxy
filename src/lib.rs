@@ -12,11 +12,13 @@ pub mod dns;
 pub mod dns_cache;
 pub mod http;
 pub mod reality;
+pub mod reality_tls;
 pub mod runtime;
 pub mod socks5;
 pub mod tls;
 pub mod url;
 pub mod vless;
+pub mod xray_sidecar;
 
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,

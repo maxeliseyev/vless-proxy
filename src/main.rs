@@ -11,6 +11,7 @@ struct Args {
     inbound_port: Option<u16>,
     verbose: bool,
     check_config: bool,
+    probe: bool,
 }
 
 #[tokio::main]
@@ -26,8 +27,13 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Arc::new(load_config(args.clone())?);
+    let sidecar = if config.needs_xray_sidecar()? {
+        config.runtime.xray_path.as_str()
+    } else {
+        "native"
+    };
     info!(
-        "Loaded config (inbound: {}, security: {:?}, dns: {:?}/{:?}, runtime: max_conn={}, timeouts: connect={}s/read={}s/write={}s/idle={}s)",
+        "Loaded config (inbound: {}, security: {:?}, dns: {:?}/{:?}, runtime: max_conn={}, timeouts: connect={}s/read={}s/write={}s/idle={}s, transport={})",
         config.inbound_addr(),
         config.transport_security()?,
         config.dns_resolve_mode()?,
@@ -37,10 +43,17 @@ async fn main() -> Result<()> {
         config.runtime.read_timeout_secs,
         config.runtime.write_timeout_secs,
         config.runtime.idle_timeout_secs,
+        sidecar,
     );
 
     if args.check_config {
         info!("Configuration is valid");
+        return Ok(());
+    }
+
+    if args.probe {
+        let report = vproxy::runtime::probe_transport(config.as_ref()).await?;
+        info!("{report}");
         return Ok(());
     }
 
@@ -57,7 +70,13 @@ fn load_config(args: Args) -> Result<Config> {
         if let Some(remark) = &url.remark {
             info!("Using VLESS server: {}", remark);
         }
-        info!("Server: {}:{} (TLS: {})", url.host, url.port, url.use_tls());
+        info!(
+            "Server: {}:{} (security: {}, tls: {})",
+            url.host,
+            url.port,
+            url.security,
+            url.use_tls()
+        );
 
         Ok(config)
     } else if let Some(config_path) = args.config_path {
@@ -74,6 +93,7 @@ fn parse_args() -> Result<Args> {
     let mut inbound_port = None;
     let mut verbose = false;
     let mut check_config = false;
+    let mut probe = false;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -108,6 +128,7 @@ fn parse_args() -> Result<Args> {
             }
             Some("-v") | Some("--verbose") => verbose = true,
             Some("--check-config") => check_config = true,
+            Some("--probe") => probe = true,
             Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
@@ -136,6 +157,7 @@ fn parse_args() -> Result<Args> {
         inbound_port,
         verbose,
         check_config,
+        probe,
     })
 }
 
@@ -153,6 +175,7 @@ Options:
   -p, --inbound-port <PORT> Local inbound port (default: 1080)
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
+      --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
   -h, --help                Show this help
 
 Examples:

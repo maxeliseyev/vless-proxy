@@ -1,10 +1,15 @@
-use crate::config::{Config, DnsConfig, InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity};
+use crate::config::{
+    Config, DnsConfig, InboundProtocol, RuntimeConfig, ServerConfig, TransportSecurity,
+};
 use crate::dns::ResolverPolicy;
 use crate::http;
+use crate::reality::RealityClient;
+use crate::reality_tls::RealityConnector;
 use crate::socks5;
 use crate::tls::{self, MaybeTlsStream};
-use crate::vless::{self, Address, Request, Response};
-use anyhow::Result;
+use crate::vless::{self, Address, Request, VlessStream};
+use crate::xray_sidecar;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +54,7 @@ impl ProxyClient {
         &self,
         address: Address,
         port: u16,
-    ) -> Result<MaybeTlsStream<TcpStream>> {
+    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
         self.connect_with_command(vless::Command::Tcp, address, port)
             .await
     }
@@ -58,7 +63,7 @@ impl ProxyClient {
         &self,
         address: Address,
         port: u16,
-    ) -> Result<MaybeTlsStream<TcpStream>> {
+    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
         self.connect_with_command(vless::Command::Udp, address, port)
             .await
     }
@@ -68,9 +73,9 @@ impl ProxyClient {
         command: vless::Command,
         address: Address,
         port: u16,
-    ) -> Result<MaybeTlsStream<TcpStream>> {
+    ) -> Result<VlessStream<MaybeTlsStream<TcpStream>>> {
         let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
-        
+
         let mut remote = timeout(connect_timeout, connect_remote(&self.server))
             .await
             .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
@@ -83,12 +88,11 @@ impl ProxyClient {
             address: request_address.clone(),
         };
 
-        let response = setup_vless_session(&mut remote, &request).await?;
-        debug!(
-            "VLESS server acknowledged request with version {} and {} addon bytes",
-            response.version,
-            response.addons.len()
-        );
+        // The server answers with the VLESS response header only together with
+        // the first downstream bytes, so the header is consumed lazily by
+        // `VlessStream` instead of being awaited here.
+        send_vless_request(&mut remote, &request).await?;
+        let remote = VlessStream::new(remote);
         if request_address != address {
             debug!(
                 "Resolved target locally before VLESS connect: {}:{} -> {}:{}",
@@ -101,11 +105,17 @@ impl ProxyClient {
 }
 
 pub async fn serve(config: Arc<Config>) -> Result<()> {
+    if xray_sidecar::should_use(config.as_ref())? {
+        return xray_sidecar::run(config).await;
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    
-    let mut ctrl_c_stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigterm_stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    
+
+    let mut ctrl_c_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     let shutdown_signal = async {
         tokio::select! {
             _ = ctrl_c_stream.recv() => {
@@ -152,7 +162,11 @@ async fn serve_socks5_with_limits(
 ) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(config.server.clone(), config.dns.clone(), config.runtime.clone())?;
+    let connector = ProxyClient::new(
+        config.server.clone(),
+        config.dns.clone(),
+        config.runtime.clone(),
+    )?;
 
     info!(
         "Listening on {} (inbound: {}, max_connections: {})",
@@ -171,11 +185,11 @@ async fn serve_socks5_with_limits(
             }
             accept_result = listener.accept() => {
                 let (client, addr) = accept_result?;
-                
+
                 let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_connections > config.runtime.max_connections {
                     connection_count.fetch_sub(1, Ordering::Relaxed);
-                    warn!("Rejecting connection from {}: max connections ({}) reached", 
+                    warn!("Rejecting connection from {}: max connections ({}) reached",
                           addr, config.runtime.max_connections);
                     continue;
                 }
@@ -185,7 +199,7 @@ async fn serve_socks5_with_limits(
                 let connector = connector.clone();
                 let connection_count = connection_count.clone();
                 let permit = semaphore.clone().acquire_owned().await?;
-                
+
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_socks5_connection(client, connector).await {
@@ -203,7 +217,7 @@ async fn serve_socks5_with_limits(
 
 async fn handle_socks5_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
     let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
-    
+
     let request = timeout(read_timeout, socks5::accept_request(&mut client))
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timeout"))??;
@@ -309,7 +323,11 @@ async fn serve_http_with_limits(
 ) -> Result<()> {
     let listener =
         TcpListener::bind((config.inbound.address.as_str(), config.inbound.port)).await?;
-    let connector = ProxyClient::new(config.server.clone(), config.dns.clone(), config.runtime.clone())?;
+    let connector = ProxyClient::new(
+        config.server.clone(),
+        config.dns.clone(),
+        config.runtime.clone(),
+    )?;
 
     info!(
         "Listening on {} (inbound: {}, max_connections: {})",
@@ -328,11 +346,11 @@ async fn serve_http_with_limits(
             }
             accept_result = listener.accept() => {
                 let (client, addr) = accept_result?;
-                
+
                 let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_connections > config.runtime.max_connections {
                     connection_count.fetch_sub(1, Ordering::Relaxed);
-                    warn!("Rejecting connection from {}: max connections ({}) reached", 
+                    warn!("Rejecting connection from {}: max connections ({}) reached",
                           addr, config.runtime.max_connections);
                     continue;
                 }
@@ -342,7 +360,7 @@ async fn serve_http_with_limits(
                 let connector = connector.clone();
                 let connection_count = connection_count.clone();
                 let permit = semaphore.clone().acquire_owned().await?;
-                
+
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = handle_http_connection(client, connector).await {
@@ -360,7 +378,7 @@ async fn serve_http_with_limits(
 
 async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
     let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
-    
+
     let request = match timeout(read_timeout, http::accept_request(&mut client)).await {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
@@ -459,12 +477,12 @@ where
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => return Err(anyhow::anyhow!("Read timeout from client")),
                 };
-                
+
                 timeout(write_timeout, b.write_all(&buf_a[..n]))
                     .await
                     .map_err(|_| anyhow::anyhow!("Write timeout to remote"))??;
                 b.flush().await?;
-                
+
                 a_to_b += n as u64;
                 last_activity = Instant::now();
             }
@@ -479,12 +497,12 @@ where
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => return Err(anyhow::anyhow!("Read timeout from remote")),
                 };
-                
+
                 timeout(write_timeout, a.write_all(&buf_b[..n]))
                     .await
                     .map_err(|_| anyhow::anyhow!("Write timeout to client"))??;
                 a.flush().await?;
-                
+
                 b_to_a += n as u64;
                 last_activity = Instant::now();
             }
@@ -662,21 +680,55 @@ async fn create_udp_tunnel(
     })
 }
 
+fn reality_client(server: &ServerConfig) -> Result<RealityClient> {
+    RealityClient::new(
+        server.tls_server_name(),
+        server.reality_public_key.as_deref().unwrap_or(""),
+        server.reality_short_id.as_deref().unwrap_or(""),
+    )
+}
+
+/// Connect to the configured server once, complete the transport handshake
+/// and describe the result. Used by `vproxy --probe`.
+pub async fn probe_transport(config: &Config) -> Result<String> {
+    let server = &config.server;
+    let remote = tokio::time::timeout(
+        Duration::from_secs(config.runtime.connect_timeout_secs),
+        connect_remote(server),
+    )
+    .await
+    .context("transport handshake timed out")??;
+
+    Ok(match remote {
+        MaybeTlsStream::Plain(_) => format!("plain TCP to {}", server.endpoint()),
+        MaybeTlsStream::Tls(_) => format!(
+            "TLS handshake OK with {} (sni {})",
+            server.endpoint(),
+            server.tls_server_name()
+        ),
+        MaybeTlsStream::Reality(stream) => {
+            let info = crate::reality_tls::connection_info(&stream, server.tls_server_name());
+            format!(
+                "REALITY handshake OK with {} (sni {}, alpn {}, suite {}): server certificate authenticated",
+                server.endpoint(),
+                info.server_name,
+                info.alpn.as_deref().unwrap_or("none"),
+                info.cipher_suite
+            )
+        }
+    })
+}
+
 async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStream>> {
     match server.transport_security()? {
         TransportSecurity::Tls => {
-            let tls = tls::TlsClient::new(server.address.clone())?;
+            let tls = tls::TlsClient::new(server.tls_server_name().to_string())?;
             tls.connect((server.address.as_str(), server.port)).await
         }
         TransportSecurity::Reality => {
-            let pbk = server.reality_public_key.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("REALITY requires pbk (public key)"))?;
-            let sid = server.reality_short_id.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("REALITY requires sid (short ID)"))?;
-            let sni = server.address.clone();
-            
-            let reality = crate::reality::RealityClient::new(&server.address, &sni, pbk, sid)?;
-            let stream = reality.connect((server.address.as_str(), server.port)).await?;
+            let client = reality_client(server)?;
+            let tcp = TcpStream::connect((server.address.as_str(), server.port)).await?;
+            let stream = RealityConnector::new(client).connect(tcp).await?;
             Ok(MaybeTlsStream::Reality(stream))
         }
         TransportSecurity::None => {
@@ -686,13 +738,13 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
     }
 }
 
-async fn setup_vless_session(
+async fn send_vless_request(
     remote: &mut MaybeTlsStream<TcpStream>,
     request: &Request,
-) -> Result<Response> {
+) -> Result<()> {
     request.write_to(remote).await?;
     remote.flush().await?;
-    Response::read_from(remote).await
+    Ok(())
 }
 
 async fn wait_for_tcp_close(stream: &mut TcpStream) -> Result<()> {

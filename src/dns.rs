@@ -73,27 +73,27 @@ impl ResolverPolicy {
 
     fn find_matching_rule(&self, domain: &str) -> Option<&DnsRule> {
         let domain_lower = domain.to_lowercase();
-        
+
         for rule in &self.rules {
             if let Some(suffix) = &rule.domain_suffix {
                 if domain_lower.ends_with(&suffix.to_lowercase()) {
                     return Some(rule);
                 }
             }
-            
+
             if let Some(exact) = &rule.domain {
                 if domain_lower == exact.to_lowercase() {
                     return Some(rule);
                 }
             }
-            
+
             if let Some(keyword) = &rule.domain_keyword {
                 if domain_lower.contains(&keyword.to_lowercase()) {
                     return Some(rule);
                 }
             }
         }
-        
+
         None
     }
 
@@ -116,9 +116,8 @@ impl ResolverPolicy {
         let ip_addresses: Vec<IpAddr> = addresses.iter().map(|addr| addr.ip()).collect();
         self.cache.insert(domain, ip_addresses.clone(), ttl).await;
 
-        let ip = select_ip(addresses.into_iter(), self.strategy).ok_or_else(|| {
-            anyhow::anyhow!("No DNS answer matched strategy for {domain}")
-        })?;
+        let ip = select_ip(addresses.into_iter(), self.strategy)
+            .ok_or_else(|| anyhow::anyhow!("No DNS answer matched strategy for {domain}"))?;
 
         Ok(match ip {
             IpAddr::V4(ipv4) => Address::Ipv4(ipv4),

@@ -1,7 +1,10 @@
 use anyhow::Result;
 use std::fmt::{self, Display, Formatter};
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{ready, Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
 pub const VERSION: u8 = 0;
@@ -75,6 +78,131 @@ impl Response {
         reader.read_exact(&mut addons).await?;
 
         Ok(Self { version, addons })
+    }
+}
+
+/// A VLESS session whose response header is consumed lazily.
+///
+/// Servers such as Xray-core do not send the VLESS response header until they
+/// have the first bytes of downstream data, so a client that waits for the
+/// header before relaying anything deadlocks on client-speaks-first protocols
+/// (HTTP, TLS). This wrapper strips the header from the first bytes read and
+/// is transparent afterwards.
+pub struct VlessStream<S> {
+    inner: S,
+    state: ResponseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseState {
+    Header { filled: usize, bytes: [u8; 2] },
+    Addons { remaining: usize },
+    Ready,
+}
+
+impl<S> VlessStream<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            state: ResponseState::Header {
+                filled: 0,
+                bytes: [0; 2],
+            },
+        }
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// `true` once the response header has been read and validated.
+    pub fn response_received(&self) -> bool {
+        self.state == ResponseState::Ready
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for VlessStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            match this.state {
+                ResponseState::Ready => return Pin::new(&mut this.inner).poll_read(cx, buf),
+                ResponseState::Header { filled, mut bytes } => {
+                    let mut scratch = [0u8; 2];
+                    let mut tmp = ReadBuf::new(&mut scratch[..2 - filled]);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut tmp))?;
+                    let got = tmp.filled().len();
+                    if got == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "VLESS connection closed before response header",
+                        )));
+                    }
+                    bytes[filled..filled + got].copy_from_slice(tmp.filled());
+                    let filled = filled + got;
+                    if filled < 2 {
+                        this.state = ResponseState::Header { filled, bytes };
+                        continue;
+                    }
+                    if bytes[0] != VERSION {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Unsupported VLESS response version: {}", bytes[0]),
+                        )));
+                    }
+                    this.state = match bytes[1] as usize {
+                        0 => ResponseState::Ready,
+                        remaining => ResponseState::Addons { remaining },
+                    };
+                }
+                ResponseState::Addons { remaining } => {
+                    let mut scratch = [0u8; 255];
+                    let mut tmp = ReadBuf::new(&mut scratch[..remaining]);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut tmp))?;
+                    let got = tmp.filled().len();
+                    if got == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "VLESS connection closed inside response addons",
+                        )));
+                    }
+                    this.state = match remaining - got {
+                        0 => ResponseState::Ready,
+                        remaining => ResponseState::Addons { remaining },
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for VlessStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -197,5 +325,52 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("<= 65535 bytes"));
+    }
+
+    #[tokio::test]
+    async fn vless_stream_strips_response_header_split_across_reads() {
+        let (mut server, client) = tokio::io::duplex(64);
+        let mut stream = VlessStream::new(client);
+
+        server.write_all(&[VERSION]).await.unwrap();
+        server.write_all(&[2]).await.unwrap();
+        server.write_all(&[0xAA]).await.unwrap();
+        server.write_all(&[0xBB, b'o', b'k']).await.unwrap();
+
+        let mut out = [0u8; 2];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"ok");
+        assert!(stream.response_received());
+
+        server.write_all(b"more").await.unwrap();
+        let mut out = [0u8; 4];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"more");
+    }
+
+    #[tokio::test]
+    async fn vless_stream_rejects_bad_version_and_early_eof() {
+        let (mut server, client) = tokio::io::duplex(64);
+        let mut stream = VlessStream::new(client);
+        server.write_all(&[7, 0, b'x']).await.unwrap();
+        let err = stream.read_u8().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let (server, client) = tokio::io::duplex(64);
+        let mut stream = VlessStream::new(client);
+        drop(server);
+        let err = stream.read_u8().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn vless_stream_writes_pass_through_before_response() {
+        let (mut server, client) = tokio::io::duplex(64);
+        let mut stream = VlessStream::new(client);
+        stream.write_all(b"client-first").await.unwrap();
+        let mut got = [0u8; 12];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"client-first");
+        assert!(!stream.response_received());
     }
 }

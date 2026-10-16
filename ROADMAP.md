@@ -45,15 +45,49 @@
      - обычные HTTP proxy requests
    - **Комментарий:** это закрывает наиболее практичный локальный client-facing слой для desktop/terminal использования.
 
-5. **UDP milestone**
-   - Добавлен VLESS UDP framing поверх stream transport.
-   - Добавлен SOCKS5 `UDP ASSOCIATE`.
-   - Добавлена runtime-маршрутизация UDP datagram'ов в отдельные VLESS UDP-сессии по целевому адресу.
-   - **Комментарий:** это важный шаг от “игрушечного TCP-only proxy” к более полноценному клиенту.
+ 5. **UDP milestone**
+    - Добавлен VLESS UDP framing поверх stream transport.
+    - Добавлен SOCKS5 `UDP ASSOCIATE`.
+    - Добавлена runtime-маршрутизация UDP datagram'ов в отдельные VLESS UDP-сессии по целевому адресу.
+    - **Комментарий:** это важный шаг от "игрушечного TCP-only proxy" к более полноценному клиенту.
 
-6. **Документация проекта**
-   - README отражает текущее устройство проекта.
-   - **Комментарий:** без актуальной документации быстро теряется понимание, где MVP уже закрыт, а где ещё нет.
+ 6. **Документация проекта**
+    - README отражает текущее устройство проекта.
+    - **Комментарий:** без актуальной документации быстро теряется понимание, где MVP уже закрыт, а где ещё нет.
+
+ 7. **vless:// URL support**
+    - Добавлен парсер vless:// ссылок
+    - Поддержка TLS, REALITY, none security
+    - Параметры: `pbk`, `sid`, `sni`, `flow`, `encryption`
+    - Автогенерация конфига из URL
+    - **Комментарий:** упрощает запуск — не нужно создавать конфиг вручную.
+
+ 8. **Runtime hardening**
+    - Таймауты: connect, read, write, idle
+    - Graceful shutdown (SIGINT/SIGTERM)
+    - Лимит соединений (`max_connections`)
+    - Защита от зависаний
+    - **Комментарий:** превращает рабочий прототип в production-ready инструмент.
+
+ 9. **DNS rules + cache**
+    - Split DNS: правила для доменов (suffix, exact, keyword)
+    - DNS cache с TTL, eviction, лимитами
+    - Настройка через `[dns.rules]` и `[dns.cache]`
+    - **Комментарий:** уменьшает DNS-запросы и позволяет гибко управлять резолвингом.
+
+ 10. **REALITY transport (sidecar)**
+     - Поддержка `vless://` REALITY/Vision параметров: `pbk`, `sid`, `sni`, `fp`, `flow`, `spx`
+     - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
+     - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
+
+ 11. **Native REALITY (2026-10-16)**
+     - `src/reality.rs`: примитивы протокола, тесты на векторах из Go-криптографии Xray-core
+     - форк rustls (`../rustls`, ветка `reality-0.23`) с хуком `ClientConfig::session_id_hook`
+     - `src/reality_tls.rs`: X25519 key share, session-id hook, HMAC-проверка сертификата, `RealityConnector`
+     - `runtime.reality_engine = auto | native | xray`, `vproxy --probe`
+     - проверено сквозным тестом против локального xray-core 26.7.28 REALITY-сервера
+     - попутно исправлен deadlock: VLESS response header читается лениво (`vless::VlessStream`), как его шлёт Xray
+     - **Комментарий:** решение принято осознанно — проект должен быть своим ядром, а не конфиг-генератором для xray-core.
 
 ## 3. Архитектурные решения, которые уже считаются принятыми
 
@@ -247,12 +281,17 @@ Core логика должна жить в библиотеке, а не в би
 
 ### XTLS/REALITY и расширенные transport-режимы
 
-Пока не делаем.
+**REALITY реализован нативно (milestone 11). Vision пока через `xray-core` sidecar.**
 
-Почему откладываем:
+Что уже закрыто:
+- нативный REALITY handshake в Rust runtime (`reality.rs` + `reality_tls.rs` + форк rustls)
+- `vless://` URLs с `security=reality`, параметры `pbk`, `sid`, `sni`, `fp`, `spx`
+- рабочий route для `flow=xtls-rprx-vision` через upstream `xray-core`
 
-- это отдельный сложный transport layer
-- сначала нужно укрепить уже существующий TLS/VLESS core
+**Следующие шаги именно в этом порядке:**
+1. **XTLS Vision нативно** — порт `proxy/proxy.go` из Xray-core: паддинг первых записей и переход на сырую пересылку TCP после завершения внутреннего TLS 1.3 handshake. После него sidecar можно будет убрать совсем.
+2. **Отпечаток ClientHello.** REALITY-сервер его не проверяет, но пересылает наш ClientHello на `dest` и зеркалит размеры ответа. rustls шлёт не-браузерный hello (свой набор шифров, случайный порядок расширений, без GREASE). Делать только если DPI или конкретные `dest` начнут ломать соединение.
+3. Поддерживать патч rustls маленьким, чтобы переносить его на новые 0.23.x одной командой.
 
 ## 7. Отдельная ветка: путь к iOS
 
@@ -277,8 +316,10 @@ Core логика должна жить в библиотеке, а не в би
 - локальные SOCKS5 и HTTP inbound
 - корректный конфиг
 - e2e tests
-- базовый DNS path
-- устойчивый runtime
+- базовый DNS path + rules + cache
+- устойчивый runtime (таймауты, shutdown, лимиты)
+- vless:// URL support
+- базовая REALITY поддержка
 - понятная документация и сценарии запуска
 
 Это ещё не “полный аналог Xray/sing-box”, но уже сильный самостоятельный terminal VLESS client.
@@ -287,8 +328,8 @@ Core логика должна жить в библиотеке, а не в би
 
 Если продолжать прямо отсюда, следующий практический milestone:
 
-1. **runtime hardening**
-2. **конфиг следующего уровня**
-3. **MUX / transport extensions only if still justified**
+1. **Native XTLS Vision** — последний кусок, ради которого ещё нужен sidecar
+2. **Service/ops слой** — systemd/launchd примеры
+3. **MUX / transport extensions** only if still justified
 
 Именно в таком порядке.
