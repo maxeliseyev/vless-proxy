@@ -124,33 +124,80 @@ impl ServerList {
         let Some(chosen) = &entry.link else {
             return Ok(());
         };
-        let content = std::fs::read_to_string(path)?;
-        let mut comments = Vec::new();
-        let mut links = Vec::new();
-        for line in content.lines() {
-            let t = line.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if t.starts_with('#') {
-                comments.push(line.to_string());
-            } else if t != chosen {
-                links.push(t.to_string());
-            }
-        }
-        let mut out = String::new();
-        for c in comments {
-            out.push_str(&c);
-            out.push('\n');
-        }
-        out.push_str(chosen);
-        out.push('\n');
-        for l in links {
-            out.push_str(&l);
-            out.push('\n');
-        }
-        std::fs::write(path, out).with_context(|| format!("Cannot write {}", path.display()))
+        rewrite_links_file(path, Some(chosen), None)
     }
+
+    /// Add a server from a `vless://` link and append it to the links file.
+    /// A link already in the list is rejected.
+    pub fn add_link(&mut self, link: &str, inbound_port: u16) -> Result<&ServerEntry> {
+        let entry = ServerEntry::from_link(link, inbound_port)?;
+        let link = entry.link.as_deref().unwrap_or_default();
+        if self.entries.iter().any(|e| e.link.as_deref() == Some(link)) {
+            bail!("{} is already in the list", entry.name);
+        }
+        if let Some(path) = &self.file {
+            let mut content = std::fs::read_to_string(path).unwrap_or_default();
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(link);
+            content.push('\n');
+            std::fs::write(path, content)
+                .with_context(|| format!("Cannot write {}", path.display()))?;
+        }
+        self.entries.push(entry);
+        Ok(self.entries.last().expect("just pushed"))
+    }
+
+    /// Remove entry `index` from the list and from the links file. The last
+    /// server cannot be removed.
+    pub fn remove(&mut self, index: usize) -> Result<ServerEntry> {
+        if index >= self.entries.len() {
+            bail!("server index {index} out of range");
+        }
+        if self.entries.len() == 1 {
+            bail!("cannot remove the last server");
+        }
+        if let (Some(path), Some(link)) = (&self.file, &self.entries[index].link) {
+            rewrite_links_file(path, None, Some(link))?;
+        }
+        Ok(self.entries.remove(index))
+    }
+}
+
+/// Rewrite a links file: comments stay on top, `first` (if present in the
+/// file) moves to the top of the links, `drop` is removed, every other line
+/// is kept verbatim so a hand-edited file is never damaged.
+fn rewrite_links_file(path: &Path, first: Option<&str>, drop: Option<&str>) -> Result<()> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let mut comments = Vec::new();
+    let mut links = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || Some(t) == drop {
+            continue;
+        }
+        if t.starts_with('#') {
+            comments.push(line.to_string());
+        } else if Some(t) != first {
+            links.push(t.to_string());
+        }
+    }
+    let mut out = String::new();
+    for c in comments {
+        out.push_str(&c);
+        out.push('\n');
+    }
+    if let Some(first) = first {
+        out.push_str(first);
+        out.push('\n');
+    }
+    for l in links {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    std::fs::write(path, out).with_context(|| format!("Cannot write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -188,6 +235,54 @@ mod tests {
 
         let reloaded = ServerList::from_file(&path, 1080).unwrap();
         assert_eq!(reloaded.entries[0].name, "1.2.3.4:443");
+    }
+
+    #[test]
+    fn adds_and_removes_links_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.txt");
+        std::fs::write(&path, format!("# my servers\n{A}")).unwrap();
+
+        let mut list = ServerList::from_file(&path, 1080).unwrap();
+        assert_eq!(list.add_link(B, 1080).unwrap().name, "beta");
+        assert_eq!(
+            list.add_link(&format!("  {C}\n"), 1080).unwrap().kind(),
+            "reality+vision"
+        );
+        assert!(list
+            .add_link(B, 1080)
+            .unwrap_err()
+            .to_string()
+            .contains("already"));
+        assert!(list.add_link("vless://broken", 1080).is_err());
+        assert_eq!(list.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("# my servers\n{A}\n{B}\n{C}\n")
+        );
+
+        let removed = list.remove(1).unwrap();
+        assert_eq!(removed.name, "beta");
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("# my servers\n{A}\n{C}\n")
+        );
+        list.remove(0).unwrap();
+        assert!(list.remove(0).unwrap_err().to_string().contains("last"));
+        assert_eq!(
+            ServerList::from_file(&path, 1080).unwrap().entries[0].name,
+            "1.2.3.4:443"
+        );
+    }
+
+    #[test]
+    fn in_memory_list_without_a_file() {
+        let mut list = ServerList::single(ServerEntry::from_link(A, 1080).unwrap().server);
+        list.add_link(B, 1080).unwrap();
+        assert_eq!(list.len(), 2);
+        list.remove(0).unwrap();
+        assert_eq!(list.entries[0].name, "beta");
     }
 
     #[test]

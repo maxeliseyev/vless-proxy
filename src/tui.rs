@@ -6,8 +6,10 @@ use crate::runtime::ActiveServer;
 use crate::servers::ServerList;
 use crate::stats::{human_bytes, Snapshot, STATS};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -90,7 +92,17 @@ impl<'a> MakeWriter<'a> for LogSink {
     }
 }
 
+/// What the keyboard currently drives.
+enum Mode {
+    Normal,
+    /// Typing or pasting a `vless://` link.
+    Adding(String),
+    /// `d` pressed on a server; `y`/Enter removes it.
+    ConfirmDelete(usize),
+}
+
 struct App {
+    mode: Mode,
     config: Arc<Config>,
     servers: ServerList,
     active: ActiveServer,
@@ -126,6 +138,115 @@ impl App {
         self.selected = ((self.selected as i32 + delta).rem_euclid(n)) as usize;
     }
 
+    fn remove_at(&mut self, i: usize) {
+        if i == self.active_index {
+            self.status = "cannot remove the active server, switch first".to_string();
+            return;
+        }
+        match self.servers.remove(i) {
+            Ok(entry) => {
+                if i < self.active_index {
+                    self.active_index -= 1;
+                }
+                self.selected = i.min(self.servers.len().saturating_sub(1));
+                self.status = format!("removed {}", entry.name);
+            }
+            Err(e) => self.status = format!("cannot remove: {e}"),
+        }
+    }
+
+    fn add_link(&mut self, link: &str) {
+        let link = link.trim();
+        if link.is_empty() {
+            self.status = "nothing to add".to_string();
+            return;
+        }
+        match self.servers.add_link(link, self.config.inbound.port) {
+            Ok(entry) => {
+                self.status = format!("added {}", entry.name);
+                self.selected = self.servers.len() - 1;
+            }
+            Err(e) => self.status = format!("cannot add: {e}"),
+        }
+    }
+
+    /// Returns true when the key asks to quit.
+    fn handle_key(&mut self, key: event::KeyEvent) -> bool {
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        match &mut self.mode {
+            Mode::Adding(input) => {
+                if ctrl_c {
+                    return true;
+                }
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status = "add cancelled".to_string();
+                    }
+                    KeyCode::Enter => {
+                        let link = std::mem::take(input);
+                        self.mode = Mode::Normal;
+                        self.add_link(&link);
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.push(c);
+                    }
+                    _ => {}
+                }
+                false
+            }
+            Mode::ConfirmDelete(i) => {
+                let i = *i;
+                self.mode = Mode::Normal;
+                if ctrl_c {
+                    return true;
+                }
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.remove_at(i),
+                    _ => self.status = "remove cancelled".to_string(),
+                }
+                false
+            }
+            Mode::Normal => {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.select(-1),
+                    KeyCode::Down | KeyCode::Char('j') => self.select(1),
+                    KeyCode::Enter => self.switch_to_selected(),
+                    KeyCode::Char('a') => {
+                        self.mode = Mode::Adding(String::new());
+                        self.status =
+                            "paste a vless:// link, Enter to add, Esc to cancel".to_string();
+                    }
+                    KeyCode::Char('d') | KeyCode::Delete => {
+                        if let Some(entry) = self.servers.entries.get(self.selected) {
+                            if self.selected == self.active_index {
+                                self.status =
+                                    "cannot remove the active server, switch first".to_string();
+                            } else if self.servers.len() == 1 {
+                                self.status = "cannot remove the last server".to_string();
+                            } else {
+                                self.mode = Mode::ConfirmDelete(self.selected);
+                                self.status = format!("remove {}? y/n", entry.name);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c
+            }
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
+        if let Mode::Adding(input) = &mut self.mode {
+            input.push_str(text.trim());
+        }
+    }
+
     fn switch_to_selected(&mut self) {
         let Some(entry) = self.servers.entries.get(self.selected) else {
             return;
@@ -147,16 +268,19 @@ impl App {
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let list_height = if self.servers.len() > 1 {
+        let adding = matches!(self.mode, Mode::Adding(_));
+        let list_height = if self.servers.len() > 1 || adding {
             (self.servers.len() as u16 + 2).min(8)
         } else {
             0
         };
+        let input_height = if adding { 3 } else { 0 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(list_height),
+                Constraint::Length(input_height),
                 Constraint::Length(3),
                 Constraint::Min(3),
                 Constraint::Length(1),
@@ -244,11 +368,34 @@ impl App {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" servers (↑↓ select, Enter switch) "),
+                        .title(" servers (↑↓ select, Enter switch, a add, d remove) "),
                 )
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▶ ");
             frame.render_stateful_widget(list, chunks[1], &mut state);
+        }
+
+        if let Mode::Adding(input) = &self.mode {
+            let area = chunks[2];
+            let width = area.width.saturating_sub(2) as usize;
+            // Keep the end of a long link visible while typing.
+            let skip = input
+                .chars()
+                .count()
+                .saturating_sub(width.saturating_sub(1));
+            let shown: String = input.chars().skip(skip).collect();
+            frame.render_widget(
+                Paragraph::new(shown.as_str()).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" add server: paste vless:// link, Enter to add, Esc to cancel "),
+                ),
+                area,
+            );
+            frame.set_cursor_position(Position::new(
+                area.x + 1 + shown.chars().count() as u16,
+                area.y + 1,
+            ));
         }
 
         let s = STATS.snapshot();
@@ -277,10 +424,10 @@ impl App {
         ]);
         frame.render_widget(
             Paragraph::new(stats).block(Block::default().borders(Borders::ALL).title(" traffic ")),
-            chunks[2],
+            chunks[3],
         );
 
-        let height = chunks[3].height.saturating_sub(2) as usize;
+        let height = chunks[4].height.saturating_sub(2) as usize;
         let lines: Vec<Line> = self
             .logs
             .tail(height)
@@ -302,7 +449,7 @@ impl App {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(" log ")),
-            chunks[3],
+            chunks[4],
         );
 
         frame.render_widget(
@@ -312,10 +459,14 @@ impl App {
                 Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" server  "),
                 Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                Span::raw(" switch   "),
+                Span::raw(" switch  "),
+                Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" add  "),
+                Span::styled(" d ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" remove   "),
                 Span::styled(&self.status, Style::default().fg(Color::Yellow)),
             ])),
-            chunks[4],
+            chunks[5],
         );
     }
 }
@@ -329,6 +480,7 @@ pub async fn run(
     mut server: JoinHandle<Result<()>>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
     let active_index = servers
         .entries
         .iter()
@@ -337,6 +489,7 @@ pub async fn run(
         })
         .unwrap_or(0);
     let mut app = App {
+        mode: Mode::Normal,
         config,
         servers,
         active,
@@ -360,19 +513,15 @@ pub async fn run(
 
         // Drain pending key events without blocking the async loop.
         while event::poll(Duration::ZERO).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            let quit = match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                Ok(Event::Paste(text)) => {
+                    app.paste(&text);
+                    false
                 }
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => app.select(-1),
-                    KeyCode::Down | KeyCode::Char('j') => app.select(1),
-                    KeyCode::Enter => app.switch_to_selected(),
-                    _ => {}
-                }
-                let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL));
+                _ => false,
+            };
+            {
                 if quit && !quitting {
                     quitting = true;
                     app.status = "shutting down…".to_string();
@@ -392,6 +541,7 @@ pub async fn run(
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
+    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     outcome
 }
