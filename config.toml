@@ -13,6 +13,9 @@ port = 443
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 use_tls = true
 security = "tls"
+# transport = "ws"            # WebSocket (Xray network = "ws"); not with reality/flow
+# ws_path = "/path"
+# ws_host = "cdn.example.com" # Host header, defaults to sni
 
 [dns]
 # remote = keep domain name in VLESS request and let the remote side resolve it

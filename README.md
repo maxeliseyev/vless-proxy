@@ -45,7 +45,9 @@ vproxy --probe -f server.txt         # один handshake с сервером и
 vproxy --print-tun-config -f server.txt   # показать сгенерированный конфиг sing-box
 ```
 
-Поддерживаются ссылки с `security=reality|tls|none`, `flow=xtls-rprx-vision`, параметрами `pbk`, `sid`, `sni`, `fp`, `spx`, и `#имя` сервера.
+Поддерживаются ссылки с `security=reality|tls|none`, транспортом `type=tcp|ws` (`path`, `host`), `flow=xtls-rprx-vision`, параметрами `pbk`, `sid`, `sni`, `fp`, `spx`, и `#имя` сервера.
+
+Конфиг Xray/Happ в JSON тоже подходит напрямую: `vproxy -c happ.json`. Берутся vless-outbound (адрес, uuid, tcp/ws, tls/reality), порт socks-inbound и правила `routing.rules` (domain/ip/port → direct/proxy/block; geosite/geoip переносятся как rule-set для TUN-режима).
 
 ## Конфиг
 
@@ -92,7 +94,7 @@ dns_via_proxy = true
 
 Главное достижение проекта: **протокольное ядро Xray перенесено на Rust и работает против боевых серверов без xray-core.**
 
-- **VLESS** поверх TCP/TLS: запрос, ленивый ответ, UDP-фреймы, SOCKS5 (`CONNECT`, `UDP ASSOCIATE`) и HTTP (`CONNECT`, обычные запросы) inbound.
+- **VLESS** поверх TCP/TLS и **WebSocket** (`type=ws`, бинарные фреймы как в Xray): запрос, ленивый ответ, UDP-фреймы, SOCKS5 (`CONNECT`, `UDP ASSOCIATE`) и HTTP (`CONNECT`, обычные запросы) inbound. Импорт конфигов Xray/Happ из JSON.
 - **REALITY нативно**: X25519 + HKDF auth key, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512, гибридный key share X25519MLKEM768, который требуют современные серверы. Поверх форка rustls с одним хуком в ~75 строк.
 - **XTLS Vision нативно**: паддинг на время внутреннего TLS-handshake и прямая пересылка TCP (direct copy) для TLS 1.3 без двойного шифрования. Для этого REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз.
 - **TUN-режим** по схеме Happ: sing-box держит интерфейс и отдаёт всё в локальный SOCKS5; конфиг генерируется автоматически и защищён от петель.

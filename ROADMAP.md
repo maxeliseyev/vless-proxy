@@ -80,6 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 18. **WebSocket-транспорт и импорт Xray JSON (2026-10-16)**
+     - `src/ws.rs`: WS поверх TLS или TCP через tokio-tungstenite (без его TLS), бинарные фреймы, адаптер AsyncRead/AsyncWrite; `type=ws` + `path`/`host` в ссылках, `server.transport`/`ws_path`/`ws_host` в TOML
+     - `src/xray_import.rs`: `vproxy -c happ.json` — vless-outbound, socks-inbound, `routing.rules` (domain:/full:/keyword:/geosite:, geoip:, cidr, порты)
+     - попутно найден и исправлен старый баг: `security=tls` падал с паникой rustls (две крипто-фичи в сборке), теперь провайдер задан явно, есть регрессионный тест
+     - проверено на боевом WS+TLS сервере: upgrade, трафик, 2 МБ по хэшу, upload; e2e-тест WS с mock-сервером
+
  17. **Первый запуск без аргументов (2026-10-16)**
      - поиск ссылки: `./server.txt` → `~/.config/vproxy/config.toml` → `~/.config/vproxy/server.txt`
      - интерактивный запрос `vless://` ссылки со stdin (без shell-кавычек), валидация, до трёх попыток, сохранение в `~/.config/vproxy/server.txt`

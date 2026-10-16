@@ -1,5 +1,5 @@
 use crate::config::{
-    Config, DnsConfig, InboundProtocol, RoutingConfig, RuntimeConfig, ServerConfig,
+    Config, DnsConfig, InboundProtocol, RoutingConfig, RuntimeConfig, ServerConfig, Transport,
     TransportSecurity,
 };
 use crate::dns::ResolverPolicy;
@@ -9,9 +9,10 @@ use crate::reality_tls::RealityConnector;
 use crate::routing::{Outbound, Router};
 use crate::socks5;
 use crate::stats::STATS;
-use crate::tls::{self, MaybeTlsStream};
+use crate::tls::{self, MaybeTlsStream, WsInner};
 use crate::vision::{Vision, FLOW_VISION};
 use crate::vless::{self, Address, Request, VlessStream, XtlsDirect};
+use crate::ws::WsStream;
 use crate::xray_sidecar;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -922,6 +923,13 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
             server.endpoint(),
             server.tls_server_name()
         ),
+        MaybeTlsStream::Ws(_) => format!(
+            "WebSocket upgrade OK with {} ({}, host {}, path {})",
+            server.endpoint(),
+            if server.use_tls { "tls" } else { "plain" },
+            server.ws_host(),
+            server.ws_path()
+        ),
         MaybeTlsStream::Reality(stream) => {
             let info = crate::reality_tls::connection_info(&stream, server.tls_server_name());
             format!(
@@ -936,20 +944,35 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
 }
 
 async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStream>> {
-    match server.transport_security()? {
-        TransportSecurity::Tls => {
+    let addr = (server.address.as_str(), server.port);
+    match (server.transport_kind()?, server.transport_security()?) {
+        (Transport::Tcp, TransportSecurity::Tls) => {
             let tls = tls::TlsClient::new(server.tls_server_name().to_string())?;
-            tls.connect((server.address.as_str(), server.port)).await
+            tls.connect(addr).await
         }
-        TransportSecurity::Reality => {
+        (Transport::Tcp, TransportSecurity::Reality) => {
             let client = reality_client(server)?;
-            let tcp = TcpStream::connect((server.address.as_str(), server.port)).await?;
+            let tcp = TcpStream::connect(addr).await?;
             let stream = RealityConnector::new(client).connect(tcp).await?;
             Ok(MaybeTlsStream::Reality(stream))
         }
-        TransportSecurity::None => {
-            let stream = TcpStream::connect((server.address.as_str(), server.port)).await?;
-            Ok(MaybeTlsStream::Plain(stream))
+        (Transport::Tcp, TransportSecurity::None) => {
+            Ok(MaybeTlsStream::Plain(TcpStream::connect(addr).await?))
+        }
+        (Transport::Ws, TransportSecurity::Tls) => {
+            let tls =
+                tls::TlsClient::with_alpn(server.tls_server_name().to_string(), &["http/1.1"])?;
+            let inner = WsInner::Tls(tls.connect_tls(addr).await?);
+            let ws = WsStream::connect(inner, server.ws_host(), server.ws_path()).await?;
+            Ok(MaybeTlsStream::Ws(ws))
+        }
+        (Transport::Ws, TransportSecurity::None) => {
+            let inner = WsInner::Plain(TcpStream::connect(addr).await?);
+            let ws = WsStream::connect(inner, server.ws_host(), server.ws_path()).await?;
+            Ok(MaybeTlsStream::Ws(ws))
+        }
+        (Transport::Ws, TransportSecurity::Reality) => {
+            anyhow::bail!("REALITY is not available over WebSocket")
         }
     }
 }

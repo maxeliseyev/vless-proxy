@@ -16,6 +16,10 @@ pub struct VlessUrl {
     pub reality_short_id: Option<String>,
     pub flow: Option<String>,
     pub spider_x: Option<String>,
+    /// `tcp` or `ws`
+    pub transport: String,
+    pub ws_path: Option<String>,
+    pub ws_host: Option<String>,
 }
 
 impl VlessUrl {
@@ -51,11 +55,14 @@ impl VlessUrl {
             }
         }
 
-        if let Some(transport) = params.get("type") {
-            if !transport.eq_ignore_ascii_case("tcp") {
-                bail!("Only type=tcp is currently supported");
-            }
-        }
+        let transport = match params.get("type").map(|t| t.to_ascii_lowercase()) {
+            None => "tcp".to_string(),
+            Some(t) if t == "tcp" || t == "raw" => "tcp".to_string(),
+            Some(t) if t == "ws" || t == "websocket" => "ws".to_string(),
+            Some(t) => bail!("Transport type={t} is not supported (tcp and ws are)"),
+        };
+        let ws_path = params.get("path").cloned().filter(|p| !p.is_empty());
+        let ws_host = params.get("host").cloned().filter(|h| !h.is_empty());
 
         let security = params
             .get("security")
@@ -88,6 +95,9 @@ impl VlessUrl {
             reality_short_id,
             flow,
             spider_x,
+            transport,
+            ws_path,
+            ws_host,
         })
     }
 
@@ -244,5 +254,23 @@ mod tests {
         assert_eq!(parsed.spider_x.as_deref(), Some("/"));
         assert_eq!(parsed.flow.as_deref(), Some("xtls-rprx-vision"));
         assert_eq!(parsed.remark.as_deref(), Some("2ei7r2pe"));
+    }
+
+    #[test]
+    fn parses_ws_tls_url() {
+        let url = VlessUrl::parse("vless://34ba3996-ef86-49b9-a481-d782b4ec7923@nearsky.example:443?type=ws&security=tls&path=%2Fygrouke6xa&host=cdn.example&sni=nearsky.example#ws-server").unwrap();
+        assert_eq!(url.transport, "ws");
+        assert_eq!(url.ws_path.as_deref(), Some("/ygrouke6xa"));
+        assert_eq!(url.ws_host.as_deref(), Some("cdn.example"));
+        assert_eq!(url.sni.as_deref(), Some("nearsky.example"));
+        assert!(url.use_tls());
+        assert!(
+            VlessUrl::parse("vless://34ba3996-ef86-49b9-a481-d782b4ec7923@h:443?type=grpc")
+                .is_err()
+        );
+        let tcp =
+            VlessUrl::parse("vless://34ba3996-ef86-49b9-a481-d782b4ec7923@h:443?security=tls")
+                .unwrap();
+        assert_eq!(tcp.transport, "tcp");
     }
 }

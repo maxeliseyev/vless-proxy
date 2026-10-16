@@ -30,6 +30,8 @@ aws-lc-rs = "1"
 libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [patch.crates-io]
 # vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook for REALITY.

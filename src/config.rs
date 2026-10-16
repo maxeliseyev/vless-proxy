@@ -169,6 +169,25 @@ pub struct ServerConfig {
     pub flow: Option<String>,
     #[serde(default)]
     pub spider_x: Option<String>,
+    /// `tcp` (default) or `ws` (WebSocket, Xray `network = "ws"`).
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// WebSocket request path (default `/`).
+    #[serde(default)]
+    pub ws_path: Option<String>,
+    /// WebSocket `Host` header (default: sni, then address).
+    #[serde(default)]
+    pub ws_host: Option<String>,
+}
+
+fn default_transport() -> String {
+    "tcp".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Tcp,
+    Ws,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,6 +309,12 @@ pub enum RealityEngine {
     Auto,
     Native,
     Xray,
+}
+
+impl RuntimeConfig {
+    pub fn default_values() -> Self {
+        default_runtime_config()
+    }
 }
 
 fn default_runtime_config() -> RuntimeConfig {
@@ -481,9 +506,40 @@ impl ServerConfig {
         }
     }
 
+    pub fn transport_kind(&self) -> Result<Transport> {
+        match self.transport.trim().to_ascii_lowercase().as_str() {
+            "" | "tcp" | "raw" => Ok(Transport::Tcp),
+            "ws" | "websocket" => Ok(Transport::Ws),
+            other => bail!("server.transport must be \"tcp\" or \"ws\", got {other:?}"),
+        }
+    }
+
+    pub fn ws_path(&self) -> &str {
+        self.ws_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/")
+    }
+
+    pub fn ws_host(&self) -> &str {
+        self.ws_host
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| self.tls_server_name())
+    }
+
     pub fn validate_transport_settings(&self) -> Result<()> {
         if self.encryption.trim().to_ascii_lowercase() != "none" {
             bail!("Only server.encryption = \"none\" is currently supported");
+        }
+
+        if self.transport_kind()? == Transport::Ws {
+            if matches!(self.transport_security()?, TransportSecurity::Reality) {
+                bail!("transport = \"ws\" cannot be combined with security = \"reality\"");
+            }
+            if self.flow.is_some() {
+                bail!("server.flow (XTLS Vision) is not available over transport = \"ws\"");
+            }
         }
 
         if self.flow.is_some() && !matches!(self.transport_security()?, TransportSecurity::Reality)
@@ -663,6 +719,9 @@ impl Config {
             reality_short_id: url.reality_short_id.clone(),
             flow: url.flow.clone(),
             spider_x: url.spider_x.clone(),
+            transport: url.transport.clone(),
+            ws_path: url.ws_path.clone(),
+            ws_host: url.ws_host.clone(),
             remark: url.remark.clone(),
         };
 
@@ -719,6 +778,9 @@ mod tests {
                 reality_short_id: None,
                 flow: None,
                 spider_x: None,
+                transport: "tcp".to_string(),
+                ws_path: None,
+                ws_host: None,
                 remark: None,
             },
             inbound: InboundConfig {

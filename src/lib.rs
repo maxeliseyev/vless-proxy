@@ -23,12 +23,14 @@ pub mod tun;
 pub mod url;
 pub mod vision;
 pub mod vless;
+pub mod ws;
+pub mod xray_import;
 pub mod xray_sidecar;
 
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
-    InboundProtocol, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, TransportSecurity,
-    TunConfig,
+    InboundProtocol, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, Transport,
+    TransportSecurity, TunConfig,
 };
 pub use dns_cache::DnsCache;
 pub use reality::RealityClient;

@@ -3,11 +3,12 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
+use vproxy::ws::WsStream;
 use vproxy::{
     serve, socks5, vless, Config, DnsCacheConfig, DnsConfig, InboundConfig, RoutingConfig,
     RoutingRule, RuntimeConfig, ServerConfig,
@@ -212,6 +213,38 @@ struct ObservedVlessRequest {
 }
 
 #[tokio::test]
+async fn websocket_transport_carries_the_vless_session() -> Result<()> {
+    let server = spawn_mock_vless_ws_server(|mut stream| async move {
+        let request = read_vless_request(&mut stream).await?;
+        assert_eq!(request.command, vless::Command::Tcp);
+        assert_eq!(
+            request.address,
+            vless::Address::Domain("echo.example".to_string())
+        );
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"ping");
+        send_vless_response(&mut stream).await?;
+        stream.write_all(b"pong").await?;
+        stream.flush().await?;
+        Ok(())
+    })
+    .await?;
+    let proxy = spawn_proxy_full("socks5", server.addr, RoutingConfig::default(), "ws").await?;
+
+    let mut client = timeout(TEST_TIMEOUT, TcpStream::connect(proxy.addr)).await??;
+    socks5_connect(&mut client, "echo.example", 7000).await?;
+    client.write_all(b"ping").await?;
+    let mut echoed = [0u8; 4];
+    timeout(TEST_TIMEOUT, client.read_exact(&mut echoed)).await??;
+    assert_eq!(&echoed, b"pong");
+
+    server.finish().await?;
+    proxy.stop();
+    Ok(())
+}
+
+#[tokio::test]
 async fn routing_direct_rule_bypasses_the_vless_server() -> Result<()> {
     // A plain TCP echo target that must be reached without any VLESS framing.
     let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -263,6 +296,15 @@ async fn spawn_proxy_with_routing(
     server_addr: SocketAddr,
     routing: RoutingConfig,
 ) -> Result<ProxyHarness> {
+    spawn_proxy_full(protocol, server_addr, routing, "tcp").await
+}
+
+async fn spawn_proxy_full(
+    protocol: &str,
+    server_addr: SocketAddr,
+    routing: RoutingConfig,
+    transport: &str,
+) -> Result<ProxyHarness> {
     let proxy_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserve_port()?));
     let config = Config {
         server: ServerConfig {
@@ -278,6 +320,9 @@ async fn spawn_proxy_with_routing(
             reality_short_id: None,
             flow: None,
             spider_x: None,
+            transport: transport.to_string(),
+            ws_path: Some("/vless-test".to_string()),
+            ws_host: Some("mock.example".to_string()),
             remark: None,
         },
         inbound: InboundConfig {
@@ -310,6 +355,37 @@ async fn spawn_proxy_with_routing(
         addr: proxy_addr,
         task,
     })
+}
+
+/// Like `spawn_mock_vless_server`, but speaks WebSocket (plain, no TLS).
+async fn spawn_mock_vless_ws_server<F, Fut>(handler: F) -> Result<MockServerHarness>
+where
+    F: FnOnce(WsStream<TcpStream>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (stream, _) = timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .map_err(|_| anyhow!("mock VLESS ws server accept timed out"))??;
+        let ws = tokio_tungstenite::accept_hdr_async(
+            stream,
+            |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+             resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                assert_eq!(req.uri().path(), "/vless-test");
+                assert_eq!(
+                    req.headers().get("host").and_then(|h| h.to_str().ok()),
+                    Some("mock.example")
+                );
+                Ok(resp)
+            },
+        )
+        .await?;
+        handler(WsStream::new(ws)).await
+    });
+
+    Ok(MockServerHarness { addr, task })
 }
 
 async fn spawn_mock_vless_server<F, Fut>(handler: F) -> Result<MockServerHarness>
@@ -411,7 +487,9 @@ async fn socks5_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr> {
     )))
 }
 
-async fn read_vless_request(stream: &mut TcpStream) -> Result<ObservedVlessRequest> {
+async fn read_vless_request<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<ObservedVlessRequest> {
     let version = stream.read_u8().await?;
     if version != vless::VERSION {
         return Err(anyhow!("unexpected VLESS version: {version}"));
@@ -442,7 +520,9 @@ async fn read_vless_request(stream: &mut TcpStream) -> Result<ObservedVlessReque
     })
 }
 
-async fn read_vless_address(stream: &mut TcpStream) -> Result<vless::Address> {
+async fn read_vless_address<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<vless::Address> {
     Ok(match stream.read_u8().await? {
         1 => {
             let mut octets = [0u8; 4];
@@ -466,13 +546,13 @@ async fn read_vless_address(stream: &mut TcpStream) -> Result<vless::Address> {
 
 /// Like Xray-core, the mock only sends the VLESS response header together with
 /// the first downstream bytes.
-async fn send_vless_response(stream: &mut TcpStream) -> Result<()> {
+async fn send_vless_response<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
     stream.write_all(&[vless::VERSION, 0]).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> Result<String> {
+async fn read_http_headers<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<String> {
     let mut buffer = Vec::new();
     loop {
         let mut byte = [0u8; 1];

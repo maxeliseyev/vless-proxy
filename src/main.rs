@@ -238,6 +238,26 @@ fn load_config(args: Args) -> Result<Config> {
         Ok(config)
     } else if let Some(config_path) = config_path {
         info!("Loading config from: {}", config_path.display());
+        if config_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            let config = vproxy::xray_import::load(&config_path, args.inbound_port)?;
+            info!(
+                "Imported Xray config: {} {}:{} ({} over {}{})",
+                config.server.remark.as_deref().unwrap_or("-"),
+                config.server.address,
+                config.server.port,
+                config.server.security,
+                config.server.transport,
+                if config.routing.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} routing rules", config.routing.rules.len())
+                }
+            );
+            return Ok(config);
+        }
         Config::load(&config_path)
     } else {
         anyhow::bail!("No config provided");
@@ -352,7 +372,7 @@ Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
 is, no quoting) and saves it to ~/.config/vproxy/server.txt.
 
 Options:
-  -c, --config <PATH>       Path to TOML config
+  -c, --config <PATH>       Path to TOML config, or an Xray/Happ JSON config (*.json)
   -u, --url <VLESS_URL>     VLESS link (vless://...), quote it in the shell
   -f, --url-file <PATH>     Read the vless:// link from a file (first non-comment line)
   -p, --inbound-port <PORT> Local inbound port (default: 1080)

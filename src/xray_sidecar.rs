@@ -136,6 +136,9 @@ mod tests {
                 reality_short_id: Some("b59cfeedfabf9f".to_string()),
                 flow: Some("xtls-rprx-vision".to_string()),
                 spider_x: Some("/".to_string()),
+                transport: "tcp".to_string(),
+                ws_path: None,
+                ws_host: None,
                 remark: None,
             },
             inbound: InboundConfig {
