@@ -80,6 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 16. **Релизы и установка (2026-10-16)**
+     - `.github/workflows/ci.yml`: fmt, clippy, тесты на ubuntu и macos
+     - `.github/workflows/release.yml`: по тегу `v*` сборки macOS arm64, macOS x86_64 (кросс с arm64-раннера), Linux x86_64; tar.gz + sha256 в GitHub Release
+     - `install.sh`: определяет платформу, качает последний релиз, проверяет sha256, ставит в `/usr/local/bin` или `~/.local/bin`
+     - `vproxy --version`, версия 0.2.0
+
  15. **Routing-правила (2026-10-16)**
      - `src/routing.rs`: `[routing]` с семантикой sing-box (AND внутри правила, OR в списках, первое совпадение); direct/proxy/block по domain*, ip_cidr, ip_private, port
      - runtime: `OutboundStream`/`UdpOutbound` — direct TCP и UDP мимо сервера, block → отказ
@@ -361,8 +367,8 @@ Core логика должна жить в библиотеке, а не в би
 Если продолжать прямо отсюда, следующий практический milestone:
 
 1. **Живая проверка `--tun`** под sudo при выключенном Happ (sing-box из Homebrew или из бандла Happ)
-2. **GitHub Actions релизы** (macOS arm64/x86_64, Linux x86_64) и `install.sh`
-3. **MUX / transport extensions** only if still justified
+2. **MUX / transport extensions** only if still justified
+3. **Переключение серверов в TUI** (несколько ссылок в `server.txt`)
 3. **MUX / transport extensions** only if still justified
 
 Именно в таком порядке.

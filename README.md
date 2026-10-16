@@ -389,6 +389,16 @@ Options:
 - встроенный FFI-safe API для Swift/Objective-C
 - production-oriented service management внутри самого приложения
 
+## Установка
+
+Готовые сборки (macOS Apple Silicon, macOS Intel, Linux x86-64) публикуются в GitHub Releases:
+
+```
+curl -fsSL https://raw.githubusercontent.com/maxeliseyev/vless-proxy/main/install.sh | sh
+```
+
+Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.2.0`, `VPROXY_PREFIX=~/.local/bin`. Для TUN-режима дополнительно нужен `sing-box` (`brew install sing-box`).
+
 ## Разработка
 
 Форматирование и тесты:

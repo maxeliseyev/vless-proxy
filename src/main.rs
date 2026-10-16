@@ -204,6 +204,10 @@ fn parse_args() -> Result<Args> {
                 print_help();
                 std::process::exit(0);
             }
+            Some("-V") | Some("--version") => {
+                println!("vproxy {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             Some(value) if value.starts_with('-') => {
                 anyhow::bail!("Unknown argument: {value}");
             }
@@ -256,6 +260,7 @@ Options:
       --print-tun-config    Print the generated sing-box config for --tun and exit
       --tui                 Terminal UI with live counters and logs (q to quit)
   -h, --help                Show this help
+  -V, --version             Print version
 
 Examples:
   vproxy config.toml
