@@ -138,9 +138,9 @@ impl ProxyClient {
                 .map_err(|_| anyhow::anyhow!("Direct connection timeout"))??;
                 Ok(OutboundStream::Direct(stream))
             }
-            Outbound::Proxy => Ok(OutboundStream::Proxy(
+            Outbound::Proxy => Ok(OutboundStream::Proxy(Box::new(
                 self.connect_target(address, port).await?,
-            )),
+            ))),
         }
     }
 
