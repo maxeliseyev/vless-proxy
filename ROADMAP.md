@@ -82,7 +82,7 @@
 
  11. **Native REALITY (2026-10-16)**
      - `src/reality.rs`: примитивы протокола, тесты на векторах из Go-криптографии Xray-core
-     - форк rustls (`../rustls`, ветка `reality-0.23`) с хуком `ClientConfig::session_id_hook`
+     - форк rustls ([maxeliseyev/rustls](https://github.com/maxeliseyev/rustls), ветка `reality-0.23`) с хуком `ClientConfig::session_id_hook`
      - `src/reality_tls.rs`: X25519 key share, session-id hook, HMAC-проверка сертификата, `RealityConnector`
      - `runtime.reality_engine = auto | native | xray`, `vproxy --probe`
      - проверено сквозным тестом против локального xray-core 26.7.28 REALITY-сервера

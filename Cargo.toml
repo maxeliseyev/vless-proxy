@@ -28,5 +28,6 @@ hmac = "0.12"
 x509-parser = "0.16"
 
 [patch.crates-io]
-# vproxy fork: adds ClientConfig::session_id_hook for REALITY (branch reality-0.23)
-rustls = { path = "../rustls/rustls" }
+# vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook for REALITY.
+# Branch reality-0.23, pinned to the commit that was tested.
+rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "2f338cae" }

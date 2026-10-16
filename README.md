@@ -85,7 +85,7 @@
 
 ### `reality` и `reality_tls`
 
-`reality` содержит чистые примитивы протокола REALITY (без I/O), проверенные на векторах, сгенерированных Go-криптографией из Xray-core. `reality_tls` встраивает их в rustls: своя X25519 key-exchange группа (чтобы знать секрет key share), хук на `session_id` первого ClientHello и `ServerCertVerifier`, который принимает только сертификат, подписанный HMAC от выведенного auth key. Для этого используется форк rustls (`../rustls`, ветка `reality-0.23`) с патчем в ~75 строк.
+`reality` содержит чистые примитивы протокола REALITY (без I/O), проверенные на векторах, сгенерированных Go-криптографией из Xray-core. `reality_tls` встраивает их в rustls: своя X25519 key-exchange группа (чтобы знать секрет key share), хук на `session_id` первого ClientHello и `ServerCertVerifier`, который принимает только сертификат, подписанный HMAC от выведенного auth key. Для этого используется форк rustls ([maxeliseyev/rustls](https://github.com/maxeliseyev/rustls), ветка `reality-0.23`) с патчем в ~75 строк.
 
 ### `xray_sidecar`
 
