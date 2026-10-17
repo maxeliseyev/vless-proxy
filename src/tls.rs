@@ -74,6 +74,8 @@ pub enum MaybeTlsStream<T> {
     Tls(tokio_rustls::client::TlsStream<T>),
     Reality(crate::reality_tls::RealityStream<T>),
     Ws(crate::ws::WsStream<WsInner<T>>),
+    /// XHTTP: the stream is carried by HTTP requests; the TCP type is unused.
+    Xhttp(crate::xhttp::XhttpStream),
 }
 
 /// What a WebSocket transport runs over.
@@ -133,6 +135,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeTlsStream<T> {
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             MaybeTlsStream::Reality(s) => Pin::new(s).poll_read(cx, buf),
             MaybeTlsStream::Ws(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Xhttp(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -148,6 +151,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             MaybeTlsStream::Reality(s) => Pin::new(s).poll_write(cx, buf),
             MaybeTlsStream::Ws(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Xhttp(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -157,6 +161,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
             MaybeTlsStream::Reality(s) => Pin::new(s).poll_flush(cx),
             MaybeTlsStream::Ws(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Xhttp(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -166,6 +171,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
             MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTlsStream::Reality(s) => Pin::new(s).poll_shutdown(cx),
             MaybeTlsStream::Ws(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Xhttp(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

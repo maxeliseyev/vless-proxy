@@ -14,8 +14,12 @@ uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 use_tls = true
 security = "tls"
 # transport = "ws"            # WebSocket (Xray network = "ws"); not with reality/flow
-# ws_path = "/path"
-# ws_host = "cdn.example.com" # Host header, defaults to sni
+# transport = "xhttp"         # XHTTP (Xray network = "xhttp"); tls, reality or none; not with flow
+# path = "/path"              # ws / xhttp request path
+# host = "cdn.example.com"    # ws / xhttp Host, defaults to sni
+# alpn = "h2,http/1.1"        # TLS ALPN; xhttp uses HTTP/2 when h2 is negotiated
+# xhttp_mode = "auto"         # auto (stream-one with reality, else packet-up), stream-one, stream-up, packet-up
+# xhttp_extra = '{"noGRPCHeader": true}'   # Xray xhttpSettings JSON (the link's extra=)
 
 [dns]
 # remote = keep domain name in VLESS request and let the remote side resolve it

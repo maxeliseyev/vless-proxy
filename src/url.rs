@@ -16,10 +16,14 @@ pub struct VlessUrl {
     pub reality_short_id: Option<String>,
     pub flow: Option<String>,
     pub spider_x: Option<String>,
-    /// `tcp` or `ws`
+    /// `tcp`, `ws` or `xhttp`
     pub transport: String,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
+    pub alpn: Option<String>,
+    /// XHTTP `mode` and `extra` (JSON) parameters.
+    pub xhttp_mode: Option<String>,
+    pub xhttp_extra: Option<String>,
 }
 
 impl VlessUrl {
@@ -59,10 +63,23 @@ impl VlessUrl {
             None => "tcp".to_string(),
             Some(t) if t == "tcp" || t == "raw" => "tcp".to_string(),
             Some(t) if t == "ws" || t == "websocket" => "ws".to_string(),
-            Some(t) => bail!("Transport type={t} is not supported (tcp and ws are)"),
+            Some(t) if t == "xhttp" || t == "splithttp" => "xhttp".to_string(),
+            Some(t) => bail!("Transport type={t} is not supported (tcp, ws and xhttp are)"),
         };
         let ws_path = params.get("path").cloned().filter(|p| !p.is_empty());
         let ws_host = params.get("host").cloned().filter(|h| !h.is_empty());
+        let alpn = params.get("alpn").cloned().filter(|a| !a.is_empty());
+        let (xhttp_mode, xhttp_extra) = if transport == "xhttp" {
+            (
+                params.get("mode").cloned().filter(|m| !m.is_empty()),
+                params
+                    .get("extra")
+                    .cloned()
+                    .filter(|e| !e.trim().is_empty()),
+            )
+        } else {
+            (None, None)
+        };
 
         let security = params
             .get("security")
@@ -98,6 +115,9 @@ impl VlessUrl {
             transport,
             ws_path,
             ws_host,
+            alpn,
+            xhttp_mode,
+            xhttp_extra,
         })
     }
 
@@ -166,6 +186,17 @@ fn url_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_xhttp_parameters() {
+        let u = VlessUrl::parse("vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?type=xhttp&security=reality&pbk=k&sid=ab&sni=s.example&path=%2Fapi&host=c.example&mode=stream-up&alpn=h2&extra=%7B%22noGRPCHeader%22%3Atrue%7D#x").unwrap();
+        assert_eq!(u.transport, "xhttp");
+        assert_eq!(u.ws_path.as_deref(), Some("/api"));
+        assert_eq!(u.ws_host.as_deref(), Some("c.example"));
+        assert_eq!(u.xhttp_mode.as_deref(), Some("stream-up"));
+        assert_eq!(u.alpn.as_deref(), Some("h2"));
+        assert_eq!(u.xhttp_extra.as_deref(), Some(r#"{"noGRPCHeader":true}"#));
+    }
 
     #[test]
     fn parses_basic_tls_url() {

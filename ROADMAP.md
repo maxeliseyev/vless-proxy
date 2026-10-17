@@ -80,6 +80,13 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 23. **XHTTP-транспорт (2026-10-17)**
+     - `src/xhttp.rs` на hyper 1.x (`client::conn::http1/http2` поверх наших TLS/REALITY-потоков): stream-one (один POST, тело запроса = uplink, тело ответа = downlink), stream-up (GET + потоковый POST), packet-up (GET + POST-пакеты с seq, батчинг до 1 МБ, интервал 30 мс); по HTTP/1.1 только packet-up на отдельном соединении для upload
+     - URL/заголовки как у Xray: `/path/` + session id (uuid) + seq, `Referer` с `x_padding` 100–1000 X, `Content-Type: application/grpc` на потоковых запросах, кастомные `headers`; из `extra`/`xhttpSettings` читаются mode, headers, noGRPCHeader, xPaddingBytes, scMaxEachPostBytes, scMinPostsIntervalMs, uplinkHTTPMethod (downloadSettings, нестандартные placement и obfs-паддинг пока нет)
+     - HTTP-версия: REALITY → HTTP/2 (prior knowledge), TLS → по ALPN (`alpn` в ссылке/TOML), без шифрования → HTTP/1.1; auto-режим как у Xray: stream-one с REALITY, иначе packet-up
+     - конфиг: `transport = "xhttp"`, `path`/`host` (алиасы `ws_path`/`ws_host`), `xhttp_mode`, `xhttp_extra`; ссылки `type=xhttp&path&host&mode&extra&alpn`; импорт Xray JSON `xhttpSettings`
+     - проверено на локальном xray-core 26.7.28: все три режима по REALITY+HTTP/2 и packet-up по plain HTTP/1.1, загрузки по хэшу и эхо 3×1 МБ
+
  22. **Импорт Amnezia VPN (2026-10-17)**
      - `src/amnezia_import.rs`: `vpn://` = base64url от `qCompress` (4 байта длины + zlib) над JSON сервера Amnezia; из контейнера `amnezia-xray` берётся `xray.last_config` (обычный клиентский JSON xray-core) и идёт через `xray_import`
      - `vpn://` принимается везде, где `vless://` (аргумент, `-u`, `-f`, `server.txt`, первый запуск, `a` в TUI); `-c file.vpn` читает сырой qCompress, base64 или plain JSON, как сам клиент Amnezia
@@ -399,7 +406,7 @@ Core логика должна жить в библиотеке, а не в би
 
 Если продолжать прямо отсюда, следующий практический milestone:
 
-1. **xhttp** транспорт (Amnezia предлагает его как вариант); grpc только если появится реальный конфиг
+1. **xhttp: downloadSettings / xmux (переиспользование HTTP/2-соединений)** если понадобится на реальном сервере; grpc только если появится реальный конфиг
 2. **UDP поверх MUX (xudp)** если понадобится
 
 Именно в таком порядке.

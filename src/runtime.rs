@@ -1091,7 +1091,7 @@ async fn create_udp_tunnel(
     })
 }
 
-fn reality_client(server: &ServerConfig) -> Result<RealityClient> {
+pub(crate) fn reality_client(server: &ServerConfig) -> Result<RealityClient> {
     RealityClient::new(
         server.tls_server_name(),
         server.reality_public_key.as_deref().unwrap_or(""),
@@ -1124,6 +1124,7 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
             server.ws_host(),
             server.ws_path()
         ),
+        MaybeTlsStream::Xhttp(stream) => format!("{} OK", stream.description()),
         MaybeTlsStream::Reality(stream) => {
             let info = crate::reality_tls::connection_info(&stream, server.tls_server_name());
             format!(
@@ -1168,6 +1169,7 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
         (Transport::Ws, TransportSecurity::Reality) => {
             anyhow::bail!("REALITY is not available over WebSocket")
         }
+        (Transport::Xhttp, _) => Ok(MaybeTlsStream::Xhttp(crate::xhttp::connect(server).await?)),
     }
 }
 

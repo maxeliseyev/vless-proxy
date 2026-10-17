@@ -529,6 +529,9 @@ fn proxy_config(
             transport: transport.to_string(),
             ws_path: Some("/vless-test".to_string()),
             ws_host: Some("mock.example".to_string()),
+            alpn: None,
+            xhttp_mode: None,
+            xhttp_extra: None,
             remark: None,
         },
         inbound: InboundConfig {

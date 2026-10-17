@@ -139,6 +139,9 @@ mod tests {
                 transport: "tcp".to_string(),
                 ws_path: None,
                 ws_host: None,
+                alpn: None,
+                xhttp_mode: None,
+                xhttp_extra: None,
                 remark: None,
             },
             inbound: InboundConfig {

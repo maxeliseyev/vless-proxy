@@ -27,6 +27,7 @@ pub mod url;
 pub mod vision;
 pub mod vless;
 pub mod ws;
+pub mod xhttp;
 pub mod xray_import;
 pub mod xray_sidecar;
 

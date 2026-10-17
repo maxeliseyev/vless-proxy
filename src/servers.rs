@@ -41,8 +41,10 @@ impl ServerEntry {
     /// Short transport description for lists: `reality+vision`, `tls/ws`, ...
     pub fn kind(&self) -> String {
         let mut s = self.server.security.clone();
-        if self.server.transport_kind().ok() == Some(crate::config::Transport::Ws) {
-            s.push_str("/ws");
+        match self.server.transport_kind().ok() {
+            Some(crate::config::Transport::Ws) => s.push_str("/ws"),
+            Some(crate::config::Transport::Xhttp) => s.push_str("/xhttp"),
+            _ => {}
         }
         if self.server.flow.is_some() {
             s.push_str("+vision");

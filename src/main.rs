@@ -2,6 +2,9 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, Level};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use vproxy::servers::config_from_link;
 use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList};
 
@@ -29,19 +32,25 @@ async fn main() -> Result<()> {
     };
     let tui_logs = if args.tui {
         let logs = vproxy::tui::LogBuffer::new(1000);
-        tracing_subscriber::fmt()
-            .with_writer(vproxy::tui::LogSink(logs.clone()))
-            .with_timer(tracing_subscriber::fmt::time::uptime())
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(level)
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(vproxy::tui::LogSink(logs.clone()))
+                    .with_timer(tracing_subscriber::fmt::time::uptime())
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_filter(log_targets(level)),
+            )
             .init();
         Some(logs)
     } else {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .with_max_level(level)
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_target(false)
+                    .with_filter(log_targets(level)),
+            )
             .init();
         None
     };
@@ -100,6 +109,19 @@ async fn main() -> Result<()> {
         }
         None => serve(config).await,
     }
+}
+
+/// Our own logs at `level`; the HTTP and TLS libraries only when something
+/// is wrong (their debug output drowns everything else).
+fn log_targets(level: Level) -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(level)
+        .with_target("h2", Level::WARN)
+        .with_target("hyper", Level::WARN)
+        .with_target("hyper_util", Level::WARN)
+        .with_target("tungstenite", Level::INFO)
+        .with_target("tokio_tungstenite", Level::INFO)
+        .with_target("rustls", Level::INFO)
 }
 
 /// First `vless://` or `vpn://` link in a text file (blank lines and `#` comment lines skipped).

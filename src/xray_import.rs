@@ -51,15 +51,35 @@ pub fn from_json(text: &str, inbound_port: Option<u16>) -> Result<Config> {
     let transport = match network.as_str() {
         "tcp" | "raw" => "tcp",
         "ws" | "websocket" => "ws",
-        other => bail!("transport network {other:?} is not supported (tcp and ws are)"),
+        "xhttp" | "splithttp" => "xhttp",
+        other => bail!("transport network {other:?} is not supported (tcp, ws and xhttp are)"),
     };
-    let (ws_path, ws_host) = if transport == "ws" {
-        let ws = &stream["wsSettings"];
-        let host = opt_str(&ws["host"]).or_else(|| opt_str(&ws["headers"]["Host"]));
-        (opt_str(&ws["path"]), host)
-    } else {
-        (None, None)
+    let (ws_path, ws_host, xhttp_mode, xhttp_extra) = match transport {
+        "ws" => {
+            let ws = &stream["wsSettings"];
+            let host = opt_str(&ws["host"]).or_else(|| opt_str(&ws["headers"]["Host"]));
+            (opt_str(&ws["path"]), host, None, None)
+        }
+        "xhttp" => {
+            let x = if stream["xhttpSettings"].is_object() {
+                &stream["xhttpSettings"]
+            } else {
+                &stream["splithttpSettings"]
+            };
+            let extra = x
+                .as_object()
+                .filter(|o| !o.is_empty())
+                .map(|_| x.to_string());
+            (
+                opt_str(&x["path"]),
+                opt_str(&x["host"]),
+                opt_str(&x["mode"]),
+                extra,
+            )
+        }
+        _ => (None, None, None, None),
     };
+    let alpn = tls_alpn(&stream["tlsSettings"]["alpn"]);
 
     let tls = &stream["tlsSettings"];
     let reality = &stream["realitySettings"];
@@ -94,6 +114,9 @@ pub fn from_json(text: &str, inbound_port: Option<u16>) -> Result<Config> {
         transport: transport.to_string(),
         ws_path,
         ws_host,
+        alpn,
+        xhttp_mode,
+        xhttp_extra,
     };
 
     let socks = root["inbounds"]
@@ -131,6 +154,20 @@ pub fn from_json(text: &str, inbound_port: Option<u16>) -> Result<Config> {
     };
     config.validate()?;
     Ok(config)
+}
+
+/// `tlsSettings.alpn` (array or string) → comma separated list.
+fn tls_alpn(v: &Value) -> Option<String> {
+    let list: Vec<String> = match v {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        Value::String(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
+        _ => Vec::new(),
+    };
+    let list: Vec<String> = list.into_iter().filter(|x| !x.is_empty()).collect();
+    (!list.is_empty()).then(|| list.join(","))
 }
 
 /// Xray outbound `mux` → `[mux]`.
@@ -312,6 +349,28 @@ mod tests {
         assert_eq!(rules[2].geoip, vec!["ru"]);
         assert_eq!(rules[2].ip_cidr, vec!["10.0.0.0/8"]);
         assert_eq!(rules[2].port, vec![80, 443]);
+    }
+
+    #[test]
+    fn imports_xhttp_stream_settings() {
+        let json = r#"{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"x.example","port":443,
+          "users":[{"id":"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d","encryption":"none"}]}]},
+          "streamSettings":{"network":"xhttp","security":"tls",
+            "tlsSettings":{"serverName":"cdn.example","alpn":["h2","http/1.1"]},
+            "xhttpSettings":{"path":"/api","host":"cdn.example","mode":"packet-up","noGRPCHeader":true}}}]}"#;
+        let c = from_json(json, Some(1080)).unwrap();
+        assert_eq!(c.server.transport, "xhttp");
+        assert_eq!(c.server.ws_path.as_deref(), Some("/api"));
+        assert_eq!(c.server.ws_host.as_deref(), Some("cdn.example"));
+        assert_eq!(c.server.xhttp_mode.as_deref(), Some("packet-up"));
+        assert_eq!(c.server.alpn.as_deref(), Some("h2,http/1.1"));
+        assert!(c
+            .server
+            .xhttp_extra
+            .as_deref()
+            .unwrap()
+            .contains("noGRPCHeader"));
+        c.validate().unwrap();
     }
 
     #[test]

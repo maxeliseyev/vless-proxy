@@ -205,15 +205,25 @@ pub struct ServerConfig {
     pub flow: Option<String>,
     #[serde(default)]
     pub spider_x: Option<String>,
-    /// `tcp` (default) or `ws` (WebSocket, Xray `network = "ws"`).
+    /// `tcp` (default), `ws` (WebSocket) or `xhttp` (Xray XHTTP).
     #[serde(default = "default_transport")]
     pub transport: String,
-    /// WebSocket request path (default `/`).
-    #[serde(default)]
+    /// WebSocket / XHTTP request path (default `/`). Also accepted as `path`.
+    #[serde(default, alias = "path")]
     pub ws_path: Option<String>,
-    /// WebSocket `Host` header (default: sni, then address).
-    #[serde(default)]
+    /// WebSocket / XHTTP `Host` (default: sni, then address). Also `host`.
+    #[serde(default, alias = "host")]
     pub ws_host: Option<String>,
+    /// TLS ALPN list, comma separated (e.g. `h2,http/1.1`); XHTTP picks
+    /// HTTP/2 or HTTP/1.1 from what the server negotiates.
+    #[serde(default)]
+    pub alpn: Option<String>,
+    /// XHTTP mode: `auto` (default), `stream-one`, `stream-up`, `packet-up`.
+    #[serde(default)]
+    pub xhttp_mode: Option<String>,
+    /// XHTTP extra settings as Xray `xhttpSettings` JSON (the link's `extra`).
+    #[serde(default)]
+    pub xhttp_extra: Option<String>,
 }
 
 fn default_transport() -> String {
@@ -224,6 +234,7 @@ fn default_transport() -> String {
 pub enum Transport {
     Tcp,
     Ws,
+    Xhttp,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -547,7 +558,8 @@ impl ServerConfig {
         match self.transport.trim().to_ascii_lowercase().as_str() {
             "" | "tcp" | "raw" => Ok(Transport::Tcp),
             "ws" | "websocket" => Ok(Transport::Ws),
-            other => bail!("server.transport must be \"tcp\" or \"ws\", got {other:?}"),
+            "xhttp" | "splithttp" => Ok(Transport::Xhttp),
+            other => bail!("server.transport must be \"tcp\", \"ws\" or \"xhttp\", got {other:?}"),
         }
     }
 
@@ -577,6 +589,12 @@ impl ServerConfig {
             if self.flow.is_some() {
                 bail!("server.flow (XTLS Vision) is not available over transport = \"ws\"");
             }
+        }
+        if self.transport_kind()? == Transport::Xhttp {
+            if self.flow.is_some() {
+                bail!("server.flow (XTLS Vision) is not available over transport = \"xhttp\"");
+            }
+            crate::xhttp::XhttpConfig::from_server(self)?;
         }
 
         if self.flow.is_some() && !matches!(self.transport_security()?, TransportSecurity::Reality)
@@ -759,6 +777,9 @@ impl Config {
             transport: url.transport.clone(),
             ws_path: url.ws_path.clone(),
             ws_host: url.ws_host.clone(),
+            alpn: url.alpn.clone(),
+            xhttp_mode: url.xhttp_mode.clone(),
+            xhttp_extra: url.xhttp_extra.clone(),
             remark: url.remark.clone(),
         };
 
@@ -819,6 +840,9 @@ mod tests {
                 transport: "tcp".to_string(),
                 ws_path: None,
                 ws_host: None,
+                alpn: None,
+                xhttp_mode: None,
+                xhttp_extra: None,
                 remark: None,
             },
             inbound: InboundConfig {
