@@ -7,6 +7,7 @@
 //! This keeps protocol/TLS logic inside Rust so a future iOS bridge can wrap the core without
 //! depending on command-line parsing or stdout-oriented startup code.
 
+pub mod amnezia_import;
 pub mod config;
 pub mod dns;
 pub mod dns_cache;

@@ -2,7 +2,8 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, Level};
-use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList, VlessUrl};
+use vproxy::servers::config_from_link;
+use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList};
 
 #[derive(Clone)]
 struct Args {
@@ -101,7 +102,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// First `vless://` link in a text file (blank lines and `#` comment lines skipped).
+/// First `vless://` or `vpn://` link in a text file (blank lines and `#` comment lines skipped).
 fn read_url_file(path: &PathBuf) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", path.display()))?;
@@ -110,7 +111,7 @@ fn read_url_file(path: &PathBuf) -> Result<String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("No vless:// link found in {}", path.display()))
+        .ok_or_else(|| anyhow::anyhow!("No vless:// or vpn:// link found in {}", path.display()))
 }
 
 /// `~/.config/vproxy`
@@ -157,7 +158,7 @@ fn clean_pasted_link(raw: &str) -> String {
     s.trim().to_string()
 }
 
-/// First run: ask for a vless:// link on the terminal, validate it and save it
+/// First run: ask for a vless:// (or Amnezia vpn://) link on the terminal, validate it and save it
 /// to `~/.config/vproxy/server.txt` so the next start needs no arguments.
 fn ask_for_link() -> Result<String> {
     use std::io::{BufRead, IsTerminal, Write};
@@ -170,15 +171,18 @@ fn ask_for_link() -> Result<String> {
     let mut stderr = std::io::stderr();
     let stdin = std::io::stdin();
     for attempt in 1..=3 {
-        write!(stderr, "Paste your vless:// link and press Enter: ")?;
+        write!(
+            stderr,
+            "Paste your vless:// (or Amnezia vpn://) link and press Enter: "
+        )?;
         stderr.flush()?;
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
             anyhow::bail!("No link entered");
         }
         let link = clean_pasted_link(&line);
-        match VlessUrl::parse(&link) {
-            Ok(url) => {
+        match config_from_link(&link, 1080) {
+            Ok(config) => {
                 if let Some(dir) = user_config_dir() {
                     let path = dir.join("server.txt");
                     match std::fs::create_dir_all(&dir)
@@ -187,7 +191,11 @@ fn ask_for_link() -> Result<String> {
                         Ok(()) => info!(
                             "Saved to {} ({}); next time just run `vproxy`",
                             path.display(),
-                            url.remark.as_deref().unwrap_or(&url.host)
+                            config
+                                .server
+                                .remark
+                                .as_deref()
+                                .unwrap_or(&config.server.address)
                         ),
                         Err(e) => eprintln!(
                             "warning: could not save the link to {}: {e}",
@@ -231,8 +239,7 @@ fn load_config(args: Args) -> Result<(Config, ServerList)> {
         }
     }
     if let Some(url_str) = vless_url {
-        let url = VlessUrl::parse(&url_str)?;
-        let config = Config::from_vless_url(&url, inbound_port);
+        let config = config_from_link(&url_str, inbound_port)?;
         config.validate()?;
         let servers = match links_file.as_deref().filter(|p| p.is_file()) {
             Some(path) => match ServerList::from_file(path, inbound_port) {
@@ -248,20 +255,36 @@ fn load_config(args: Args) -> Result<(Config, ServerList)> {
             info!("{} servers available (switch in --tui)", servers.len());
         }
 
-        if let Some(remark) = &url.remark {
+        if let Some(remark) = config.server.remark.as_deref().filter(|r| !r.is_empty()) {
             info!("Using VLESS server: {}", remark);
         }
         info!(
-            "Server: {}:{} (security: {}, tls: {})",
-            url.host,
-            url.port,
-            url.security,
-            url.use_tls()
+            "Server: {}:{} (security: {}, transport: {})",
+            config.server.address,
+            config.server.port,
+            config.server.security,
+            config.server.transport
         );
 
         Ok((config, servers))
     } else if let Some(config_path) = config_path {
         info!("Loading config from: {}", config_path.display());
+        if config_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("vpn"))
+        {
+            let config = vproxy::amnezia_import::load_file(&config_path, args.inbound_port)?;
+            let servers = ServerList::single(config.server.clone());
+            info!(
+                "Imported Amnezia config: {} {}:{} ({} over {})",
+                config.server.remark.as_deref().unwrap_or("-"),
+                config.server.address,
+                config.server.port,
+                config.server.security,
+                config.server.transport
+            );
+            return Ok((config, servers));
+        }
         if config_path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("json"))
@@ -315,7 +338,7 @@ fn parse_args() -> Result<Args> {
             Some("-u") | Some("--url") => {
                 let value = args
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("--url requires a vless:// URL"))?;
+                    .ok_or_else(|| anyhow::anyhow!("--url requires a vless:// or vpn:// link"))?;
                 vless_url = Some(
                     value
                         .into_string()
@@ -357,7 +380,7 @@ fn parse_args() -> Result<Args> {
             Some(value) if value.starts_with('-') => {
                 anyhow::bail!("Unknown argument: {value}");
             }
-            Some(value) if value.starts_with("vless://") => {
+            Some(value) if value.starts_with("vless://") || value.starts_with("vpn://") => {
                 if vless_url.is_some() {
                     anyhow::bail!("VLESS URL can only be provided once");
                 }
@@ -392,7 +415,7 @@ fn print_help() {
 vproxy - terminal VLESS client
 
 Usage:
-  vproxy [OPTIONS] [config-path|vless://...]
+  vproxy [OPTIONS] [config-path|vless://...|vpn://...]
 
 Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
 ~/.config/vproxy/server.txt; if none exists it asks for a vless:// link (pasted as
@@ -400,9 +423,9 @@ is, no quoting) and saves it to ~/.config/vproxy/server.txt. A links file may ho
 several servers (one per line): the first is used, --tui switches between them.
 
 Options:
-  -c, --config <PATH>       Path to TOML config, or an Xray/Happ JSON config (*.json)
-  -u, --url <VLESS_URL>     VLESS link (vless://...), quote it in the shell
-  -f, --url-file <PATH>     Read the vless:// link from a file (first non-comment line)
+  -c, --config <PATH>       Path to TOML config, an Xray/Happ JSON config (*.json) or an Amnezia *.vpn file
+  -u, --url <LINK>          vless:// link or Amnezia vpn:// link, quote it in the shell
+  -f, --url-file <PATH>     Read the link from a file (first non-comment line)
   -p, --inbound-port <PORT> Local inbound port (default: 1080)
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit

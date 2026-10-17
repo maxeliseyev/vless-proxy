@@ -2,6 +2,7 @@
 //! `vless://` link of the links file (or the single server of a TOML/JSON
 //! config), plus persistence of the chosen one as the file's first link.
 
+use crate::amnezia_import;
 use crate::config::{Config, ServerConfig};
 use crate::url::VlessUrl;
 use anyhow::{bail, Context, Result};
@@ -29,10 +30,9 @@ impl ServerEntry {
         }
     }
 
+    /// From a `vless://` or Amnezia `vpn://` link.
     pub fn from_link(link: &str, inbound_port: u16) -> Result<Self> {
-        let url = VlessUrl::parse(link)?;
-        let config = Config::from_vless_url(&url, inbound_port);
-        config.server.validate_transport_settings()?;
+        let config = config_from_link(link, inbound_port)?;
         let mut entry = Self::from_server(config.server);
         entry.link = Some(link.trim().to_string());
         Ok(entry)
@@ -49,6 +49,22 @@ impl ServerEntry {
         }
         s
     }
+}
+
+/// A `vless://` link or an Amnezia `vpn://` link as a full config listening
+/// on `inbound_port`.
+pub fn config_from_link(link: &str, inbound_port: u16) -> Result<Config> {
+    let link = link.trim();
+    if amnezia_import::is_link(link) {
+        return amnezia_import::from_link(link, inbound_port);
+    }
+    if !link.starts_with("vless://") {
+        bail!("expected a vless:// or vpn:// link");
+    }
+    let url = VlessUrl::parse(link)?;
+    let config = Config::from_vless_url(&url, inbound_port);
+    config.server.validate_transport_settings()?;
+    Ok(config)
 }
 
 #[derive(Debug, Clone, Default)]

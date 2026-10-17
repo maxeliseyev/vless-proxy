@@ -19,6 +19,7 @@ webpki-roots = "0.26"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand = "0.8"
 base64 = "0.22"
+flate2 = "1"
 serde_json = "1"
 tempfile = "3"
 hkdf = "0.12"
