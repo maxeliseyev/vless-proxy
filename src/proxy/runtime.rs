@@ -1420,16 +1420,17 @@ pub fn raise_nofile_limit(wanted: u64) {
     if lim.rlim_cur >= wanted {
         return;
     }
-    let mut target = if lim.rlim_max == libc::RLIM_INFINITY {
+    let target = if lim.rlim_max == libc::RLIM_INFINITY {
         wanted
     } else {
         wanted.min(lim.rlim_max)
     };
-    #[cfg(target_os = "macos")]
-    {
-        // macOS refuses soft limits above OPEN_MAX unless the hard limit is infinite.
-        target = target.min(10_240);
-    }
+    // macOS refuses soft limits above OPEN_MAX unless the hard limit is infinite.
+    let target = if cfg!(target_os = "macos") {
+        target.min(10_240)
+    } else {
+        target
+    };
     if target <= lim.rlim_cur {
         return;
     }
