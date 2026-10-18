@@ -80,6 +80,11 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 25. **Отпечаток TLS как у Chrome (2026-10-18)**
+     - форк rustls: `ClientConfig::client_hello_rewriter` — хук получает закодированный ClientHello и отдаёт замену; байты идут в сеть и в transcript, список предложенных шифров и расширений перечитывается из них (ответы на ALPS/ECH не «unsolicited»), добавленный GREASE ECH переводит статус ECH в Grease; применяется до `session_id_hook`, который теперь работает по байтам; не применяется при resumption
+     - `src/fingerprint.rs`: профиль uTLS `HelloChrome_133` (его шлёт Xray 26.x): 16 шифров с GREASE, 16 расширений + 2 GREASE, порядок случайный на соединение и одинаковый для HRR, GREASE в cipher/group/ext1/ext2/version, GREASE ECH как у BoringSSL, ALPS (17613), SCT, session ticket, renegotiation_info, compress_certificate brotli (включена фича rustls `brotli`); random, session id, key shares, SNI и ALPN rustls сохраняются; `fp=none` отключает; при отпечатке resumption выключен
+     - проверено: JA4 `t13d1516h2_8daaf6152771_d8a2da3f94cd` (Chrome) и по нашему расчёту, и у tls.peet.ws (`examples/fingerprint.rs`); REALITY-аутентификация с локальным xray и боевым сервером, WS+TLS — без изменений
+
  24. **Установка sing-box и фоновый сервис (2026-10-18)**
      - `src/singbox.rs`: поиск бинарника (`--sing-box`/`tun.sing_box_path`, `~/.config/vproxy/bin`, PATH, Homebrew, системные префиксы, бандл Happ; под sudo ищется и дом реального пользователя); `vproxy install-sing-box`: Homebrew на macOS (без него предлагает поставить Homebrew), официальный скрипт репозитория sing-box на deb/rpm/Arch, иначе релиз с GitHub под ОС/CPU в `~/.config/vproxy/bin` (`--download` принудительно); `--tun` без sing-box предлагает установку на месте
      - `src/service.rs`: `vproxy service install|uninstall|status|logs [--tun]` генерирует launchd plist (агент пользователя или системный демон) или systemd unit (user или system с root и CAP_NET_ADMIN), пишет абсолютные пути к бинарнику, конфигу и sing-box, запускает и включает автозапуск; логи в файл без ANSI

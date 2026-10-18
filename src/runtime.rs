@@ -1142,13 +1142,17 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
     let addr = (server.address.as_str(), server.port);
     match (server.transport_kind()?, server.transport_security()?) {
         (Transport::Tcp, TransportSecurity::Tls) => {
-            let tls = tls::TlsClient::new(server.tls_server_name().to_string())?;
+            let tls = tls::TlsClient::new(server.tls_server_name().to_string())?
+                .with_fingerprint(server.fingerprint_kind());
             tls.connect(addr).await
         }
         (Transport::Tcp, TransportSecurity::Reality) => {
             let client = reality_client(server)?;
             let tcp = TcpStream::connect(addr).await?;
-            let stream = RealityConnector::new(client).connect(tcp).await?;
+            let stream = RealityConnector::new(client)
+                .with_fingerprint(server.fingerprint_kind())
+                .connect(tcp)
+                .await?;
             Ok(MaybeTlsStream::Reality(stream))
         }
         (Transport::Tcp, TransportSecurity::None) => {
@@ -1156,7 +1160,8 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
         }
         (Transport::Ws, TransportSecurity::Tls) => {
             let tls =
-                tls::TlsClient::with_alpn(server.tls_server_name().to_string(), &["http/1.1"])?;
+                tls::TlsClient::with_alpn(server.tls_server_name().to_string(), &["http/1.1"])?
+                    .with_fingerprint(server.fingerprint_kind());
             let inner = WsInner::Tls(tls.connect_tls(addr).await?);
             let ws = WsStream::connect(inner, server.ws_host(), server.ws_path()).await?;
             Ok(MaybeTlsStream::Ws(ws))

@@ -18,6 +18,7 @@ security = "tls"
 # path = "/path"              # ws / xhttp request path
 # host = "cdn.example.com"    # ws / xhttp Host, defaults to sni
 # alpn = "h2,http/1.1"        # TLS ALPN; xhttp uses HTTP/2 when h2 is negotiated
+# fingerprint = "chrome"      # ClientHello shaped like Chrome (default); "none" sends plain rustls
 # xhttp_mode = "auto"         # auto (stream-one with reality, else packet-up), stream-one, stream-up, packet-up
 # xhttp_extra = '{"noGRPCHeader": true}'   # Xray xhttpSettings JSON (the link's extra=)
 

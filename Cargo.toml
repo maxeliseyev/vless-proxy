@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", features = ["rustls-tls"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["brotli"] }
 tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
@@ -42,6 +42,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [patch.crates-io]
-# vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook for REALITY.
+# vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook (REALITY) and
+# ClientConfig::client_hello_rewriter (Chrome TLS fingerprint).
 # Branch reality-0.23, pinned to the commit that was tested.
-rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "2f338cae" }
+rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "47e099e0" }

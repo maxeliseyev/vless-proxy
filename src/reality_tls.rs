@@ -384,11 +384,21 @@ pub struct RealityConnectionInfo {
 
 pub struct RealityConnector {
     client: RealityClient,
+    fingerprint: crate::fingerprint::Fingerprint,
 }
 
 impl RealityConnector {
     pub fn new(client: RealityClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            fingerprint: crate::fingerprint::Fingerprint::Chrome,
+        }
+    }
+
+    /// Which browser's ClientHello to imitate (`fp=` of the link).
+    pub fn with_fingerprint(mut self, fingerprint: crate::fingerprint::Fingerprint) -> Self {
+        self.fingerprint = fingerprint;
+        self
     }
 
     /// Run the REALITY handshake over an established transport.
@@ -416,6 +426,7 @@ impl RealityConnector {
             client: self.client.clone(),
             slot: slot.clone(),
         }));
+        config.client_hello_rewriter = self.fingerprint.rewriter();
 
         let server_name = ServerName::try_from(self.client.server_name().to_string())
             .with_context(|| {

@@ -66,7 +66,7 @@ vproxy --probe -f server.txt         # один handshake с сервером и
 vproxy --print-tun-config -f server.txt   # показать сгенерированный конфиг sing-box
 ```
 
-Поддерживаются ссылки с `security=reality|tls|none`, транспортом `type=tcp|ws` (`path`, `host`), `flow=xtls-rprx-vision`, параметрами `pbk`, `sid`, `sni`, `fp`, `spx`, и `#имя` сервера.
+Поддерживаются ссылки с `security=reality|tls|none`, транспортом `type=tcp|ws|xhttp` (`path`, `host`, `mode`, `extra`), `flow=xtls-rprx-vision`, параметрами `pbk`, `sid`, `sni`, `fp` (`chrome` по умолчанию, `none` отключает имитацию), `spx`, `alpn`, и `#имя` сервера.
 
 Конфиг Xray/Happ в JSON тоже подходит напрямую: `vproxy -c happ.json`. Берутся vless-outbound (адрес, uuid, tcp/ws, tls/reality), порт socks-inbound и правила `routing.rules` (domain/ip/port → direct/proxy/block; geosite/geoip переносятся как rule-set для TUN-режима).
 
@@ -116,7 +116,8 @@ dns_via_proxy = true
 Главное достижение проекта: **протокольное ядро Xray перенесено на Rust и работает против боевых серверов без xray-core.**
 
 - **VLESS** поверх TCP/TLS, **WebSocket** (`type=ws`, бинарные фреймы как в Xray) и **XHTTP** (`type=xhttp`: stream-one, stream-up и packet-up по HTTP/2 или HTTP/1.1, поверх REALITY, TLS или без шифрования, с паддингом и заголовками как у Xray): запрос, ленивый ответ, UDP-фреймы, SOCKS5 (`CONNECT`, `UDP ASSOCIATE`) и HTTP (`CONNECT`, обычные запросы) inbound. Импорт конфигов Xray/Happ из JSON и Amnezia VPN (`vpn://` ссылки и `.vpn` файлы с контейнером XRay).
-- **REALITY нативно**: X25519 + HKDF auth key, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512, гибридный key share X25519MLKEM768, который требуют современные серверы. Поверх форка rustls с одним хуком в ~75 строк.
+- **REALITY нативно**: X25519 + HKDF auth key, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512, гибридный key share X25519MLKEM768, который требуют современные серверы. Поверх форка rustls с двумя хуками.
+- **Отпечаток TLS как у Chrome** (`fp=chrome`, включён по умолчанию для REALITY, TLS, WS и XHTTP): ClientHello пересобирается по профилю uTLS `HelloChrome_133`, который шлёт сам Xray: набор и порядок шифров, 16 расширений в случайном порядке, GREASE в пяти местах, GREASE ECH, ALPS, SCT, session ticket. JA4 совпадает с Chrome (`t13d1516h2_8daaf6152771_d8a2da3f94cd`), проверить можно командой `cargo run --example fingerprint`. Отключается `fp=none`.
 - **XTLS Vision нативно**: паддинг на время внутреннего TLS-handshake и прямая пересылка TCP (direct copy) для TLS 1.3 без двойного шифрования. Для этого REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз.
 - **TUN-режим** по схеме Happ: sing-box держит интерфейс и отдаёт всё в локальный SOCKS5; конфиг генерируется автоматически и защищён от петель.
 - **Routing**: direct / proxy / block по доменам, CIDR, приватным адресам, портам, geoip/geosite.

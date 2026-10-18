@@ -344,7 +344,10 @@ async fn dial(server: &ServerConfig, config: &XhttpConfig) -> Result<HttpConn> {
         TransportSecurity::Reality => {
             let client = crate::runtime::reality_client(server)?;
             let tcp = TcpStream::connect(addr).await?;
-            let stream = RealityConnector::new(client).connect(tcp).await?;
+            let stream = RealityConnector::new(client)
+                .with_fingerprint(server.fingerprint_kind())
+                .connect(tcp)
+                .await?;
             (Box::new(stream), true)
         }
         TransportSecurity::Tls => {
@@ -352,7 +355,8 @@ async fn dial(server: &ServerConfig, config: &XhttpConfig) -> Result<HttpConn> {
                 Some(a) if !a.is_empty() => a.split(',').map(str::trim).collect(),
                 _ => vec!["h2", "http/1.1"],
             };
-            let tls = TlsClient::with_alpn(server.tls_server_name().to_string(), &alpn)?;
+            let tls = TlsClient::with_alpn(server.tls_server_name().to_string(), &alpn)?
+                .with_fingerprint(server.fingerprint_kind());
             let stream = tls.connect_tls(addr).await?;
             let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
             (Box::new(stream), h2)

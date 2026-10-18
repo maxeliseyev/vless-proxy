@@ -11,6 +11,7 @@ pub mod amnezia_import;
 pub mod config;
 pub mod dns;
 pub mod dns_cache;
+pub mod fingerprint;
 pub mod http;
 pub mod mux;
 pub mod reality;

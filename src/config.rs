@@ -660,6 +660,11 @@ impl ServerConfig {
         self.fingerprint.as_deref().unwrap_or("chrome")
     }
 
+    /// How the TLS ClientHello is shaped (`fp=`): Chrome unless `none`.
+    pub fn fingerprint_kind(&self) -> crate::fingerprint::Fingerprint {
+        crate::fingerprint::Fingerprint::parse(self.fingerprint.as_deref())
+    }
+
     pub fn reality_spider_x(&self) -> &str {
         self.spider_x.as_deref().unwrap_or("/")
     }

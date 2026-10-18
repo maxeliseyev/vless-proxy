@@ -8,8 +8,9 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 pub struct TlsClient {
-    connector: tokio_rustls::TlsConnector,
+    config: Arc<rustls::ClientConfig>,
     server_name: String,
+    fingerprint: crate::fingerprint::Fingerprint,
 }
 
 impl TlsClient {
@@ -42,12 +43,30 @@ impl TlsClient {
             .with_no_client_auth();
         config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
 
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-
         Ok(Self {
-            connector,
+            config: Arc::new(config),
             server_name,
+            fingerprint: crate::fingerprint::Fingerprint::Chrome,
         })
+    }
+
+    /// Which browser's ClientHello to imitate (`fp=` of the link). With a
+    /// fingerprint on, session resumption is off: a resumed hello cannot be
+    /// reshaped and would stand out.
+    pub fn with_fingerprint(mut self, fingerprint: crate::fingerprint::Fingerprint) -> Self {
+        self.fingerprint = fingerprint;
+        self
+    }
+
+    /// Per-connection config: the fingerprint rewriter makes its random
+    /// choices once per connection.
+    fn connector(&self) -> tokio_rustls::TlsConnector {
+        let mut config = (*self.config).clone();
+        if let Some(rewriter) = self.fingerprint.rewriter() {
+            config.client_hello_rewriter = Some(rewriter);
+            config.resumption = rustls::client::Resumption::disabled();
+        }
+        tokio_rustls::TlsConnector::from(Arc::new(config))
     }
 
     pub async fn connect(
@@ -65,7 +84,7 @@ impl TlsClient {
         let domain = ServerName::try_from(self.server_name.as_str())
             .with_context(|| format!("Invalid TLS server name: {}", self.server_name))?
             .to_owned();
-        Ok(self.connector.connect(domain, tcp).await?)
+        Ok(self.connector().connect(domain, tcp).await?)
     }
 }
 
