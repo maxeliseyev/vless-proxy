@@ -80,6 +80,9 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 28. **Структура исходников (2026-10-18)**
+     - `src/` разложен по слоям: `config/` (+ `import/`), `protocol/` (+ `reality/`), `transport/`, `inbound/`, `proxy/`, `system/`, `ui/`; публичные типы для CLI и тестов реэкспортируются из `lib.rs`; история файлов сохранена через `git mv`
+
  27. **Подписки (2026-10-18)**
      - `src/subscription.rs`: загрузка по URL (reqwest, UA `vproxy/<ver>`), тело base64 (std/url-safe, с паддингом и без, с переносами) или plain, берутся `vless://` и `vpn://`, остальные протоколы считаются пропущенными; заголовки `subscription-userinfo`, `profile-title` (в т.ч. `base64:`), `profile-update-interval`
      - файл ссылок с заголовком `# subscription/title/updated/interval/traffic/active` и секцией `# manual` (маркер пишется всегда, чтобы дописанные руками ссылки переживали обновление); для управляемого файла выбор сервера пишется в `# active:`, порядок не меняется

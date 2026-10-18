@@ -1,4 +1,4 @@
-use crate::vless::Address;
+use crate::protocol::vless::Address;
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

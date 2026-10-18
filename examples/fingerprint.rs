@@ -6,8 +6,8 @@
 //! Connects to tls.peet.ws, which reports the JA3/JA4 of the connecting client.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vproxy::fingerprint::Fingerprint;
-use vproxy::tls::TlsClient;
+use vproxy::protocol::fingerprint::Fingerprint;
+use vproxy::transport::tls::TlsClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

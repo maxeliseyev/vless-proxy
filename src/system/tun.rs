@@ -8,7 +8,7 @@
 //! server address, and those processes resolve DNS directly as well.
 
 use crate::config::{Config, InboundProtocol};
-use crate::routing::Outbound;
+use crate::proxy::routing::Outbound;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -246,7 +246,7 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
             format!(
                 "Failed to start sing-box binary `{}` for TUN mode. {}",
                 config.tun.sing_box_path,
-                crate::singbox::not_found_hint()
+                crate::system::singbox::not_found_hint()
             )
         })?;
 
@@ -278,8 +278,8 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::url::VlessUrl;
     use crate::config::Config;
-    use crate::url::VlessUrl;
 
     fn cfg(url: &str) -> Config {
         let mut c = Config::from_vless_url(&VlessUrl::parse(url).unwrap(), 1080);

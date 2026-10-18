@@ -13,7 +13,7 @@
 //!    TLS records straight onto the TCP socket, skipping the outer encryption.
 //!
 //! This module is pure state and byte manipulation; the stream plumbing lives
-//! in [`crate::vless::VlessStream`].
+//! in [`crate::protocol::vless::VlessStream`].
 
 use rand::Rng;
 

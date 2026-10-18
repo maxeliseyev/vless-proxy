@@ -86,11 +86,11 @@ impl UserInfo {
         match self.total {
             Some(total) if total > 0 => out.push(format!(
                 "used {} of {}",
-                crate::stats::human_bytes(used),
-                crate::stats::human_bytes(total)
+                crate::proxy::stats::human_bytes(used),
+                crate::proxy::stats::human_bytes(total)
             )),
             _ if self.upload.is_some() || self.download.is_some() => {
-                out.push(format!("used {}", crate::stats::human_bytes(used)))
+                out.push(format!("used {}", crate::proxy::stats::human_bytes(used)))
             }
             _ => {}
         }

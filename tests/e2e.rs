@@ -8,11 +8,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
-use vproxy::mux;
-use vproxy::ws::WsStream;
+use vproxy::inbound::socks5;
+use vproxy::protocol::mux;
+use vproxy::protocol::vless;
+use vproxy::transport::ws::WsStream;
 use vproxy::{
-    serve, serve_with_server, socks5, vless, ActiveServer, Config, DnsCacheConfig, DnsConfig,
-    InboundConfig, MuxConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig,
+    serve, serve_with_server, ActiveServer, Config, DnsCacheConfig, DnsConfig, InboundConfig,
+    MuxConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);

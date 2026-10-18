@@ -3,7 +3,7 @@
 //! working after the terminal is closed and starts at boot. `--tun` installs a
 //! system daemon (root); without it a per-user agent/unit for the local proxy.
 
-use crate::singbox;
+use crate::system::singbox;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;

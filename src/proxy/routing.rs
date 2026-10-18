@@ -9,7 +9,7 @@
 //! only evaluated by sing-box in TUN mode; here such rules never match.
 
 use crate::config::{RoutingConfig, RoutingRule};
-use crate::vless::Address;
+use crate::protocol::vless::Address;
 use anyhow::{bail, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

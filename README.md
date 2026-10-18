@@ -147,4 +147,4 @@ cargo test                   # 99 unit + 5 e2e
 cargo clippy --all-targets
 ```
 
-Модули: `reality` (примитивы протокола), `reality_tls` (rustls-интеграция и драйвер потока), `vision`, `vless`, `routing`, `tun`, `tui`, `runtime` (relay и inbound'ы). Релизы собирает GitHub Actions по тегу `v*`.
+Структура `src/`: `config/` (TOML, ссылки, списки серверов, подписки, импорт Xray и Amnezia), `protocol/` (VLESS, REALITY, Vision, Mux.Cool, отпечаток Chrome), `transport/` (TLS, WebSocket, XHTTP), `inbound/` (SOCKS5, HTTP), `proxy/` (relay, routing, DNS, счётчики), `system/` (TUN через sing-box, установка sing-box, сервисы, xray-sidecar), `ui/` (TUI); `main.rs` только разбирает аргументы. Релизы собирает GitHub Actions по тегу `v*`.

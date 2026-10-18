@@ -17,6 +17,8 @@
 //! 5. The server proves itself by sending a certificate whose Ed25519 public key
 //!    `P` satisfies `cert.signature == HMAC-SHA512(auth_key, P)`.
 
+pub mod tls;
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{bail, Context, Result};

@@ -1,47 +1,35 @@
-//! Reusable VLESS client core with a thin terminal CLI wrapper.
+//! vproxy: a VLESS client core with a terminal CLI on top.
 //!
-//! The library boundary is intentionally kept below the CLI layer:
-//! - `runtime::ProxyClient` exposes reusable outbound connection setup.
-//! - `runtime::serve` hosts the local SOCKS5 listener for terminal usage.
+//! Layout:
+//! - [`config`]: TOML config, `vless://`/`vpn://` links, server lists,
+//!   subscriptions, importers for Xray and Amnezia configs.
+//! - [`protocol`]: VLESS framing, REALITY, XTLS Vision, Mux.Cool and the
+//!   Chrome-shaped ClientHello.
+//! - [`transport`]: TLS, WebSocket and XHTTP carriers.
+//! - [`inbound`]: the local SOCKS5 and HTTP listeners.
+//! - [`proxy`]: the relay, routing, DNS, counters and the `serve` entry point.
+//! - [`system`]: TUN mode (sing-box), installing sing-box, services, the
+//!   xray-core sidecar.
+//! - [`ui`]: the terminal UI.
 //!
-//! This keeps protocol/TLS logic inside Rust so a future iOS bridge can wrap the core without
-//! depending on command-line parsing or stdout-oriented startup code.
+//! The CLI (`main.rs`) only parses arguments and wires these together, so
+//! the library can be embedded without it.
 
-pub mod amnezia_import;
 pub mod config;
-pub mod dns;
-pub mod dns_cache;
-pub mod fingerprint;
-pub mod http;
-pub mod mux;
-pub mod reality;
-pub mod reality_tls;
-pub mod routing;
-pub mod runtime;
-pub mod servers;
-pub mod service;
-pub mod singbox;
-pub mod socks5;
-pub mod stats;
-pub mod subscription;
-pub mod tls;
-pub mod tui;
-pub mod tun;
-pub mod url;
-pub mod vision;
-pub mod vless;
-pub mod ws;
-pub mod xhttp;
-pub mod xray_import;
-pub mod xray_sidecar;
+pub mod inbound;
+pub mod protocol;
+pub mod proxy;
+pub mod system;
+pub mod transport;
+pub mod ui;
 
+pub use config::servers::{ServerEntry, ServerList};
+pub use config::url::VlessUrl;
 pub use config::{
     Config, DnsCacheConfig, DnsConfig, DnsIpStrategy, DnsResolveMode, InboundConfig,
     InboundProtocol, MuxConfig, RoutingConfig, RoutingRule, RuntimeConfig, ServerConfig, Transport,
     TransportSecurity, TunConfig,
 };
-pub use dns_cache::DnsCache;
-pub use reality::RealityClient;
-pub use runtime::{serve, serve_with_server, ActiveServer, ProxyClient};
-pub use servers::{ServerEntry, ServerList};
-pub use url::VlessUrl;
+pub use protocol::reality::RealityClient;
+pub use proxy::dns_cache::DnsCache;
+pub use proxy::runtime::{serve, serve_with_server, ActiveServer, ProxyClient};

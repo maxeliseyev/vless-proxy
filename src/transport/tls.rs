@@ -10,7 +10,7 @@ use tracing::debug;
 pub struct TlsClient {
     config: Arc<rustls::ClientConfig>,
     server_name: String,
-    fingerprint: crate::fingerprint::Fingerprint,
+    fingerprint: crate::protocol::fingerprint::Fingerprint,
 }
 
 impl TlsClient {
@@ -46,14 +46,17 @@ impl TlsClient {
         Ok(Self {
             config: Arc::new(config),
             server_name,
-            fingerprint: crate::fingerprint::Fingerprint::Chrome,
+            fingerprint: crate::protocol::fingerprint::Fingerprint::Chrome,
         })
     }
 
     /// Which browser's ClientHello to imitate (`fp=` of the link). With a
     /// fingerprint on, session resumption is off: a resumed hello cannot be
     /// reshaped and would stand out.
-    pub fn with_fingerprint(mut self, fingerprint: crate::fingerprint::Fingerprint) -> Self {
+    pub fn with_fingerprint(
+        mut self,
+        fingerprint: crate::protocol::fingerprint::Fingerprint,
+    ) -> Self {
         self.fingerprint = fingerprint;
         self
     }
@@ -91,10 +94,10 @@ impl TlsClient {
 pub enum MaybeTlsStream<T> {
     Plain(T),
     Tls(tokio_rustls::client::TlsStream<T>),
-    Reality(crate::reality_tls::RealityStream<T>),
-    Ws(crate::ws::WsStream<WsInner<T>>),
+    Reality(crate::protocol::reality::tls::RealityStream<T>),
+    Ws(crate::transport::ws::WsStream<WsInner<T>>),
     /// XHTTP: the stream is carried by HTTP requests; the TCP type is unused.
-    Xhttp(crate::xhttp::XhttpStream),
+    Xhttp(crate::transport::xhttp::XhttpStream),
 }
 
 /// What a WebSocket transport runs over.
@@ -195,7 +198,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeTlsStream<T> {
     }
 }
 
-impl<T> crate::vless::XtlsDirect for MaybeTlsStream<T> {
+impl<T> crate::protocol::vless::XtlsDirect for MaybeTlsStream<T> {
     fn supports_direct(&self) -> bool {
         matches!(self, MaybeTlsStream::Reality(_))
     }

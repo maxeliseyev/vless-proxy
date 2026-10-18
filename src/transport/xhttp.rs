@@ -15,8 +15,8 @@
 //! HTTP/1.1 otherwise.
 
 use crate::config::{ServerConfig, TransportSecurity};
-use crate::reality_tls::RealityConnector;
-use crate::tls::TlsClient;
+use crate::protocol::reality::tls::RealityConnector;
+use crate::transport::tls::TlsClient;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
@@ -342,7 +342,7 @@ async fn dial(server: &ServerConfig, config: &XhttpConfig) -> Result<HttpConn> {
     let security = server.transport_security()?;
     let (io, h2): (BoxIo, bool) = match security {
         TransportSecurity::Reality => {
-            let client = crate::runtime::reality_client(server)?;
+            let client = crate::proxy::runtime::reality_client(server)?;
             let tcp = TcpStream::connect(addr).await?;
             let stream = RealityConnector::new(client)
                 .with_fingerprint(server.fingerprint_kind())
@@ -723,7 +723,7 @@ mod tests {
 
     fn server(path: Option<&str>, host: Option<&str>, security: &str) -> ServerConfig {
         let mut s = crate::config::Config::from_vless_url(
-            &crate::url::VlessUrl::parse(&format!(
+            &crate::config::url::VlessUrl::parse(&format!(
                 "vless://00000000-0000-0000-0000-000000000001@203.0.113.9:443?type=xhttp&security={security}&sni=cdn.example{}{}",
                 path.map(|p| format!("&path={}", p.replace('/', "%2F"))).unwrap_or_default(),
                 host.map(|h| format!("&host={h}")).unwrap_or_default(),

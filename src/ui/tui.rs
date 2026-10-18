@@ -1,10 +1,10 @@
 //! Minimal terminal UI: server/mode header, live counters, recent log lines.
 //! `q` (or Esc / Ctrl-C) shuts the proxy down gracefully.
 
+use crate::config::servers::ServerList;
 use crate::config::Config;
-use crate::runtime::ActiveServer;
-use crate::servers::ServerList;
-use crate::stats::{human_bytes, Snapshot, STATS};
+use crate::proxy::runtime::ActiveServer;
+use crate::proxy::stats::{human_bytes, Snapshot, STATS};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -126,8 +126,8 @@ struct App {
     /// Generation of the current ping round; stale results are dropped.
     ping_round: u64,
     pings_in_flight: usize,
-    sub_rx: mpsc::UnboundedReceiver<Result<crate::subscription::Subscription, String>>,
-    sub_tx: mpsc::UnboundedSender<Result<crate::subscription::Subscription, String>>,
+    sub_rx: mpsc::UnboundedReceiver<Result<crate::config::subscription::Subscription, String>>,
+    sub_tx: mpsc::UnboundedSender<Result<crate::config::subscription::Subscription, String>>,
     refreshing: bool,
 }
 
@@ -146,7 +146,7 @@ impl App {
         let url = meta.url.clone();
         let tx = self.sub_tx.clone();
         tokio::spawn(async move {
-            let result = crate::subscription::fetch(&url)
+            let result = crate::config::subscription::fetch(&url)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -212,7 +212,7 @@ impl App {
             let server = entry.server.clone();
             let tx = self.ping_tx.clone();
             tokio::spawn(async move {
-                let result = crate::runtime::measure_handshake(&server, limit)
+                let result = crate::proxy::runtime::measure_handshake(&server, limit)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx.send((i, round, result));

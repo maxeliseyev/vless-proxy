@@ -1,4 +1,4 @@
-//! Native REALITY transport: the primitives from [`crate::reality`] wired into
+//! Native REALITY transport: the primitives from [`crate::protocol::reality`] wired into
 //! rustls through three extension points.
 //!
 //! * A [`SupportedKxGroup`] for X25519 that keeps the ephemeral secret so the
@@ -11,7 +11,7 @@
 //!
 //! All three share per-connection state through a [`ConnectionSlot`].
 
-use crate::reality::{
+use crate::protocol::reality::{
     seal_session_id, session_id_plaintext, unix_time_now, RealityClient, RealityHandshake,
 };
 use anyhow::{bail, Context as _, Result};
@@ -384,19 +384,22 @@ pub struct RealityConnectionInfo {
 
 pub struct RealityConnector {
     client: RealityClient,
-    fingerprint: crate::fingerprint::Fingerprint,
+    fingerprint: crate::protocol::fingerprint::Fingerprint,
 }
 
 impl RealityConnector {
     pub fn new(client: RealityClient) -> Self {
         Self {
             client,
-            fingerprint: crate::fingerprint::Fingerprint::Chrome,
+            fingerprint: crate::protocol::fingerprint::Fingerprint::Chrome,
         }
     }
 
     /// Which browser's ClientHello to imitate (`fp=` of the link).
-    pub fn with_fingerprint(mut self, fingerprint: crate::fingerprint::Fingerprint) -> Self {
+    pub fn with_fingerprint(
+        mut self,
+        fingerprint: crate::protocol::fingerprint::Fingerprint,
+    ) -> Self {
         self.fingerprint = fingerprint;
         self
     }

@@ -5,8 +5,8 @@
 //! container carries a stock Xray client config as the `xray.last_config`
 //! string, which goes through the regular Xray JSON import.
 
+use crate::config::import::xray;
 use crate::config::Config;
-use crate::xray_import;
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -91,7 +91,7 @@ pub fn from_json(root: &Value, inbound_port: Option<u16>) -> Result<Config> {
              not the full-access (admin) config"
         ),
     };
-    let mut config = xray_import::from_json(&text, inbound_port)
+    let mut config = xray::from_json(&text, inbound_port)
         .context("Xray client config inside the Amnezia config")?;
     if config.server.remark.as_deref().is_none_or(str::is_empty) {
         if let Some(description) = root["description"]

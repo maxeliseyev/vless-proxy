@@ -1,4 +1,4 @@
-use crate::vision::Vision;
+use crate::protocol::vision::Vision;
 use anyhow::Result;
 use std::fmt::{self, Display, Formatter};
 use std::io;
@@ -292,7 +292,7 @@ impl<S: AsyncRead + AsyncWrite + XtlsDirect + Unpin> AsyncRead for VlessStream<S
                 Some(v) if !this.read_direct => v,
                 _ => return Pin::new(&mut this.inner).poll_read(cx, buf),
             };
-            let mut scratch = [0u8; crate::vision::BUF_SIZE];
+            let mut scratch = [0u8; crate::protocol::vision::BUF_SIZE];
             let mut tmp = ReadBuf::new(&mut scratch);
             ready!(Pin::new(&mut this.inner).poll_read(cx, &mut tmp))?;
             if tmp.filled().is_empty() {
@@ -605,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn vision_stream_pads_and_unpads_against_mirror_peer() {
-        use crate::vision::{Unpadder, Vision, CMD_END, PADDING_OVERHEAD};
+        use crate::protocol::vision::{Unpadder, Vision, CMD_END, PADDING_OVERHEAD};
         let uuid = [0x42u8; 16];
         let (mut server, client) = tokio::io::duplex(65536);
         let mut stream = VlessStream::new(client, vec![VERSION, 0]).with_vision(Vision::new(uuid));
@@ -630,8 +630,13 @@ mod tests {
 
         // server -> client: response header + padded reply, split over two writes
         let mut reply = vec![VERSION, 0];
-        let mut padder = crate::vision::Padder::new(uuid, Default::default());
-        padder.pad(b"reply ", crate::vision::CMD_CONTINUE, true, &mut reply);
+        let mut padder = crate::protocol::vision::Padder::new(uuid, Default::default());
+        padder.pad(
+            b"reply ",
+            crate::protocol::vision::CMD_CONTINUE,
+            true,
+            &mut reply,
+        );
         padder.pad(b"done", CMD_END, false, &mut reply);
         let (first, second) = reply.split_at(40);
         server.write_all(first).await.unwrap();

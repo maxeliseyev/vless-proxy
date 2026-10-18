@@ -1,4 +1,4 @@
-use crate::vless;
+use crate::protocol::vless;
 use anyhow::{anyhow, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

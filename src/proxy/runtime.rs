@@ -2,19 +2,19 @@ use crate::config::{
     Config, DnsConfig, InboundProtocol, MuxConfig, RoutingConfig, RuntimeConfig, ServerConfig,
     Transport, TransportSecurity,
 };
-use crate::dns::ResolverPolicy;
-use crate::http;
-use crate::mux::{MuxManager, MuxStream, MUX_COOL_ADDRESS, MUX_COOL_PORT};
-use crate::reality::RealityClient;
-use crate::reality_tls::RealityConnector;
-use crate::routing::{Outbound, Router};
-use crate::socks5;
-use crate::stats::STATS;
-use crate::tls::{self, MaybeTlsStream, WsInner};
-use crate::vision::{Vision, FLOW_VISION};
-use crate::vless::{self, Address, Request, VlessStream, XtlsDirect};
-use crate::ws::WsStream;
-use crate::xray_sidecar;
+use crate::inbound::http;
+use crate::inbound::socks5;
+use crate::protocol::mux::{MuxManager, MuxStream, MUX_COOL_ADDRESS, MUX_COOL_PORT};
+use crate::protocol::reality::tls::RealityConnector;
+use crate::protocol::reality::RealityClient;
+use crate::protocol::vision::{Vision, FLOW_VISION};
+use crate::protocol::vless::{self, Address, Request, VlessStream, XtlsDirect};
+use crate::proxy::dns::ResolverPolicy;
+use crate::proxy::routing::{Outbound, Router};
+use crate::proxy::stats::STATS;
+use crate::system::xray_sidecar;
+use crate::transport::tls::{self, MaybeTlsStream, WsInner};
+use crate::transport::ws::WsStream;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::future::Future;
@@ -387,7 +387,7 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
     let mut tun_task = config
         .tun
         .enabled
-        .then(|| tokio::spawn(crate::tun::run(config.clone(), shutdown_rx.clone())));
+        .then(|| tokio::spawn(crate::system::tun::run(config.clone(), shutdown_rx.clone())));
     let tun_failed = async {
         match tun_task.as_mut() {
             Some(task) => match task.await {
@@ -1126,7 +1126,8 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
         ),
         MaybeTlsStream::Xhttp(stream) => format!("{} OK", stream.description()),
         MaybeTlsStream::Reality(stream) => {
-            let info = crate::reality_tls::connection_info(&stream, server.tls_server_name());
+            let info =
+                crate::protocol::reality::tls::connection_info(&stream, server.tls_server_name());
             format!(
                 "REALITY handshake OK with {} (sni {}, alpn {}, suite {}): server certificate authenticated",
                 server.endpoint(),
@@ -1213,7 +1214,9 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
         (Transport::Ws, TransportSecurity::Reality) => {
             anyhow::bail!("REALITY is not available over WebSocket")
         }
-        (Transport::Xhttp, _) => Ok(MaybeTlsStream::Xhttp(crate::xhttp::connect(server).await?)),
+        (Transport::Xhttp, _) => Ok(MaybeTlsStream::Xhttp(
+            crate::transport::xhttp::connect(server).await?,
+        )),
     }
 }
 

@@ -13,7 +13,7 @@
 //! 16 s check interval. There is no half-close in Mux.Cool: when the local
 //! side finishes writing, the session is ended.
 
-use crate::vless::Address;
+use crate::protocol::vless::Address;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;

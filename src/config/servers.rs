@@ -2,10 +2,10 @@
 //! `vless://` link of the links file (or the single server of a TOML/JSON
 //! config), plus persistence of the chosen one as the file's first link.
 
-use crate::amnezia_import;
+use crate::config::import::amnezia;
+use crate::config::subscription::{self, Meta, Subscription};
+use crate::config::url::VlessUrl;
 use crate::config::{Config, ServerConfig};
-use crate::subscription::{self, Meta, Subscription};
-use crate::url::VlessUrl;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -58,8 +58,8 @@ impl ServerEntry {
 /// on `inbound_port`.
 pub fn config_from_link(link: &str, inbound_port: u16) -> Result<Config> {
     let link = link.trim();
-    if amnezia_import::is_link(link) {
-        return amnezia_import::from_link(link, inbound_port);
+    if amnezia::is_link(link) {
+        return amnezia::from_link(link, inbound_port);
     }
     if !link.starts_with("vless://") {
         bail!("expected a vless:// or vpn:// link");
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn subscription_managed_file() {
-        use crate::subscription::{Meta, Subscription};
+        use crate::config::subscription::{Meta, Subscription};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.txt");
         std::fs::write(&path, format!("{A}\n{B}\n")).unwrap();
@@ -430,7 +430,7 @@ mod tests {
         list.add_link(d, 1080).unwrap();
         list.apply_subscription(&sub, 1080).unwrap();
         let (subs, manual) =
-            crate::subscription::split_sections(&std::fs::read_to_string(&path).unwrap());
+            crate::config::subscription::split_sections(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(subs, vec![B.to_string(), C.to_string()]);
         assert_eq!(manual, vec![A.to_string(), d.to_string()]);
         assert_eq!(list.len(), 4);

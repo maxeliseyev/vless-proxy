@@ -1,6 +1,6 @@
 use crate::config::{DnsConfig, DnsIpStrategy, DnsResolveMode, DnsRule};
-use crate::dns_cache::DnsCache;
-use crate::vless::Address;
+use crate::protocol::vless::Address;
+use crate::proxy::dns_cache::DnsCache;
 use anyhow::{Context, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -15,7 +15,7 @@ pub struct ResolverPolicy {
 
 impl ResolverPolicy {
     pub fn new(config: DnsConfig) -> Result<Self> {
-        let cache_config = crate::dns_cache::DnsCacheConfig {
+        let cache_config = crate::proxy::dns_cache::DnsCacheConfig {
             enabled: config.cache.enabled,
             max_entries: config.cache.max_entries,
             default_ttl_secs: config.cache.ttl_secs,

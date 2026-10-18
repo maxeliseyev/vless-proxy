@@ -6,7 +6,7 @@ use tracing::{info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
-use vproxy::servers::config_from_link;
+use vproxy::config::servers::config_from_link;
 use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList};
 
 /// Subcommands that run instead of the proxy.
@@ -52,11 +52,11 @@ async fn main() -> Result<()> {
         Level::INFO
     };
     let tui_logs = if args.tui {
-        let logs = vproxy::tui::LogBuffer::new(1000);
+        let logs = vproxy::ui::tui::LogBuffer::new(1000);
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(vproxy::tui::LogSink(logs.clone()))
+                    .with_writer(vproxy::ui::tui::LogSink(logs.clone()))
                     .with_timer(tracing_subscriber::fmt::time::uptime())
                     .with_ansi(false)
                     .with_target(false)
@@ -120,16 +120,16 @@ async fn main() -> Result<()> {
     }
 
     if args.print_tun_config {
-        let rendered = vproxy::tun::build_sing_box_config(
+        let rendered = vproxy::system::tun::build_sing_box_config(
             config.as_ref(),
-            vproxy::tun::current_process_name().as_deref(),
+            vproxy::system::tun::current_process_name().as_deref(),
         )?;
         println!("{}", serde_json::to_string_pretty(&rendered)?);
         return Ok(());
     }
 
     if args.probe {
-        let report = vproxy::runtime::probe_transport(config.as_ref()).await?;
+        let report = vproxy::proxy::runtime::probe_transport(config.as_ref()).await?;
         info!("{report}");
         return Ok(());
     }
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
     if args.ping {
         let limit = Duration::from_secs(config.runtime.connect_timeout_secs.clamp(1, 10));
         let list: Vec<_> = servers.entries.iter().map(|e| e.server.clone()).collect();
-        let results = vproxy::runtime::ping_servers(&list, limit).await;
+        let results = vproxy::proxy::runtime::ping_servers(&list, limit).await;
         let mut rows: Vec<(usize, &vproxy::ServerEntry, &Result<Duration, String>)> = servers
             .entries
             .iter()
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         Some(logs) => {
             let active = ActiveServer::new(config.server.clone());
             let server = tokio::spawn(serve_with_server(config.clone(), active.clone()));
-            vproxy::tui::run(config, servers, active, logs, server).await
+            vproxy::ui::tui::run(config, servers, active, logs, server).await
         }
         None => serve(config).await,
     }
@@ -179,17 +179,17 @@ async fn main() -> Result<()> {
 /// Find sing-box for TUN mode, offering to install it on a terminal.
 async fn resolve_sing_box(args: &Args, configured: &str) -> Result<String> {
     if let Some(path) = &args.sing_box {
-        return match vproxy::singbox::locate(&path.display().to_string()) {
+        return match vproxy::system::singbox::locate(&path.display().to_string()) {
             Some(p) => Ok(p.display().to_string()),
             None => anyhow::bail!("--sing-box {} is not an executable", path.display()),
         };
     }
-    if let Some(found) = vproxy::singbox::locate(configured) {
+    if let Some(found) = vproxy::system::singbox::locate(configured) {
         return Ok(found.display().to_string());
     }
-    eprintln!("{}", vproxy::singbox::not_found_hint());
-    if vproxy::singbox::ask("Install sing-box now?", true, args.yes)? {
-        let path = vproxy::singbox::install(args.yes).await?;
+    eprintln!("{}", vproxy::system::singbox::not_found_hint());
+    if vproxy::system::singbox::ask("Install sing-box now?", true, args.yes)? {
+        let path = vproxy::system::singbox::install(args.yes).await?;
         return Ok(path.display().to_string());
     }
     anyhow::bail!("sing-box is required for --tun")
@@ -200,9 +200,9 @@ async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
     match command {
         Subcommand::InstallSingBox => {
             let path = if args.download {
-                vproxy::singbox::download_release(args.yes).await?
+                vproxy::system::singbox::download_release(args.yes).await?
             } else {
-                vproxy::singbox::install(args.yes).await?
+                vproxy::system::singbox::install(args.yes).await?
             };
             info!("sing-box ready at {}", path.display());
             Ok(())
@@ -210,15 +210,15 @@ async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
         Subcommand::Service(action) => match action.as_str() {
             "install" => service_install(args).await,
             "uninstall" | "remove" => {
-                let p = vproxy::service::uninstall(args.tun)?;
+                let p = vproxy::system::service::uninstall(args.tun)?;
                 info!("Service removed ({})", p.unit.display());
                 Ok(())
             }
             "status" => {
-                print!("{}", vproxy::service::status(args.tun)?);
+                print!("{}", vproxy::system::service::status(args.tun)?);
                 Ok(())
             }
-            "logs" | "log" => vproxy::service::logs(args.tun),
+            "logs" | "log" => vproxy::system::service::logs(args.tun),
             other => {
                 anyhow::bail!("unknown service action {other:?} (install, uninstall, status, logs)")
             }
@@ -229,7 +229,7 @@ async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
 /// Resolve the config source to absolute paths, check it loads, pick the
 /// sing-box binary for `--tun`, then install the launchd/systemd service.
 async fn service_install(args: Args) -> Result<()> {
-    use vproxy::service::absolute;
+    use vproxy::system::service::absolute;
     let mut service_args: Vec<String> = Vec::new();
     let mut check = args.clone();
     check.command = None;
@@ -243,7 +243,7 @@ async fn service_install(args: Args) -> Result<()> {
         check.url_file = Some(file);
     } else if let Some(link) = &args.vless_url {
         // The service cannot take the link on its command line safely; keep it in a file.
-        let dir = vproxy::singbox::real_home()
+        let dir = vproxy::system::singbox::real_home()
             .map(|h| h.join(".config").join("vproxy"))
             .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
         std::fs::create_dir_all(&dir)?;
@@ -289,12 +289,12 @@ async fn service_install(args: Args) -> Result<()> {
     let binary = std::env::current_exe()?
         .canonicalize()
         .context("cannot resolve the vproxy binary path")?;
-    let plan = vproxy::service::ServicePlan {
+    let plan = vproxy::system::service::ServicePlan {
         tun: args.tun,
         binary,
         args: service_args,
     };
-    let p = vproxy::service::install(&plan)?;
+    let p = vproxy::system::service::install(&plan)?;
     info!(
         "Service installed and started: {} ({} {})",
         p.unit.display(),
@@ -354,7 +354,7 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
                 .unwrap_or_else(|| PathBuf::from("server.txt"))
         });
         info!("Fetching subscription {url}");
-        let sub = vproxy::subscription::fetch(&url).await?;
+        let sub = vproxy::config::subscription::fetch(&url).await?;
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -387,7 +387,7 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
     let Ok(content) = std::fs::read_to_string(&file) else {
         return Ok(false);
     };
-    let Some(meta) = vproxy::subscription::Meta::from_lines(content.lines()) else {
+    let Some(meta) = vproxy::config::subscription::Meta::from_lines(content.lines()) else {
         if args.refresh {
             anyhow::bail!(
                 "{} has no `# subscription:` header; start once with -s URL",
@@ -404,7 +404,7 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
                 meta.age_text()
             );
         }
-        match vproxy::subscription::fetch(&meta.url).await {
+        match vproxy::config::subscription::fetch(&meta.url).await {
             Ok(sub) => {
                 let mut list = ServerList::from_file(&file, inbound_port)?;
                 list.apply_subscription(&sub, inbound_port)?;
@@ -418,7 +418,7 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
 }
 
 fn subscription_summary(
-    sub: &vproxy::subscription::Subscription,
+    sub: &vproxy::config::subscription::Subscription,
     list: &ServerList,
     file: &std::path::Path,
 ) -> String {
@@ -448,7 +448,7 @@ fn subscription_summary(
 fn read_url_file(path: &PathBuf) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", path.display()))?;
-    if let Some(active) = vproxy::servers::active_link(&content) {
+    if let Some(active) = vproxy::config::servers::active_link(&content) {
         return Ok(active);
     }
     content
@@ -618,7 +618,8 @@ fn load_config(args: Args) -> Result<(Config, ServerList)> {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("vpn"))
         {
-            let config = vproxy::amnezia_import::load_file(&config_path, args.inbound_port)?;
+            let config =
+                vproxy::config::import::amnezia::load_file(&config_path, args.inbound_port)?;
             let servers = ServerList::single(config.server.clone());
             info!(
                 "Imported Amnezia config: {} {}:{} ({} over {})",
@@ -634,7 +635,7 @@ fn load_config(args: Args) -> Result<(Config, ServerList)> {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         {
-            let config = vproxy::xray_import::load(&config_path, args.inbound_port)?;
+            let config = vproxy::config::import::xray::load(&config_path, args.inbound_port)?;
             let servers = ServerList::single(config.server.clone());
             info!(
                 "Imported Xray config: {} {}:{} ({} over {}{})",

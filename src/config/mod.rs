@@ -1,4 +1,11 @@
-use crate::url::VlessUrl;
+//! Configuration: TOML config, links, server lists, subscriptions and importers.
+
+pub mod import;
+pub mod servers;
+pub mod subscription;
+pub mod url;
+
+use crate::config::url::VlessUrl;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -518,7 +525,7 @@ impl Config {
         self.dns.resolve_mode()?;
         self.needs_xray_sidecar()?;
         self.tun.validate()?;
-        crate::routing::Router::new(&self.routing)?;
+        crate::proxy::routing::Router::new(&self.routing)?;
         if self.tun.enabled && !matches!(self.inbound.protocol_kind()?, InboundProtocol::Socks5) {
             bail!("tun.enabled requires inbound.protocol = \"socks5\"");
         }
@@ -594,7 +601,7 @@ impl ServerConfig {
             if self.flow.is_some() {
                 bail!("server.flow (XTLS Vision) is not available over transport = \"xhttp\"");
             }
-            crate::xhttp::XhttpConfig::from_server(self)?;
+            crate::transport::xhttp::XhttpConfig::from_server(self)?;
         }
 
         if self.flow.is_some() && !matches!(self.transport_security()?, TransportSecurity::Reality)
@@ -650,8 +657,8 @@ impl ServerConfig {
     pub fn vision_flow(&self) -> Result<Option<VisionFlow>> {
         match self.flow.as_deref().map(str::trim) {
             None | Some("") => Ok(None),
-            Some(crate::vision::FLOW_VISION) => Ok(Some(VisionFlow::Vision)),
-            Some(crate::vision::FLOW_VISION_UDP443) => Ok(Some(VisionFlow::VisionUdp443)),
+            Some(crate::protocol::vision::FLOW_VISION) => Ok(Some(VisionFlow::Vision)),
+            Some(crate::protocol::vision::FLOW_VISION_UDP443) => Ok(Some(VisionFlow::VisionUdp443)),
             Some(other) => bail!("Unsupported server.flow value: {other}"),
         }
     }
@@ -661,8 +668,8 @@ impl ServerConfig {
     }
 
     /// How the TLS ClientHello is shaped (`fp=`): Chrome unless `none`.
-    pub fn fingerprint_kind(&self) -> crate::fingerprint::Fingerprint {
-        crate::fingerprint::Fingerprint::parse(self.fingerprint.as_deref())
+    pub fn fingerprint_kind(&self) -> crate::protocol::fingerprint::Fingerprint {
+        crate::protocol::fingerprint::Fingerprint::parse(self.fingerprint.as_deref())
     }
 
     pub fn reality_spider_x(&self) -> &str {
