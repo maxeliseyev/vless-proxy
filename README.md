@@ -22,7 +22,7 @@ docker run -d --name vproxy -p 127.0.0.1:1080:1080 ghcr.io/maxeliseyev/vproxy -s
 docker build -t vproxy .      # собрать самому (Alpine, статический musl)
 ```
 
-Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически).
+Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически). Форк раз в неделю сливается с upstream `rel-0.23` workflow'ом `rustls fork sync`: он прогоняет тесты rustls и vproxy, обновляет `rev` в `Cargo.toml`, а конфликт слияния или выход rustls 0.24 превращает в issue.
 
 Для системного режима (TUN) дополнительно нужен [sing-box](https://sing-box.sagernet.org). Его ставит сам vproxy:
 

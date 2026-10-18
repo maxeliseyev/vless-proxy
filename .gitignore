@@ -2,3 +2,6 @@
 .DS_Store
 tun-mytishchi.toml
 server.txt
+
+# local clone made by .github/scripts/rustls-sync.sh
+/rustls-fork/
