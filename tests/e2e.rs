@@ -339,6 +339,9 @@ async fn mux_shares_one_vless_connection_between_sessions() -> Result<()> {
             }
             stream.flush().await?;
         }
+        // New frames go out with each session's first data, and the client
+        // writes to `b` before `a`, so their order is not fixed.
+        opened.sort_by_key(|(id, _)| *id);
         assert_eq!(
             opened,
             vec![
