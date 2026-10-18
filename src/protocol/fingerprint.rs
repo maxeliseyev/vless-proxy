@@ -1,16 +1,20 @@
 //! TLS ClientHello shaped like Chrome's, so the handshake does not stand out
 //! from browser traffic (JA3/JA4 and friends). This is the client side of
-//! what Xray does with uTLS `fp=chrome`; the profile is uTLS
-//! `HelloChrome_133`, the one Xray 26.x sends.
+//! what Xray does with uTLS `fp=chrome`. The default profile is uTLS
+//! `HelloChrome_155` (Chrome stable since October 2026); `HelloChrome_133`
+//! stays available as `fp=chrome133` for side-by-side comparisons, since
+//! TSPU is reported to single out that older shape.
 //!
 //! rustls builds its own hello; our fork hands the encoded bytes to a
 //! [`ClientHelloRewriter`] and sends what it returns. The rewriter keeps the
 //! fields that carry cryptographic state (random, session id, key shares,
 //! ALPN, SNI) and replaces the rest: Chrome's cipher suite list, its set of
 //! extensions in a per-connection random order (Chrome shuffles them since
-//! version 110), GREASE values in the five places BoringSSL puts them, a
-//! GREASE ECH extension, ALPS, SCT and session ticket requests. Extensions
-//! rustls does not implement are advertised only; servers do not select them.
+//! version 110), GREASE values in the places BoringSSL puts them, a GREASE
+//! ECH extension, ALPS, SCT and session ticket requests, and for Chrome 155
+//! ML-DSA signature algorithms plus the `trust_anchors` list of the Chrome
+//! Root Store. Extensions rustls does not implement are advertised only;
+//! servers do not select them.
 
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -35,6 +39,7 @@ const EXT_COOKIE: u16 = 44;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_ALPS: u16 = 17613; // application_settings, new code point
+const EXT_TRUST_ANCHORS: u16 = 0xca34; // draft-ietf-tls-trust-anchor-ids
 const EXT_ECH: u16 = 0xfe0d;
 const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
@@ -49,15 +54,77 @@ const CIPHER_SUITES: [u16; 15] = [
     0x009d, 0x002f, 0x0035,
 ];
 
-/// Chrome's signature algorithms.
+/// Chrome's classic signature algorithms (Chrome 133 sends exactly these).
 const SIGNATURE_ALGORITHMS: [u16; 8] = [
     0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
 ];
 
+/// ML-DSA-44/65/87, which Chrome 155 lists first (after a GREASE value).
+const MLDSA_SIGNATURE_ALGORITHMS: [u16; 3] = [0x0904, 0x0905, 0x0906];
+
+/// Chrome Root Store trust anchor IDs advertised by Chrome 155.0.8059.40, in
+/// the lexicographic order Chrome uses (uTLS `chrome155TrustAnchorIDs`).
+const TRUST_ANCHOR_IDS: [&[u8]; 28] = [
+    &[0x82, 0xdf, 0x13, 0x02, 0x01],
+    &[0x82, 0xdf, 0x13, 0x02, 0x06],
+    &[0x82, 0xdf, 0x13, 0x02, 0x0d],
+    &[0x82, 0xdf, 0x13, 0x02, 0x0e],
+    &[0x82, 0xdf, 0x13, 0x02, 0x0f],
+    &[0x82, 0xdf, 0x13, 0x02, 0x12],
+    &[0x82, 0xdf, 0x13, 0x02, 0x13],
+    &[0x82, 0xdf, 0x13, 0x02, 0x14],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x08],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0d],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12],
+    &[0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x13],
+    &[0xd6, 0x79, 0x09, 0x01],
+    &[0xd6, 0x79, 0x09, 0x04],
+    &[0xd6, 0x79, 0x09, 0x05],
+    &[0xd6, 0x79, 0x09, 0x06],
+    &[0xd6, 0x79, 0x09, 0x07],
+    &[0xd6, 0x79, 0x09, 0x08],
+    &[0xd6, 0x79, 0x09, 0x0a],
+    &[0xd6, 0x79, 0x09, 0x0b],
+    &[0xd6, 0x79, 0x09, 0x0c],
+    &[0xd6, 0x79, 0x09, 0x0d],
+    &[0xd6, 0x79, 0x09, 0x0f],
+];
+
+/// `trust_anchors` extension body: a u16-length list of u8-length IDs.
+fn trust_anchors_body() -> Vec<u8> {
+    let list_len: usize = TRUST_ANCHOR_IDS.iter().map(|id| 1 + id.len()).sum();
+    let mut out = Vec::with_capacity(2 + list_len);
+    out.extend_from_slice(&(list_len as u16).to_be_bytes());
+    for id in TRUST_ANCHOR_IDS {
+        out.push(id.len() as u8);
+        out.extend_from_slice(id);
+    }
+    out
+}
+
+/// Which Chrome release to imitate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// uTLS `HelloChrome_133` (Chrome 133 to 154; what Xray sent until
+    /// October 2026).
+    Chrome133,
+    /// uTLS `HelloChrome_155`: adds GREASE and ML-DSA to the signature
+    /// algorithms and the `trust_anchors` extension.
+    Chrome155,
+}
+
 /// Which browser to look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fingerprint {
+    /// Current Chrome (155).
     Chrome,
+    /// The previous Chrome shape, for A/B comparisons (`fp=chrome133`).
+    Chrome133,
     /// Send what rustls builds.
     None,
 }
@@ -65,14 +132,16 @@ pub enum Fingerprint {
 impl Fingerprint {
     /// `fp=` / `server.fingerprint` value. Anything Xray would hand to uTLS
     /// (chrome, firefox, safari, ios, android, edge, 360, qq, random,
-    /// randomized) becomes Chrome: that is the only profile implemented, and
-    /// the one almost every link asks for. `none`, `rustls`, `raw` and `go`
-    /// disable shaping.
+    /// randomized) becomes current Chrome: that is the only browser
+    /// implemented, and the one almost every link asks for. `chrome133`
+    /// (also `chrome-133`, `chrome_133`) selects the previous shape. `none`,
+    /// `rustls`, `raw` and `go` disable shaping.
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("none") | Some("rustls") | Some("raw") | Some("go") | Some("golang") => {
                 Fingerprint::None
             }
+            Some("chrome133") | Some("chrome-133") | Some("chrome_133") => Fingerprint::Chrome133,
             _ => Fingerprint::Chrome,
         }
     }
@@ -81,7 +150,8 @@ impl Fingerprint {
     /// once, so a HelloRetryRequest hello keeps the same shape).
     pub fn rewriter(self) -> Option<Arc<dyn ClientHelloRewriter>> {
         match self {
-            Fingerprint::Chrome => Some(Arc::new(ChromeHello::new())),
+            Fingerprint::Chrome => Some(Arc::new(ChromeHello::new(Profile::Chrome155))),
+            Fingerprint::Chrome133 => Some(Arc::new(ChromeHello::new(Profile::Chrome133))),
             Fingerprint::None => None,
         }
     }
@@ -90,11 +160,13 @@ impl Fingerprint {
 /// Per-connection random choices of a Chrome hello.
 #[derive(Debug)]
 pub struct ChromeHello {
+    profile: Profile,
     grease_cipher: u16,
     grease_group: u16,
     grease_ext1: u16,
     grease_ext2: u16,
     grease_version: u16,
+    grease_sigalg: u16,
     /// Extension order: lower rank first.
     ranks: HashMap<u16, u32>,
     ech: Vec<u8>,
@@ -108,19 +180,19 @@ fn grease(byte: u8) -> u16 {
 
 impl Default for ChromeHello {
     fn default() -> Self {
-        Self::new()
+        Self::new(Profile::Chrome155)
     }
 }
 
 impl ChromeHello {
-    pub fn new() -> Self {
+    pub fn new(profile: Profile) -> Self {
         let mut seed = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut seed);
-        Self::from_seed(seed)
+        Self::from_seed(profile, seed)
     }
 
     /// Deterministic variant (tests).
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    pub fn from_seed(profile: Profile, seed: [u8; 32]) -> Self {
         let mut rng = StdRng::from_seed(seed);
         let grease_cipher = grease(rng.gen());
         let grease_group = grease(rng.gen());
@@ -130,6 +202,7 @@ impl ChromeHello {
             grease_ext2 ^= 0x1010;
         }
         let grease_version = grease(rng.gen());
+        let grease_sigalg = grease(rng.gen());
         let mut ranks = HashMap::new();
         for ext in [
             EXT_SERVER_NAME,
@@ -147,6 +220,7 @@ impl ChromeHello {
             EXT_PSK_KEY_EXCHANGE_MODES,
             EXT_KEY_SHARE,
             EXT_ALPS,
+            EXT_TRUST_ANCHORS,
             EXT_ECH,
             EXT_RENEGOTIATION_INFO,
         ] {
@@ -154,11 +228,13 @@ impl ChromeHello {
         }
         let ech = grease_ech(&mut rng);
         Self {
+            profile,
             grease_cipher,
             grease_group,
             grease_ext1,
             grease_ext2,
             grease_version,
+            grease_sigalg,
             ranks,
             ech,
         }
@@ -330,7 +406,17 @@ impl ChromeHello {
             exts.push((EXT_ALPN, alpn.to_vec()));
         }
         exts.push((EXT_STATUS_REQUEST, vec![0x01, 0x00, 0x00, 0x00, 0x00]));
-        exts.push((EXT_SIGNATURE_ALGORITHMS, u16_list(&SIGNATURE_ALGORITHMS)));
+        let sigalgs = match self.profile {
+            Profile::Chrome133 => u16_list(&SIGNATURE_ALGORITHMS),
+            Profile::Chrome155 => {
+                let mut all = Vec::with_capacity(12);
+                all.push(self.grease_sigalg);
+                all.extend_from_slice(&MLDSA_SIGNATURE_ALGORITHMS);
+                all.extend_from_slice(&SIGNATURE_ALGORITHMS);
+                u16_list(&all)
+            }
+        };
+        exts.push((EXT_SIGNATURE_ALGORITHMS, sigalgs));
         exts.push((EXT_SCT, Vec::new()));
         if let Some(shares) = original.extension(EXT_KEY_SHARE) {
             // Keep rustls's shares (they hold the key exchange state); a
@@ -363,6 +449,9 @@ impl ChromeHello {
         ));
         exts.push((EXT_COMPRESS_CERTIFICATE, vec![0x02, 0x00, 0x02]));
         exts.push((EXT_ALPS, vec![0x00, 0x03, 0x02, b'h', b'2']));
+        if self.profile == Profile::Chrome155 {
+            exts.push((EXT_TRUST_ANCHORS, trust_anchors_body()));
+        }
         exts.push((EXT_ECH, self.ech.clone()));
         if let Some(cookie) = original.extension(EXT_COOKIE) {
             exts.push((EXT_COOKIE, cookie.to_vec()));
@@ -464,6 +553,7 @@ pub fn ja4(raw: &[u8]) -> Option<String> {
         .extension(EXT_SIGNATURE_ALGORITHMS)
         .map(|d| {
             be_u16s(d.get(2..).unwrap_or(&[]))
+                .filter(|v| !is_grease(*v))
                 .map(|v| format!("{v:04x}"))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -541,8 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn shaped_hello_matches_chrome_133() {
-        let chrome = ChromeHello::from_seed([3u8; 32]);
+    fn shaped_hello_matches_chrome_155() {
+        let chrome = ChromeHello::from_seed(Profile::Chrome155, [3u8; 32]);
         let original = rustls_like_hello();
         let raw = chrome.rewrite(&original.encode(), false).unwrap();
         let h = ParsedHello::parse(&raw).unwrap();
@@ -559,8 +649,9 @@ mod tests {
         assert_eq!(h.extensions[0].1, Vec::<u8>::new());
         assert_eq!(h.extensions.last().unwrap().1, vec![0u8]);
         let non_grease: Vec<u16> = types.iter().copied().filter(|t| !is_grease(*t)).collect();
-        assert_eq!(non_grease.len(), 16, "{non_grease:?}");
+        assert_eq!(non_grease.len(), 17, "{non_grease:?}");
         for t in [
+            EXT_TRUST_ANCHORS,
             EXT_SERVER_NAME,
             EXT_EXTENDED_MASTER_SECRET,
             EXT_RENEGOTIATION_INFO,
@@ -598,9 +689,23 @@ mod tests {
         assert!([144, 176, 208, 240].contains(&payload_len));
         assert_eq!(ech.len(), 42 + payload_len as usize);
 
-        // JA4 of Chrome (t13d1516h2 + Chrome's cipher hash)
+        // signature algorithms: GREASE, ML-DSA-44/65/87, then the classic eight
+        let sigalgs: Vec<u16> =
+            be_u16s(&h.extension(EXT_SIGNATURE_ALGORITHMS).unwrap()[2..]).collect();
+        assert_eq!(sigalgs.len(), 12);
+        assert!(is_grease(sigalgs[0]));
+        assert_eq!(&sigalgs[1..4], &MLDSA_SIGNATURE_ALGORITHMS);
+        assert_eq!(&sigalgs[4..], &SIGNATURE_ALGORITHMS);
+
+        // trust_anchors: 28 IDs, u16 list length, u8 per ID
+        let tai = h.extension(EXT_TRUST_ANCHORS).unwrap();
+        assert_eq!(tai.len(), 186);
+        assert_eq!(u16::from_be_bytes([tai[0], tai[1]]), 184);
+        assert_eq!(&tai[2..8], &[5, 0x82, 0xdf, 0x13, 0x02, 0x01]);
+
+        // JA4 of Chrome 155 (t13d1517h2 + Chrome's cipher hash)
         let ja4 = ja4(&raw).unwrap();
-        assert!(ja4.starts_with("t13d1516h2_8daaf6152771_"), "{ja4}");
+        assert!(ja4.starts_with("t13d1517h2_8daaf6152771_"), "{ja4}");
 
         // the same connection keeps its order on a retry, minus the GREASE share
         let again = ParsedHello::parse(&chrome.rewrite(&original.encode(), true).unwrap()).unwrap();
@@ -612,7 +717,7 @@ mod tests {
         );
 
         // different connections differ in order and GREASE
-        let other = ChromeHello::from_seed([4u8; 32]);
+        let other = ChromeHello::from_seed(Profile::Chrome155, [4u8; 32]);
         let other_types: Vec<u16> =
             ParsedHello::parse(&other.rewrite(&original.encode(), false).unwrap())
                 .unwrap()
@@ -624,10 +729,32 @@ mod tests {
     }
 
     #[test]
+    fn chrome_133_profile_keeps_the_old_shape() {
+        let chrome = ChromeHello::from_seed(Profile::Chrome133, [3u8; 32]);
+        let raw = chrome
+            .rewrite(&rustls_like_hello().encode(), false)
+            .unwrap();
+        let h = ParsedHello::parse(&raw).unwrap();
+        let non_grease: Vec<u16> = h
+            .extensions
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|t| !is_grease(*t))
+            .collect();
+        assert_eq!(non_grease.len(), 16, "{non_grease:?}");
+        assert!(h.extension(EXT_TRUST_ANCHORS).is_none());
+        let sigalgs: Vec<u16> =
+            be_u16s(&h.extension(EXT_SIGNATURE_ALGORITHMS).unwrap()[2..]).collect();
+        assert_eq!(sigalgs, SIGNATURE_ALGORITHMS);
+        // the JA4 Chrome 133 reports on tls.peet.ws
+        assert_eq!(ja4(&raw).unwrap(), "t13d1516h2_8daaf6152771_d8a2da3f94cd");
+    }
+
+    #[test]
     fn resumption_hellos_are_left_alone() {
         let mut h = rustls_like_hello();
         h.extensions.push((EXT_PRE_SHARED_KEY, vec![0; 40]));
-        assert!(ChromeHello::from_seed([1u8; 32])
+        assert!(ChromeHello::from_seed(Profile::Chrome155, [1u8; 32])
             .rewrite(&h.encode(), false)
             .is_none());
     }
@@ -637,6 +764,14 @@ mod tests {
         assert_eq!(Fingerprint::parse(None), Fingerprint::Chrome);
         assert_eq!(Fingerprint::parse(Some("chrome")), Fingerprint::Chrome);
         assert_eq!(Fingerprint::parse(Some("firefox")), Fingerprint::Chrome);
+        assert_eq!(
+            Fingerprint::parse(Some("chrome133")),
+            Fingerprint::Chrome133
+        );
+        assert_eq!(
+            Fingerprint::parse(Some("Chrome-133")),
+            Fingerprint::Chrome133
+        );
         assert_eq!(Fingerprint::parse(Some("none")), Fingerprint::None);
         assert_eq!(Fingerprint::parse(Some("rustls")), Fingerprint::None);
     }

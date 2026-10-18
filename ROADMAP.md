@@ -80,6 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 32. **Отпечаток Chrome 155 (2026-10-18, стадия 0 плана `docs/h3-transport-plan.md`)**
+     - По данным разработчиков Xray (issue #7131, 13.10.2026) ТСПУ давно целится в отпечаток Chrome 133 и ограничивает число соединений с ним; наш `fp=chrome` был именно HelloChrome_133.
+     - `fp=chrome` теперь uTLS `HelloChrome_155`: в signature_algorithms добавлены GREASE и ML-DSA-44/65/87 (12 значений), появилось расширение `trust_anchors` (0xca34, draft-ietf-tls-trust-anchor-ids) с 28 идентификаторами Chrome Root Store, 17 расширений в случайном порядке, JA4 `t13d1517h2_…`. Старая форма сохранена как `fp=chrome133` для A/B-сравнений тестировщиками (гипотеза H0).
+     - Форк rustls (rev `7df70d14`): `trust_anchors` в CertificateEntry игнорируется так же, как SCT, иначе сервер, выбравший цепочку по нашему списку, ронял бы handshake `UnknownCertificateExtension`; в EncryptedExtensions неизвестные расширения rustls и так складывает в `unknown_extensions`.
+     - `cargo run --example fingerprint -- chrome <host>` делает handshake и `GET /` к любому хосту, чтобы проверять приём новой формы реальными серверами.
+
  31. **Поддержание форка rustls в актуальном состоянии (2026-10-18)**
      - Форк `maxeliseyev/rustls` (ветка `reality-0.23`, 6 коммитов поверх upstream `rel-0.23`) надо двигать за upstream: 0.23.x выходит примерно раз в месяц, в том числе с security-фиксами, а `cargo audit` видит только номер версии из форка.
      - Workflow `rustls fork sync` (`.github/workflows/rustls-sync.yml`, по понедельникам 06:00 UTC и вручную) вызывает `.github/scripts/rustls-sync.sh`: fetch upstream `rel-0.23`, merge в `reality-0.23` (merge, а не rebase, чтобы все когда-либо запинённые `rev` оставались доступны), полный `cargo test -p rustls --all-features --all-targets`, push форка через deploy-ключ (секрет `RUSTLS_FORK_DEPLOY_KEY`, ключ с правом записи только на репозиторий форка), затем bump `rev` в `Cargo.toml`, `cargo update -p rustls`, fmt/clippy/тесты vproxy и коммит в `main`. Конфликт слияния, любой другой сбой и выход rustls 0.24 становятся issue в vproxy (0.24 один раз: патчи придётся переносить на новую ветку вручную).
