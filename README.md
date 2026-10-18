@@ -12,7 +12,7 @@
 curl -fsSL https://raw.githubusercontent.com/maxeliseyev/vless-proxy/main/install.sh | sh
 ```
 
-Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.11.0`, `VPROXY_PREFIX=~/.local/bin`.
+Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.12.0`, `VPROXY_PREFIX=~/.local/bin`.
 
 Docker (образ `ghcr.io/maxeliseyev/vproxy`, linux/amd64 и linux/arm64, слушает `0.0.0.0:1080` внутри контейнера):
 
