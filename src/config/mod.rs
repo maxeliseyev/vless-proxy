@@ -8,8 +8,65 @@ pub mod url;
 use crate::config::url::VlessUrl;
 use anyhow::{bail, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Write a file that holds credentials (links with UUIDs, subscription
+/// tokens): readable by the owner only, in a directory other users cannot list.
+pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_private_dir(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // An existing file keeps its old mode on open; tighten it too.
+        file.set_permissions(
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )?;
+        file.write_all(contents.as_ref())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// `create_dir_all` with mode 0700 for the directories it creates.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// A server name as shown in the TUI, logs and `--ping`: no control
+/// characters (terminal escapes, newlines that would forge log or file
+/// lines), trimmed, at most 128 characters.
+pub fn sanitize_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(128)
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportSecurity {
@@ -833,6 +890,41 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_name_strips_control_characters_and_limits_length() {
+        assert_eq!(
+            sanitize_name("  My \x1b[31mServer\n# manual  "),
+            "My  [31mServer # manual"
+        );
+        assert_eq!(sanitize_name("Москва 🇷🇺"), "Москва 🇷🇺");
+        assert_eq!(sanitize_name(&"x".repeat(300)).chars().count(), 128);
+        assert_eq!(sanitize_name("\n\t"), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("server.txt");
+        write_private(&path, "vless://secret\n").unwrap();
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+        assert_eq!(file_mode & 0o777, 0o600);
+        // An existing world-readable file is tightened on rewrite.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "vless://other\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "vless://other\n");
+    }
 
     fn base_config() -> Config {
         Config {

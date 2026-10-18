@@ -232,6 +232,10 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
         config.tun.sing_box_path,
         config.inbound.endpoint()
     );
+    crate::system::singbox::warn_if_unsafe_for_root(
+        std::path::Path::new(&config.tun.sing_box_path),
+        "sing-box",
+    );
     let mut child = Command::new(&config.tun.sing_box_path)
         .arg("run")
         .arg("-c")

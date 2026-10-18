@@ -372,7 +372,10 @@ where
                     Err(data) => undelivered = Some((id, data)),
                 }
             }
-            while undelivered.is_none() {
+            // `out` also collects End replies for unknown sessions; a server
+            // flooding those must not grow it without bound, so parsing waits
+            // for the batch to drain.
+            while undelivered.is_none() && out.len() < 64 * 1024 {
                 let (frame, used) = match parse_frame(&raw[raw_pos..]) {
                     Ok(Some(parsed)) => parsed,
                     Ok(None) => break,

@@ -231,6 +231,36 @@ pub async fn install(assume_yes: bool) -> Result<PathBuf> {
     download_release(assume_yes).await
 }
 
+/// Running as root, a helper binary that a non-root user can replace is a
+/// way for that user to become root. vproxy still runs it (Homebrew binaries
+/// on macOS are user-owned by design) but says so once.
+pub fn warn_if_unsafe_for_root(binary: &Path, what: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !is_root() {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(binary) else {
+            return;
+        };
+        let world_or_group_writable = meta.mode() & 0o022 != 0;
+        if meta.uid() != 0 || world_or_group_writable {
+            tracing::warn!(
+                "{what} {} is owned by uid {} (mode {:o}) and runs as root: anyone who can change \
+                 that file can run code as root. Prefer a root-owned copy, e.g. /usr/local/bin.",
+                binary.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (binary, what);
+    }
+}
+
 fn is_root() -> bool {
     // SAFETY: getuid has no preconditions.
     unsafe { libc::getuid() == 0 }

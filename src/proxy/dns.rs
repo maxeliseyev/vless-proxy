@@ -76,7 +76,9 @@ impl ResolverPolicy {
 
         for rule in &self.rules {
             if let Some(suffix) = &rule.domain_suffix {
-                if domain_lower.ends_with(&suffix.to_lowercase()) {
+                let suffix = suffix.to_lowercase();
+                let suffix = suffix.trim_start_matches('.');
+                if domain_lower == suffix || domain_lower.ends_with(&format!(".{suffix}")) {
                     return Some(rule);
                 }
             }
@@ -172,6 +174,26 @@ fn select_ip_from_vec(addresses: &[IpAddr], strategy: DnsIpStrategy) -> Option<I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_rules_match_on_label_boundaries() {
+        let policy = ResolverPolicy::new(DnsConfig {
+            mode: "remote".to_string(),
+            strategy: "prefer_ipv4".to_string(),
+            rules: vec![crate::config::DnsRule {
+                domain: None,
+                domain_suffix: Some("ru".to_string()),
+                domain_keyword: None,
+                resolve: "local".to_string(),
+            }],
+            cache: DnsCacheConfig::default(),
+        })
+        .unwrap();
+        assert!(policy.find_matching_rule("mail.ru").is_some());
+        assert!(policy.find_matching_rule("RU").is_some());
+        assert!(policy.find_matching_rule("guru").is_none());
+        assert!(policy.find_matching_rule("evil-ru.com").is_none());
+    }
     use crate::config::DnsCacheConfig;
     use std::net::{Ipv4Addr, Ipv6Addr};
 

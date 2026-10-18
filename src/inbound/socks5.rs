@@ -158,7 +158,14 @@ where
             let len = stream.read_u8().await? as usize;
             let mut domain = vec![0u8; len];
             stream.read_exact(&mut domain).await?;
-            vless::Address::Domain(String::from_utf8(domain)?)
+            let domain = String::from_utf8(domain)?;
+            // Clients may send an IP literal as a domain; routing rules on IPs
+            // (block, private) must still see it as an address.
+            match domain.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(ip)) => vless::Address::Ipv4(ip),
+                Ok(std::net::IpAddr::V6(ip)) => vless::Address::Ipv6(ip),
+                Err(_) => vless::Address::Domain(domain),
+            }
         }
         4 => {
             // IPv6
@@ -264,6 +271,20 @@ fn parse_address_port_bytes(bytes: &[u8]) -> Result<(vless::Address, u16, usize)
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn ip_literal_sent_as_domain_becomes_an_ip_address() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let server_task = tokio::spawn(async move { accept_request(&mut server).await.unwrap() });
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth_reply = [0u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        client.write_all(&[5, 1, 0, 3, 9]).await.unwrap();
+        client.write_all(b"127.0.0.1").await.unwrap();
+        client.write_u16(22).await.unwrap();
+        let result = server_task.await.unwrap();
+        assert_eq!(result.address, vless::Address::Ipv4(Ipv4Addr::LOCALHOST));
+    }
 
     #[tokio::test]
     async fn accepts_domain_connect_request() {

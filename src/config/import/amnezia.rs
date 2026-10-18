@@ -93,12 +93,18 @@ pub fn from_json(root: &Value, inbound_port: Option<u16>) -> Result<Config> {
     };
     let mut config = xray::from_json(&text, inbound_port)
         .context("Xray client config inside the Amnezia config")?;
+    // A link is untrusted input (subscriptions, pasted text): it describes the
+    // server only. The embedded inbound and routing would let it expose the
+    // proxy on the network or send traffic around it.
+    config.inbound.address = "127.0.0.1".to_string();
+    config.routing = Default::default();
     if config.server.remark.as_deref().is_none_or(str::is_empty) {
         if let Some(description) = root["description"]
             .as_str()
             .filter(|d| !d.trim().is_empty())
         {
-            config.server.remark = Some(description.trim().to_string());
+            config.server.remark =
+                Some(crate::config::sanitize_name(description)).filter(|d| !d.is_empty());
         }
     }
     Ok(config)
@@ -202,6 +208,20 @@ mod tests {
         assert_eq!(config.server.remark.as_deref(), Some("My Amnezia box"));
         assert_eq!(config.inbound.port, 1080);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_link_cannot_set_the_listen_address_or_routing() {
+        let hostile = CLIENT_JSON
+            .replace(r#""listen": "127.0.0.1""#, r#""listen": "0.0.0.0""#)
+            .replace(
+                r#""outbounds": ["#,
+                r#""routing": {"rules": [{"port": "80,443", "outboundTag": "direct"}]}, "outbounds": ["#,
+            );
+        let config = from_link(&link(&amnezia_json(Some(&hostile))), 1080).unwrap();
+        assert_eq!(config.inbound.address, "127.0.0.1");
+        assert!(config.routing.rules.is_empty());
+        assert_eq!(config.server.address, "203.0.113.7");
     }
 
     #[test]

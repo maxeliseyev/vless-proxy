@@ -149,19 +149,24 @@ impl XhttpConfig {
         if extra["noGRPCHeader"].as_bool() == Some(true) {
             self.no_grpc_header = true;
         }
-        if let Some(range) = int_range(&extra["xPaddingBytes"]) {
-            if range.1 > 0 {
-                self.padding_bytes = range;
+        // `extra` comes from the link, so every number is clamped: a huge
+        // padding would allocate gigabytes per request, a huge interval would
+        // overflow `Instant` arithmetic.
+        if let Some((from, to)) = int_range(&extra["xPaddingBytes"]) {
+            if to > 0 {
+                let to = to.min(MAX_PADDING_BYTES);
+                self.padding_bytes = (from.min(to), to);
             }
         }
         if let Some(range) = int_range(&extra["scMaxEachPostBytes"]) {
             if range.1 > 0 {
-                self.max_post_bytes = range.0.max(1);
+                self.max_post_bytes = range.0.clamp(1, MAX_POST_BYTES);
             }
         }
         if let Some(range) = int_range(&extra["scMinPostsIntervalMs"]) {
             if range.1 > 0 {
-                self.min_post_interval = Duration::from_millis(range.0 as u64);
+                self.min_post_interval =
+                    Duration::from_millis(range.0.min(MAX_POST_INTERVAL_MS) as u64);
             }
         }
         if let Some(m) = extra["uplinkHTTPMethod"].as_str().filter(|m| !m.is_empty()) {
@@ -227,6 +232,12 @@ impl XhttpConfig {
     }
 }
 
+/// Upper bounds for link-provided settings (Xray defaults: padding 100-1000,
+/// post size 1 MB, interval 30 ms).
+const MAX_PADDING_BYTES: usize = 64 * 1024;
+const MAX_POST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_POST_INTERVAL_MS: usize = 60_000;
+
 /// Xray `Int32Range`: a number, `"from-to"` or `{from, to}`.
 fn int_range(v: &Value) -> Option<(usize, usize)> {
     match v {
@@ -254,7 +265,8 @@ fn rand_between(from: usize, to: usize) -> usize {
     }
     let mut b = [0u8; 8];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-    from + (u64::from_le_bytes(b) % (to - from + 1) as u64) as usize
+    let span = (to - from) as u64 + 1; // to > from here, so no overflow for usize ranges
+    from + (u64::from_le_bytes(b) % span) as usize
 }
 
 /// Request body: nothing, a fixed chunk, or a stream fed by the session.
@@ -591,7 +603,9 @@ async fn pump_packets(
     mut up: mpsc::Receiver<Bytes>,
 ) {
     let mut seq: u64 = 0;
-    let mut last_post = Instant::now() - config.min_post_interval;
+    let mut last_post = Instant::now()
+        .checked_sub(config.min_post_interval)
+        .unwrap_or_else(Instant::now);
     let mut queue: VecDeque<Bytes> = VecDeque::new();
     loop {
         let first = match queue.pop_front() {
@@ -720,6 +734,29 @@ impl Drop for XhttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_numbers_are_clamped() {
+        let mut s = server(None, None, "tls");
+        s.xhttp_extra = Some(
+            r#"{"xPaddingBytes":"0-18446744073709551615","scMaxEachPostBytes":99999999999,
+                "scMinPostsIntervalMs":18446744073709551615}"#
+                .into(),
+        );
+        let c = XhttpConfig::from_server(&s).unwrap();
+        assert_eq!(c.padding_bytes, (0, MAX_PADDING_BYTES));
+        assert_eq!(c.max_post_bytes, MAX_POST_BYTES);
+        assert_eq!(
+            c.min_post_interval,
+            Duration::from_millis(MAX_POST_INTERVAL_MS as u64)
+        );
+        assert!(c.referer(true).len() <= MAX_PADDING_BYTES + 200);
+
+        s.xhttp_extra = Some(r#"{"xPaddingBytes":"5000-10"}"#.into());
+        let c = XhttpConfig::from_server(&s).unwrap();
+        assert_eq!(c.padding_bytes, (10, 10));
+        assert_eq!(rand_between(10, 10), 10);
+    }
 
     fn server(path: Option<&str>, host: Option<&str>, security: &str) -> ServerConfig {
         let mut s = crate::config::Config::from_vless_url(

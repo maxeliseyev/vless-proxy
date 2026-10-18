@@ -251,9 +251,8 @@ async fn service_install(args: Args) -> Result<()> {
         let dir = vproxy::system::singbox::real_home()
             .map(|h| h.join(".config").join("vproxy"))
             .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-        std::fs::create_dir_all(&dir)?;
         let file = dir.join("service.txt");
-        std::fs::write(&file, format!("{link}\n"))?;
+        vproxy::config::write_private(&file, format!("{link}\n"))?;
         service_args.extend(["-f".to_string(), file.display().to_string()]);
         check.vless_url = None;
         check.url_file = Some(file);
@@ -361,10 +360,13 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
                 .map(|d| d.join("server.txt"))
                 .unwrap_or_else(|| PathBuf::from("server.txt"))
         });
-        info!("Fetching subscription {url}");
+        info!(
+            "Fetching subscription {}",
+            vproxy::config::subscription::redact_url(&url)
+        );
         let sub = vproxy::config::subscription::fetch(&url).await?;
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir)?;
+        if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
+            vproxy::config::create_private_dir(dir)?;
         }
         let mut list = if file.is_file() {
             ServerList::from_file(&file, inbound_port).unwrap_or_else(|_| ServerList {
@@ -372,7 +374,7 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
                 ..Default::default()
             })
         } else {
-            std::fs::write(&file, "")?;
+            vproxy::config::write_private(&file, "")?;
             ServerList {
                 file: Some(file.clone()),
                 ..Default::default()
@@ -408,7 +410,9 @@ async fn prepare_subscription(args: &mut Args) -> Result<bool> {
         if !args.refresh {
             info!(
                 "Subscription {} ({}): refreshing",
-                meta.title.as_deref().unwrap_or(&meta.url),
+                meta.title
+                    .clone()
+                    .unwrap_or_else(|| vproxy::config::subscription::redact_url(&meta.url)),
                 meta.age_text()
             );
         }
@@ -538,9 +542,7 @@ fn ask_for_link() -> Result<String> {
             Ok(config) => {
                 if let Some(dir) = user_config_dir() {
                     let path = dir.join("server.txt");
-                    match std::fs::create_dir_all(&dir)
-                        .and_then(|_| std::fs::write(&path, format!("{link}\n")))
-                    {
+                    match vproxy::config::write_private(&path, format!("{link}\n")) {
                         Ok(()) => info!(
                             "Saved to {} ({}); next time just run `vproxy`",
                             path.display(),

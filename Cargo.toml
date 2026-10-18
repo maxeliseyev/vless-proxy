@@ -45,4 +45,4 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook (REALITY) and
 # ClientConfig::client_hello_rewriter (Chrome TLS fingerprint).
 # Branch reality-0.23, pinned to the commit that was tested.
-rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "47e099e0" }
+rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "e372b5e6" }

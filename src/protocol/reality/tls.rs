@@ -536,6 +536,15 @@ impl<IO> RealityStream<IO> {
     }
 
     fn queue_tls_out(&mut self) -> io::Result<()> {
+        if self.write_direct {
+            // Raw inner bytes are already on the wire; an outer-TLS record
+            // (KeyUpdate reply, alert) after them would corrupt the stream.
+            // Xray stops writing through the TLS object at this point too.
+            while self.conn.wants_write() {
+                self.conn.write_tls(&mut io::sink())?;
+            }
+            return Ok(());
+        }
         while self.conn.wants_write() {
             self.conn.write_tls(&mut self.tls_out)?;
         }

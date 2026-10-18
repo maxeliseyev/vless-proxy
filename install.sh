@@ -59,16 +59,16 @@ trap 'rm -rf "$tmp"' EXIT
 
 say "Downloading $asset $VERSION ..."
 curl -fsSL -o "$tmp/$asset.tar.gz" "$base/$asset.tar.gz"
-if curl -fsSL -o "$tmp/$asset.tar.gz.sha256" "$base/$asset.tar.gz.sha256" 2>/dev/null; then
-  expected="$(awk '{print $1}' "$tmp/$asset.tar.gz.sha256")"
-  if command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$tmp/$asset.tar.gz" | awk '{print $1}')"
-  else
-    actual="$(sha256sum "$tmp/$asset.tar.gz" | awk '{print $1}')"
-  fi
-  [ "$expected" = "$actual" ] || die "sha256 mismatch for $asset.tar.gz"
-  say "sha256 OK"
+curl -fsSL -o "$tmp/$asset.tar.gz.sha256" "$base/$asset.tar.gz.sha256" \
+  || die "cannot download $asset.tar.gz.sha256 (refusing to install an unverified binary)"
+expected="$(awk '{print $1}' "$tmp/$asset.tar.gz.sha256")"
+if command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp/$asset.tar.gz" | awk '{print $1}')"
+else
+  actual="$(sha256sum "$tmp/$asset.tar.gz" | awk '{print $1}')"
 fi
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || die "sha256 mismatch for $asset.tar.gz"
+say "sha256 OK"
 
 tar -C "$tmp" -xzf "$tmp/$asset.tar.gz"
 bin="$tmp/$asset/vproxy"

@@ -170,7 +170,9 @@ impl RealityHandshake {
     }
 
     /// REALITY certificate check. `Ok(true)` means the server is ours.
-    /// `Ok(false)` means a well-formed but foreign certificate (fall back to PKI).
+    /// `Ok(false)` means a well-formed but foreign certificate: the caller
+    /// aborts the handshake (vproxy never falls back to PKI or sends VLESS
+    /// to such a peer; Xray would spider the site instead).
     pub fn verify_server_certificate(&self, cert_der: &[u8]) -> Result<bool> {
         let auth_key = self
             .auth_key
@@ -290,8 +292,8 @@ pub fn split_client_hello(raw_hello: &[u8]) -> Result<(&[u8], &[u8])> {
 /// Check that `cert_der` is the server's REALITY certificate: an Ed25519 leaf
 /// whose signature value equals `HMAC-SHA512(auth_key, raw_ed25519_public_key)`.
 ///
-/// Returns `Ok(false)` for a parseable certificate that does not match, so the
-/// caller can fall back to ordinary PKI validation (and spider behaviour).
+/// Returns `Ok(false)` for a parseable certificate that does not match; the
+/// caller treats that as a failed handshake.
 pub fn verify_server_certificate(auth_key: &AuthKey, cert_der: &[u8]) -> Result<bool> {
     let (_, cert) = X509Certificate::from_der(cert_der)
         .map_err(|e| anyhow::anyhow!("REALITY: cannot parse server certificate: {e}"))?;

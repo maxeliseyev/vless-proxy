@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -148,6 +148,11 @@ pub struct ProxyClient {
     runtime: RuntimeConfig,
     router: Arc<Router>,
     mux: Option<Arc<MuxManager>>,
+    /// Whether `direct` may reach loopback, private and link-local addresses.
+    /// On when the inbound listens on loopback only (the default); off for a
+    /// network-reachable inbound, where it would turn the proxy into a pivot
+    /// into the host's own network.
+    private_direct: bool,
 }
 
 impl ProxyClient {
@@ -174,7 +179,55 @@ impl ProxyClient {
             runtime,
             router: Arc::new(router),
             mux,
+            private_direct: true,
         })
+    }
+
+    /// Allow or refuse `direct` connections to private destinations
+    /// (see [`ProxyClient::private_direct`]).
+    pub fn allow_private_direct(mut self, allow: bool) -> Self {
+        self.private_direct = allow;
+        self
+    }
+
+    /// Addresses of a `direct` target after DNS, minus what the rules block
+    /// and, for a network-reachable inbound, minus private ranges.
+    async fn direct_addrs(
+        &self,
+        address: &Address,
+        port: u16,
+    ) -> Result<Vec<std::net::SocketAddr>> {
+        let resolved: Vec<std::net::SocketAddr> = match address {
+            Address::Ipv4(ip) => vec![(IpAddr::V4(*ip), port).into()],
+            Address::Ipv6(ip) => vec![(IpAddr::V6(*ip), port).into()],
+            Address::Domain(_) => tokio::net::lookup_host(direct_target(address, port))
+                .await?
+                .collect(),
+        };
+        if resolved.is_empty() {
+            anyhow::bail!("cannot resolve {address}");
+        }
+        let mut out = Vec::with_capacity(resolved.len());
+        for addr in resolved {
+            let ip = addr.ip();
+            let as_address = match ip {
+                IpAddr::V4(v4) => Address::Ipv4(v4),
+                IpAddr::V6(v6) => Address::Ipv6(v6),
+            };
+            if self.router.decide(&as_address, port) == Outbound::Block {
+                debug!("direct {address}:{port}: {ip} blocked by routing rules");
+                continue;
+            }
+            if !self.private_direct && crate::proxy::routing::is_private_ip(ip) {
+                debug!("direct {address}:{port}: {ip} is private, refused (inbound is not on loopback)");
+                continue;
+            }
+            out.push(addr);
+        }
+        if out.is_empty() {
+            anyhow::bail!("blocked by routing rules: {address}:{port} (resolved addresses)");
+        }
+        Ok(out)
     }
 
     /// Multiplexer, when `[mux]` is on.
@@ -192,9 +245,10 @@ impl ProxyClient {
             Outbound::Block => anyhow::bail!("blocked by routing rules: {address}:{port}"),
             Outbound::Direct => {
                 debug!("route direct: {address}:{port}");
+                let addrs = self.direct_addrs(&address, port).await?;
                 let stream = timeout(
                     Duration::from_secs(self.runtime.connect_timeout_secs),
-                    TcpStream::connect(direct_target(&address, port)),
+                    TcpStream::connect(addrs.as_slice()),
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("Direct connection timeout"))??;
@@ -227,7 +281,8 @@ impl ProxyClient {
         port: u16,
     ) -> Result<MuxStream> {
         let request_address = self.resolver.resolve(address, port).await?;
-        let key = format!("{}|{}", server.endpoint(), server.uuid);
+        // Logged on failures: identify the account without printing the UUID.
+        let key = format!("{}#{}", server.endpoint(), account_tag(&server.uuid));
         let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
         let dial = async move {
             let remote = timeout(connect_timeout, connect_remote(&server))
@@ -252,10 +307,7 @@ impl ProxyClient {
             Outbound::Block => anyhow::bail!("blocked by routing rules: {address}:{port}"),
             Outbound::Direct => {
                 debug!("route direct (udp): {address}:{port}");
-                let target = tokio::net::lookup_host(direct_target(&address, port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("cannot resolve {address}"))?;
+                let target = self.direct_addrs(&address, port).await?[0];
                 let bind: std::net::SocketAddr = if target.is_ipv4() {
                     "0.0.0.0:0".parse().unwrap()
                 } else {
@@ -429,6 +481,7 @@ async fn serve_with_shutdown(
 ) -> Result<()> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let max_connections = config.runtime.max_connections;
+    raise_nofile_limit((max_connections as u64) * 4 + 256);
     let semaphore = Arc::new(Semaphore::new(max_connections));
     let connector = ProxyClient::new(
         active,
@@ -436,7 +489,14 @@ async fn serve_with_shutdown(
         config.runtime.clone(),
         &config.routing,
         &config.mux,
-    )?;
+    )?
+    .allow_private_direct(inbound_is_loopback(&config.inbound.address));
+    if !inbound_is_loopback(&config.inbound.address) {
+        info!(
+            "Inbound {} is reachable from the network: direct connections to private addresses are refused",
+            config.inbound.address
+        );
+    }
 
     match config.inbound_protocol()? {
         InboundProtocol::Socks5 => {
@@ -474,7 +534,16 @@ async fn serve_socks5_with_limits(
                 }
             }
             accept_result = listener.accept() => {
-                let (client, addr) = accept_result?;
+                let (client, addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        // EMFILE/ENFILE/ECONNABORTED: keep serving, give the
+                        // kernel a moment to free resources.
+                        warn!("accept failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_connections > config.runtime.max_connections {
@@ -511,9 +580,12 @@ async fn serve_socks5_with_limits(
 async fn handle_socks5_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
     let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
 
-    let request = timeout(read_timeout, socks5::accept_request(&mut client))
-        .await
-        .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timeout"))??;
+    let request = timeout(
+        handshake_timeout(read_timeout),
+        socks5::accept_request(&mut client),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timeout"))??;
 
     debug!(
         "SOCKS5 {:?} request: target {}:{}",
@@ -639,7 +711,16 @@ async fn serve_http_with_limits(
                 }
             }
             accept_result = listener.accept() => {
-                let (client, addr) = accept_result?;
+                let (client, addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        // EMFILE/ENFILE/ECONNABORTED: keep serving, give the
+                        // kernel a moment to free resources.
+                        warn!("accept failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 let current_connections = connection_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_connections > config.runtime.max_connections {
@@ -676,7 +757,12 @@ async fn serve_http_with_limits(
 async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -> Result<()> {
     let read_timeout = Duration::from_secs(connector.runtime().read_timeout_secs);
 
-    let request = match timeout(read_timeout, http::accept_request(&mut client)).await {
+    let request = match timeout(
+        handshake_timeout(read_timeout),
+        http::accept_request(&mut client),
+    )
+    .await
+    {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
             let _ = http::send_error(&mut client, 400, "Bad Request").await;
@@ -911,12 +997,28 @@ async fn run_udp_association(
     let mut buffer = vec![0u8; 65_535];
     let mut client_udp_addr = None;
     let mut tunnels: HashMap<(Address, u16), UdpTunnel> = HashMap::new();
+    let mut sweep = tokio::time::interval(Duration::from_secs(30));
+    sweep.reset();
 
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
+                }
+            }
+            _ = sweep.tick() => {
+                let now = Instant::now();
+                let idle: Vec<_> = tunnels
+                    .iter()
+                    .filter(|(_, t)| now.duration_since(t.last_used) >= UDP_TUNNEL_IDLE)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in idle {
+                    if let Some(tunnel) = tunnels.remove(&key) {
+                        debug!("UDP session to {}:{} idle, closed", key.0, key.1);
+                        tunnel.abort();
+                    }
                 }
             }
             received = socket.recv_from(&mut buffer) => {
@@ -949,6 +1051,18 @@ async fn run_udp_association(
 
                 loop {
                     if !tunnels.contains_key(&key) {
+                        if tunnels.len() >= MAX_UDP_TUNNELS {
+                            if let Some(oldest) = tunnels
+                                .iter()
+                                .min_by_key(|(_, t)| t.last_used)
+                                .map(|(k, _)| k.clone())
+                            {
+                                if let Some(tunnel) = tunnels.remove(&oldest) {
+                                    debug!("UDP session limit reached, dropping {}:{}", oldest.0, oldest.1);
+                                    tunnel.abort();
+                                }
+                            }
+                        }
                         let tunnel = match create_udp_tunnel(
                             connector.clone(),
                             key.0.clone(),
@@ -976,8 +1090,11 @@ async fn run_udp_association(
                         tunnels.insert(key.clone(), tunnel);
                     }
 
-                    let send_result = match tunnels.get(&key) {
-                        Some(tunnel) => tunnel.sender.send(payload).await,
+                    let send_result = match tunnels.get_mut(&key) {
+                        Some(tunnel) => {
+                            tunnel.last_used = Instant::now();
+                            tunnel.sender.send(payload).await
+                        }
                         None => continue,
                     };
 
@@ -1088,6 +1205,7 @@ async fn create_udp_tunnel(
         sender,
         writer_task,
         reader_task,
+        last_used: Instant::now(),
     })
 }
 
@@ -1182,7 +1300,13 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
     let addr = (server.address.as_str(), server.port);
     match (server.transport_kind()?, server.transport_security()?) {
         (Transport::Tcp, TransportSecurity::Tls) => {
-            let tls = tls::TlsClient::new(server.tls_server_name().to_string())?
+            // Xray offers h2,http/1.1 by default; Chrome always sends ALPN,
+            // so a hello with ALPS but no ALPN would stand out.
+            let alpn: Vec<&str> = match server.alpn.as_deref().map(str::trim) {
+                Some(a) if !a.is_empty() => a.split(',').map(str::trim).collect(),
+                _ => vec!["h2", "http/1.1"],
+            };
+            let tls = tls::TlsClient::with_alpn(server.tls_server_name().to_string(), &alpn)?
                 .with_fingerprint(server.fingerprint_kind());
             tls.connect(addr).await
         }
@@ -1256,6 +1380,75 @@ async fn prime_remote(
         .await
         .map_err(|_| anyhow::anyhow!("Flush timeout to remote"))??;
     Ok(())
+}
+
+/// Short, non-secret tag for a UUID (first 4 bytes of its SHA-256), for logs
+/// and map keys.
+fn account_tag(uuid: &uuid::Uuid) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(uuid.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A client gets this long to finish the SOCKS5/HTTP handshake; `read_timeout`
+/// is meant for established relays and would let idle sockets hold slots.
+fn handshake_timeout(read_timeout: Duration) -> Duration {
+    read_timeout.min(Duration::from_secs(30))
+}
+
+/// Whether the inbound address is only reachable from this machine.
+pub fn inbound_is_loopback(address: &str) -> bool {
+    match address.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => address.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// Raise the open-files soft limit towards the hard limit: every proxied
+/// connection costs at least two descriptors, and launchd starts agents with
+/// a soft limit of 256.
+pub fn raise_nofile_limit(wanted: u64) {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain libc call with a valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let wanted = wanted as libc::rlim_t;
+    if lim.rlim_cur >= wanted {
+        return;
+    }
+    let mut target = if lim.rlim_max == libc::RLIM_INFINITY {
+        wanted
+    } else {
+        wanted.min(lim.rlim_max)
+    };
+    #[cfg(target_os = "macos")]
+    {
+        // macOS refuses soft limits above OPEN_MAX unless the hard limit is infinite.
+        target = target.min(10_240);
+    }
+    if target <= lim.rlim_cur {
+        return;
+    }
+    let new = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: lim.rlim_max,
+    };
+    // SAFETY: plain libc call with a valid pointer.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) } == 0 {
+        debug!(
+            "open files limit raised from {} to {}",
+            lim.rlim_cur, target
+        );
+    } else {
+        debug!(
+            "cannot raise open files limit from {} to {}",
+            lim.rlim_cur, target
+        );
+    }
 }
 
 async fn wait_for_tcp_close(stream: &mut TcpStream) -> Result<()> {
@@ -1340,6 +1533,7 @@ fn create_direct_udp_tunnel(
         sender,
         writer_task,
         reader_task,
+        last_used: Instant::now(),
     })
 }
 
@@ -1354,11 +1548,97 @@ struct UdpTunnel {
     sender: mpsc::Sender<Vec<u8>>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
+    /// Last datagram from the client towards this target.
+    last_used: Instant,
 }
+
+/// Distinct targets one UDP association may talk to at once; the least
+/// recently used one is dropped beyond that. Each target costs a VLESS
+/// connection or a socket plus two tasks, which `max_connections` does not see.
+const MAX_UDP_TUNNELS: usize = 128;
+/// A target the client has not sent to for this long is closed.
+const UDP_TUNNEL_IDLE: Duration = Duration::from_secs(120);
 
 impl UdpTunnel {
     fn abort(self) {
         self.writer_task.abort();
         self.reader_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_detection() {
+        assert!(inbound_is_loopback("127.0.0.1"));
+        assert!(inbound_is_loopback("::1"));
+        assert!(inbound_is_loopback("[::1]"));
+        assert!(inbound_is_loopback("localhost"));
+        assert!(!inbound_is_loopback("0.0.0.0"));
+        assert!(!inbound_is_loopback("192.168.1.2"));
+        assert!(!inbound_is_loopback("::"));
+    }
+
+    #[test]
+    fn handshake_timeout_is_capped() {
+        assert_eq!(
+            handshake_timeout(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            handshake_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn account_tag_hides_the_uuid() {
+        let id = uuid::Uuid::parse_str("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d").unwrap();
+        let tag = account_tag(&id);
+        assert_eq!(tag.len(), 8);
+        assert!(!id.to_string().contains(&tag));
+    }
+
+    #[tokio::test]
+    async fn direct_to_private_is_refused_for_a_network_inbound() {
+        let config = crate::config::Config::from_vless_url(
+            &crate::config::url::VlessUrl::parse(
+                "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@203.0.113.9:443?security=none",
+            )
+            .unwrap(),
+            1080,
+        );
+        let routing = RoutingConfig {
+            final_outbound: "proxy".to_string(),
+            rules: vec![crate::config::RoutingRule {
+                outbound: "direct".to_string(),
+                ip_private: true,
+                ..Default::default()
+            }],
+        };
+        let client = ProxyClient::new(
+            ActiveServer::new(config.server.clone()),
+            config.dns.clone(),
+            config.runtime.clone(),
+            &routing,
+            &config.mux,
+        )
+        .unwrap();
+        let loopback = Address::Ipv4(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(client.router().decide(&loopback, 22), Outbound::Direct);
+        assert!(client.direct_addrs(&loopback, 22).await.is_ok());
+        let client = client.allow_private_direct(false);
+        let err = client
+            .direct_addrs(&loopback, 22)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blocked"), "{err}");
+        assert!(client
+            .direct_addrs(&Address::Domain("localhost".to_string()), 22)
+            .await
+            .is_err());
     }
 }

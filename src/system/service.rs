@@ -114,11 +114,18 @@ pub fn render_plist(plan: &ServicePlan, p: &Paths) -> String {
 
 fn shell_quote(s: &str) -> String {
     if s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b))
+        .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@+,".contains(&b))
     {
         s.to_string()
     } else {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        // systemd expands `%` specifiers and `$` variables inside quotes too.
+        format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$")
+        )
     }
 }
 
@@ -336,6 +343,18 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_quoting_escapes_specifiers_and_variables() {
+        assert_eq!(
+            shell_quote("/usr/local/bin/vproxy"),
+            "/usr/local/bin/vproxy"
+        );
+        assert_eq!(
+            shell_quote("/home/u/100%/$HOME x"),
+            "\"/home/u/100%%/$$HOME x\""
+        );
+    }
 
     fn plan(tun: bool) -> ServicePlan {
         ServicePlan {

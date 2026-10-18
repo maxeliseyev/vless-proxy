@@ -158,7 +158,7 @@ impl ServerList {
         };
         let active =
             active_link(&content).or_else(|| self.entries.first().and_then(|e| e.link.clone()));
-        std::fs::write(
+        crate::config::write_private(
             &path,
             subscription::render_file(sub, active.as_deref(), &manual),
         )
@@ -211,7 +211,7 @@ impl ServerList {
             if !written {
                 out.push_str(&format!("{} {chosen}\n", subscription::HEADER_ACTIVE));
             }
-            return std::fs::write(path, out)
+            return crate::config::write_private(path, out)
                 .with_context(|| format!("Cannot write {}", path.display()));
         }
         rewrite_links_file(path, Some(chosen), None)
@@ -242,7 +242,7 @@ impl ServerList {
             }
             content.push_str(link);
             content.push('\n');
-            std::fs::write(path, content)
+            crate::config::write_private(path, content)
                 .with_context(|| format!("Cannot write {}", path.display()))?;
         }
         self.entries.push(entry);
@@ -306,7 +306,8 @@ fn rewrite_links_file(path: &Path, first: Option<&str>, drop: Option<&str>) -> R
         out.push_str(&l);
         out.push('\n');
     }
-    std::fs::write(path, out).with_context(|| format!("Cannot write {}", path.display()))
+    crate::config::write_private(path, out)
+        .with_context(|| format!("Cannot write {}", path.display()))
 }
 
 #[cfg(test)]

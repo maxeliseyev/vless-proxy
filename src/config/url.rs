@@ -107,7 +107,9 @@ impl VlessUrl {
             sni,
             fingerprint,
             encryption,
-            remark: fragment,
+            remark: fragment
+                .map(|f| crate::config::sanitize_name(&f))
+                .filter(|f| !f.is_empty()),
             reality_public_key,
             reality_short_id,
             flow,
@@ -161,31 +163,57 @@ fn parse_host_port(input: &str) -> Result<(String, u16)> {
 }
 
 fn url_decode(input: &str) -> String {
-    let mut result = String::new();
+    // Percent-escapes are bytes of UTF-8 (`%D0%9C` is one Cyrillic letter),
+    // so decode into bytes first.
+    let mut bytes: Vec<u8> = Vec::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
-            } else {
-                result.push('%');
-                result.push_str(&hex);
+            if hex.len() == 2 && hex.is_ascii() {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    bytes.push(byte);
+                    continue;
+                }
             }
+            bytes.push(b'%');
+            bytes.extend_from_slice(hex.as_bytes());
         } else if c == '+' {
-            result.push(' ');
+            bytes.push(b' ');
         } else {
-            result.push(c);
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
 
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remark_is_utf8_decoded_and_sanitized() {
+        let parsed = VlessUrl::parse(
+            "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?security=none#%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0%20%231",
+        )
+        .unwrap();
+        assert_eq!(parsed.remark.as_deref(), Some("Москва #1"));
+
+        let parsed = VlessUrl::parse(
+            "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?security=none#a%1b%5b31mb%0ac",
+        )
+        .unwrap();
+        assert_eq!(parsed.remark.as_deref(), Some("a [31mb c"));
+
+        let parsed = VlessUrl::parse(
+            "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?security=none#%0a",
+        )
+        .unwrap();
+        assert_eq!(parsed.remark, None);
+    }
 
     #[test]
     fn parses_xhttp_parameters() {

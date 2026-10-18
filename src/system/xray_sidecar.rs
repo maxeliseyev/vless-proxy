@@ -27,6 +27,10 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         config.server.address, config.server.port, config.runtime.xray_path
     );
 
+    crate::system::singbox::warn_if_unsafe_for_root(
+        std::path::Path::new(&config.runtime.xray_path),
+        "xray-core",
+    );
     let mut child = Command::new(&config.runtime.xray_path)
         .arg("run")
         .arg("-c")

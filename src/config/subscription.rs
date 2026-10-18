@@ -32,6 +32,8 @@ pub const HEADER_TRAFFIC: &str = "# traffic:";
 pub const HEADER_ACTIVE: &str = "# active:";
 pub const MANUAL_MARKER: &str = "# manual";
 const DEFAULT_INTERVAL_HOURS: u64 = 24;
+/// A year: anything larger is a provider's mistake or an overflow attempt.
+pub const MAX_INTERVAL_HOURS: u64 = 24 * 366;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `subscription-userinfo` header values (bytes, unix seconds).
@@ -134,7 +136,11 @@ impl Meta {
             } else if let Some(v) = line.strip_prefix(HEADER_UPDATED) {
                 m.updated = v.trim().parse().ok();
             } else if let Some(v) = line.strip_prefix(HEADER_INTERVAL) {
-                m.interval_hours = v.trim().parse().unwrap_or(DEFAULT_INTERVAL_HOURS);
+                m.interval_hours = v
+                    .trim()
+                    .parse()
+                    .map(|h: u64| h.clamp(1, MAX_INTERVAL_HOURS))
+                    .unwrap_or(DEFAULT_INTERVAL_HOURS);
             } else if let Some(v) = line.strip_prefix(HEADER_TRAFFIC) {
                 m.userinfo = Some(UserInfo::parse(v));
             }
@@ -230,10 +236,10 @@ pub async fn fetch(url: &str) -> Result<Subscription> {
         .header("Accept", "text/plain, */*")
         .send()
         .await
-        .with_context(|| format!("cannot fetch subscription {url}"))?;
+        .with_context(|| format!("cannot fetch subscription {}", redact_url(url)))?;
     let status = resp.status();
     if !status.is_success() {
-        bail!("subscription {url} answered {status}");
+        bail!("subscription {} answered {status}", redact_url(url));
     }
     let header = |name: &str| {
         resp.headers()
@@ -246,12 +252,14 @@ pub async fn fetch(url: &str) -> Result<Subscription> {
     let interval_hours = header("profile-update-interval")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|h| *h > 0)
+        .map(|h| h.min(MAX_INTERVAL_HOURS))
         .unwrap_or(DEFAULT_INTERVAL_HOURS);
     let body = resp.text().await.context("reading subscription body")?;
     let (links, skipped) = parse_body(&body);
     if links.is_empty() {
         bail!(
-            "subscription {url} has no vless:// or vpn:// links{}",
+            "subscription {} has no vless:// or vpn:// links{}",
+            redact_url(url),
             if skipped > 0 {
                 format!(" ({skipped} links of other protocols)")
             } else {
@@ -278,11 +286,25 @@ fn decode_title(raw: &str) -> String {
     if let Some(b64) = raw.strip_prefix("base64:") {
         if let Some(bytes) = decode_base64(b64) {
             if let Ok(s) = String::from_utf8(bytes) {
-                return s.trim().to_string();
+                // The title is written as a header line of the links file:
+                // a newline inside it would let the provider add lines.
+                return crate::config::sanitize_name(&s);
             }
         }
     }
-    raw.to_string()
+    crate::config::sanitize_name(raw)
+}
+
+/// A subscription URL without its path and query, which usually carry the
+/// account token: for logs and error messages.
+pub fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(host) => format!("{}://{}/…", u.scheme(), host),
+            None => "<subscription url>".to_string(),
+        },
+        Err(_) => "<subscription url>".to_string(),
+    }
 }
 
 fn decode_base64(text: &str) -> Option<Vec<u8>> {
@@ -379,6 +401,34 @@ pub fn split_sections(content: &str) -> (Vec<String>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_cannot_inject_file_lines() {
+        let evil = STANDARD.encode("Title\n# subscription: http://evil/\n# manual\nvless://x");
+        let title = decode_title(&format!("base64:{evil}"));
+        assert!(!title.contains('\n'));
+        assert!(title.starts_with("Title"));
+        assert_eq!(decode_title("  plain\x1btitle "), "plain title");
+    }
+
+    #[test]
+    fn redacted_url_keeps_only_the_host() {
+        assert_eq!(
+            redact_url("https://sub.example.com/api/v1/sub/TOKEN?x=1"),
+            "https://sub.example.com/…"
+        );
+        assert_eq!(redact_url("not a url"), "<subscription url>");
+    }
+
+    #[test]
+    fn interval_is_bounded() {
+        let interval_line = format!("{HEADER_INTERVAL} 18446744073709551615");
+        let meta =
+            Meta::from_lines(["# subscription: https://h/x", interval_line.as_str()].into_iter())
+                .unwrap();
+        assert_eq!(meta.interval_hours, MAX_INTERVAL_HOURS);
+        assert!(meta.is_stale());
+    }
 
     const A: &str = "vless://00000000-0000-0000-0000-000000000001@a.example:443?security=tls#alpha";
     const B: &str = "vless://00000000-0000-0000-0000-000000000002@b.example:443?security=reality&pbk=k&sid=ab&sni=s#beta";
