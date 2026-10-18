@@ -216,10 +216,7 @@ impl ParsedHello {
         let sid_len = take(&mut p, 1)?[0] as usize;
         let session_id = take(&mut p, sid_len)?.to_vec();
         let cs_len = u16::from_be_bytes(take(&mut p, 2)?.try_into().ok()?) as usize;
-        let cipher_suites = take(&mut p, cs_len)?
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
+        let cipher_suites = be_u16s(take(&mut p, cs_len)?).collect();
         let comp_len = take(&mut p, 1)?[0] as usize;
         let compression = take(&mut p, comp_len)?.to_vec();
         let mut extensions = Vec::new();
@@ -279,6 +276,15 @@ impl ParsedHello {
         out.extend_from_slice(&body);
         out
     }
+}
+
+/// Big-endian u16 values of a byte slice (a trailing odd byte is ignored).
+fn be_u16s(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
 }
 
 fn u16_list(values: &[u16]) -> Vec<u8> {
@@ -396,10 +402,7 @@ pub fn ja4(raw: &[u8]) -> Option<String> {
     let versions: Vec<u16> = hello
         .extension(EXT_SUPPORTED_VERSIONS)
         .map(|d| {
-            d.get(1..)
-                .unwrap_or(&[])
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            be_u16s(d.get(1..).unwrap_or(&[]))
                 .filter(|v| !is_grease(*v))
                 .collect()
         })
@@ -460,10 +463,8 @@ pub fn ja4(raw: &[u8]) -> Option<String> {
     let sigalgs = hello
         .extension(EXT_SIGNATURE_ALGORITHMS)
         .map(|d| {
-            d.get(2..)
-                .unwrap_or(&[])
-                .chunks_exact(2)
-                .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+            be_u16s(d.get(2..).unwrap_or(&[]))
+                .map(|v| format!("{v:04x}"))
                 .collect::<Vec<_>>()
                 .join(",")
         })
