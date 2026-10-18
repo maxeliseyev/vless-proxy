@@ -1,0 +1,20 @@
+# Шаблон, setup.sh делает из него hy2-brutal.yaml и hy2-bbr.yaml
+listen: :__PORT__
+
+tls:
+  cert: /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/__DOMAIN__/__DOMAIN__.crt
+  key: /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/__DOMAIN__/__DOMAIN__.key
+
+auth:
+  type: password
+  password: __PASSWORD__
+
+# Чужие клиенты (и активный пробинг) получают тот же сайт по HTTP/3
+masquerade:
+  type: proxy
+  proxy:
+    url: http://caddy:8080
+    rewriteHost: true
+
+# true = BBR для всех клиентов, false = Brutal, если клиент прислал bandwidth
+ignoreClientBandwidth: __IGNORE_BW__

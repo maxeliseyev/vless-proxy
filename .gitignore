@@ -5,3 +5,7 @@ server.txt
 
 # local clone made by .github/scripts/rustls-sync.sh
 /rustls-fork/
+/deploy/trial-server/.env
+/deploy/trial-server/.hy2-password
+/deploy/trial-server/hy2-*.yaml
+/deploy/trial-server/site/*.bin

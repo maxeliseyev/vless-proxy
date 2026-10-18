@@ -1,0 +1,58 @@
+# Тестовый сервер для испытаний HTTP/3-транспорта (стадия 1 плана docs/h3-transport-plan.md).
+# Подготовка: bash setup.sh домен  →  docker compose up -d  →  docker compose --profile hysteria up -d
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./site:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # H3: «неизвестный UDP» для сравнения с QUIC. Клиент: iperf3 -u -c домен -b 10M -t 60
+  iperf3:
+    image: networkstatic/iperf3
+    command: -s
+    restart: unless-stopped
+    ports:
+      - "5201:5201"
+      - "5201:5201/udp"
+
+  # H4: Hysteria 2 с маскировкой под тот же сайт. Сертификат берётся из хранилища Caddy,
+  # поэтому поднимать только после того, как Caddy получил сертификат (см. README).
+  hy2-brutal:
+    image: tobyxdd/hysteria
+    profiles: [hysteria]
+    restart: unless-stopped
+    command: server -c /etc/hysteria/config.yaml
+    ports:
+      - "8443:8443/udp"
+    volumes:
+      - ./hy2-brutal.yaml:/etc/hysteria/config.yaml:ro
+      - caddy_data:/data:ro
+    depends_on:
+      - caddy
+
+  hy2-bbr:
+    image: tobyxdd/hysteria
+    profiles: [hysteria]
+    restart: unless-stopped
+    command: server -c /etc/hysteria/config.yaml
+    ports:
+      - "8444:8444/udp"
+    volumes:
+      - ./hy2-bbr.yaml:/etc/hysteria/config.yaml:ro
+      - caddy_data:/data:ro
+    depends_on:
+      - caddy
+
+volumes:
+  caddy_data:
+  caddy_config:

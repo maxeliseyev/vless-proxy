@@ -80,7 +80,12 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
- 32. **Отпечаток Chrome 155 (2026-10-18, стадия 0 плана `docs/h3-transport-plan.md`)**
+ 33. **Набор для измерений за ТСПУ (2026-10-19, стадия 1 плана `docs/h3-transport-plan.md`)**
+    - `deploy/trial-server/`: Caddy с HTTP/3 на 443/udp и настоящим сертификатом, файлы 10 МБ и 1 ГБ, журнал доступа для H8, iperf3 на 5201, Hysteria 2 в двух вариантах (Brutal на 8443, BBR на 8444) с маскировкой на тот же сайт; `setup.sh домен` генерирует `.env`, файлы, конфиги и ссылки `hysteria2://`.
+    - `scripts/tspu-trial.sh` для тестировщиков (bash 3.2+, macOS/Linux/WSL): один прогон = TCP h2 с Alt-Svc, H1 QUIC handshake, H2 10 МБ и 1 ГБ по HTTP/3 с детектором заморозки (меньше 2 КБ/с за 20 с), долгое соединение 50 КБ/с, H6 четыре параллельных QUIC-соединения с проверкой заморозки через 10/130/310 с, H3 iperf3 UDP, H0 vproxy с двумя REALITY-ссылками (`fp=chrome`/`fp=chrome133`) через SOCKS; curl с HTTP/3 ищется сам (Homebrew keg-only), внешний IP и страна через ipinfo, прокси-переменные снимаются, отчёт в формате таблицы со страницы испытаний плюс сырой лог.
+    - Проверено локально: нативный Caddy на loopback (Docker Desktop на macOS не доставляет UDP на localhost, на Linux-VPS такой проблемы нет), iperf3, REALITY-сервер.
+
+32. **Отпечаток Chrome 155 (2026-10-18, стадия 0 плана `docs/h3-transport-plan.md`)**
      - По данным разработчиков Xray (issue #7131, 13.10.2026) ТСПУ давно целится в отпечаток Chrome 133 и ограничивает число соединений с ним; наш `fp=chrome` был именно HelloChrome_133.
      - `fp=chrome` теперь uTLS `HelloChrome_155`: в signature_algorithms добавлены GREASE и ML-DSA-44/65/87 (12 значений), появилось расширение `trust_anchors` (0xca34, draft-ietf-tls-trust-anchor-ids) с 28 идентификаторами Chrome Root Store, 17 расширений в случайном порядке, JA4 `t13d1517h2_…`. Старая форма сохранена как `fp=chrome133` для A/B-сравнений тестировщиками (гипотеза H0).
      - Форк rustls (rev `7df70d14`): `trust_anchors` в CertificateEntry игнорируется так же, как SCT, иначе сервер, выбравший цепочку по нашему списку, ронял бы handshake `UnknownCertificateExtension`; в EncryptedExtensions неизвестные расширения rustls и так складывает в `unknown_extensions`.

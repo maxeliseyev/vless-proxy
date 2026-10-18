@@ -1,0 +1,23 @@
+{
+	# Один выпускающий центр, чтобы путь к сертификату был предсказуем (его читает Hysteria).
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+{$DOMAIN} {
+	root * /srv
+	file_server
+
+	# Журнал доступа для H8: кто ходит на сайт кроме тестировщиков (активный пробинг).
+	log {
+		output file /data/access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+	}
+}
+
+# Тот же сайт без TLS внутри docker-сети: сюда Hysteria проксирует чужих клиентов.
+http://:8080 {
+	root * /srv
+	file_server
+}
