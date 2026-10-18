@@ -126,9 +126,78 @@ struct App {
     /// Generation of the current ping round; stale results are dropped.
     ping_round: u64,
     pings_in_flight: usize,
+    sub_rx: mpsc::UnboundedReceiver<Result<crate::subscription::Subscription, String>>,
+    sub_tx: mpsc::UnboundedSender<Result<crate::subscription::Subscription, String>>,
+    refreshing: bool,
 }
 
 impl App {
+    /// Fetch the subscription in the background (`u`).
+    fn refresh_subscription(&mut self) {
+        let Some(meta) = &self.servers.subscription else {
+            self.status = "no subscription in the links file (start once with -s URL)".to_string();
+            return;
+        };
+        if self.refreshing {
+            self.status = "refresh already running…".to_string();
+            return;
+        }
+        self.refreshing = true;
+        let url = meta.url.clone();
+        let tx = self.sub_tx.clone();
+        tokio::spawn(async move {
+            let result = crate::subscription::fetch(&url)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.status = "refreshing subscription…".to_string();
+    }
+
+    fn collect_subscription(&mut self) {
+        while let Ok(result) = self.sub_rx.try_recv() {
+            self.refreshing = false;
+            let sub = match result {
+                Ok(sub) => sub,
+                Err(e) => {
+                    self.status = format!("refresh failed: {e}");
+                    continue;
+                }
+            };
+            let active_link = self
+                .servers
+                .entries
+                .get(self.active_index)
+                .and_then(|e| e.link.clone());
+            if let Err(e) = self
+                .servers
+                .apply_subscription(&sub, self.config.inbound.port)
+            {
+                self.status = format!("refresh failed: {e}");
+                continue;
+            }
+            self.active_index = active_link
+                .and_then(|l| {
+                    self.servers
+                        .entries
+                        .iter()
+                        .position(|e| e.link.as_deref() == Some(&l))
+                })
+                .unwrap_or(0);
+            self.selected = self.selected.min(self.servers.len().saturating_sub(1));
+            let mut status = format!("subscription updated: {} servers", self.servers.len());
+            if let Some(info) = &sub.meta.userinfo {
+                let summary = info.summary();
+                if !summary.is_empty() {
+                    status.push_str(&format!("; {summary}"));
+                }
+            }
+            self.status = status;
+            tracing::info!("{}", self.status);
+            self.ping_all();
+        }
+    }
+
     /// Measure every server concurrently; results arrive through `ping_rx`.
     fn ping_all(&mut self) {
         if self.servers.is_empty() {
@@ -300,6 +369,7 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => self.select(1),
                     KeyCode::Enter => self.switch_to_selected(),
                     KeyCode::Char('p') => self.ping_all(),
+                    KeyCode::Char('u') => self.refresh_subscription(),
                     KeyCode::Char('b') => self.switch_to_best(),
                     KeyCode::Char('a') => {
                         self.mode = Mode::Adding(String::new());
@@ -587,6 +657,7 @@ pub async fn run(
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
     let (ping_tx, ping_rx) = mpsc::unbounded_channel();
+    let (sub_tx, sub_rx) = mpsc::unbounded_channel();
     let active_index = servers
         .entries
         .iter()
@@ -613,6 +684,9 @@ pub async fn run(
         ping_tx,
         ping_round: 0,
         pings_in_flight: 0,
+        sub_rx,
+        sub_tx,
+        refreshing: false,
     };
     if app.servers.len() > 1 {
         app.ping_all();
@@ -622,6 +696,7 @@ pub async fn run(
     let outcome = loop {
         app.tick();
         app.collect_pings();
+        app.collect_subscription();
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(anyhow::Error::from(e));
         }

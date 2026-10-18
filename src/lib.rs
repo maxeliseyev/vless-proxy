@@ -23,6 +23,7 @@ pub mod service;
 pub mod singbox;
 pub mod socks5;
 pub mod stats;
+pub mod subscription;
 pub mod tls;
 pub mod tui;
 pub mod tun;

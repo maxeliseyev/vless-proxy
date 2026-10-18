@@ -4,6 +4,7 @@
 
 use crate::amnezia_import;
 use crate::config::{Config, ServerConfig};
+use crate::subscription::{self, Meta, Subscription};
 use crate::url::VlessUrl;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -74,6 +75,8 @@ pub struct ServerList {
     pub entries: Vec<ServerEntry>,
     /// Links file the entries came from, for persisting the active choice.
     pub file: Option<PathBuf>,
+    /// Set when the links file is managed by a subscription.
+    pub subscription: Option<Meta>,
 }
 
 impl ServerList {
@@ -81,6 +84,7 @@ impl ServerList {
         Self {
             entries: vec![ServerEntry::from_server(server)],
             file: None,
+            subscription: None,
         }
     }
 
@@ -89,6 +93,8 @@ impl ServerList {
     pub fn from_file(path: &Path, inbound_port: u16) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Cannot read {}", path.display()))?;
+        let subscription = Meta::from_lines(content.lines());
+        let active = active_link(&content);
         let mut entries = Vec::new();
         let mut errors = Vec::new();
         for (n, line) in content.lines().enumerate() {
@@ -115,10 +121,50 @@ impl ServerList {
         for e in errors {
             tracing::warn!("{}: skipped {e}", path.display());
         }
+        // `# active:` names the server to start with; it goes first in memory.
+        if let Some(active) = active {
+            if let Some(pos) = entries
+                .iter()
+                .position(|e| e.link.as_deref() == Some(&active))
+            {
+                let entry = entries.remove(pos);
+                entries.insert(0, entry);
+            }
+        }
         Ok(Self {
             entries,
             file: Some(path.to_path_buf()),
+            subscription,
         })
+    }
+
+    /// Replace the subscription section of the links file with `sub`,
+    /// keeping manual links and the active choice, and reload the entries.
+    pub fn apply_subscription(&mut self, sub: &Subscription, inbound_port: u16) -> Result<()> {
+        let path = self
+            .file
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no links file to update"))?;
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let manual = if self.subscription.is_some() {
+            subscription::split_sections(&content).1
+        } else {
+            // A plain links file becoming subscription-managed: its links are manual.
+            subscription::split_sections(&content)
+                .0
+                .into_iter()
+                .filter(|l| !sub.links.contains(l))
+                .collect()
+        };
+        let active =
+            active_link(&content).or_else(|| self.entries.first().and_then(|e| e.link.clone()));
+        std::fs::write(
+            &path,
+            subscription::render_file(sub, active.as_deref(), &manual),
+        )
+        .with_context(|| format!("Cannot write {}", path.display()))?;
+        *self = Self::from_file(&path, inbound_port)?;
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -142,6 +188,32 @@ impl ServerList {
         let Some(chosen) = &entry.link else {
             return Ok(());
         };
+        if self.subscription.is_some() {
+            // Managed file: record the choice in the header, keep the order.
+            let content = std::fs::read_to_string(path)?;
+            let mut out = String::new();
+            let mut written = false;
+            for line in content.lines() {
+                if line.trim().starts_with(subscription::HEADER_ACTIVE) {
+                    if !written {
+                        out.push_str(&format!("{} {chosen}\n", subscription::HEADER_ACTIVE));
+                        written = true;
+                    }
+                    continue;
+                }
+                if !written && !line.trim().starts_with('#') {
+                    out.push_str(&format!("{} {chosen}\n", subscription::HEADER_ACTIVE));
+                    written = true;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            if !written {
+                out.push_str(&format!("{} {chosen}\n", subscription::HEADER_ACTIVE));
+            }
+            return std::fs::write(path, out)
+                .with_context(|| format!("Cannot write {}", path.display()));
+        }
         rewrite_links_file(path, Some(chosen), None)
     }
 
@@ -156,6 +228,16 @@ impl ServerList {
         if let Some(path) = &self.file {
             let mut content = std::fs::read_to_string(path).unwrap_or_default();
             if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            // In a subscription-managed file hand-added links live after the
+            // manual marker, so a refresh keeps them.
+            if self.subscription.is_some()
+                && !content
+                    .lines()
+                    .any(|l| l.trim() == subscription::MANUAL_MARKER)
+            {
+                content.push_str(subscription::MANUAL_MARKER);
                 content.push('\n');
             }
             content.push_str(link);
@@ -181,6 +263,15 @@ impl ServerList {
         }
         Ok(self.entries.remove(index))
     }
+}
+
+/// The `# active:` link of a links file, if any.
+pub fn active_link(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(subscription::HEADER_ACTIVE))
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
 }
 
 /// Rewrite a links file: comments stay on top, `first` (if present in the
@@ -292,6 +383,57 @@ mod tests {
             ServerList::from_file(&path, 1080).unwrap().entries[0].name,
             "1.2.3.4:443"
         );
+    }
+
+    #[test]
+    fn subscription_managed_file() {
+        use crate::subscription::{Meta, Subscription};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.txt");
+        std::fs::write(&path, format!("{A}\n{B}\n")).unwrap();
+        let mut list = ServerList::from_file(&path, 1080).unwrap();
+        assert!(list.subscription.is_none());
+
+        let sub = Subscription {
+            meta: Meta {
+                url: "https://p.example/sub".into(),
+                title: Some("P".into()),
+                updated: Some(1),
+                interval_hours: 6,
+                userinfo: None,
+            },
+            links: vec![B.to_string(), C.to_string()],
+            skipped: 0,
+        };
+        // A was in the plain file and not in the subscription: it becomes manual.
+        list.apply_subscription(&sub, 1080).unwrap();
+        assert_eq!(list.subscription.as_ref().unwrap().interval_hours, 6);
+        let names: Vec<&str> = list.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "1.2.3.4:443"]); // active A first
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&format!("# active: {A}\n{B}\n{C}\n# manual\n{A}\n")));
+
+        // choosing a server records it in the header, order untouched
+        list.persist_first(1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(&format!("# active: {B}\n{B}\n{C}\n# manual\n{A}\n")),
+            "{text}"
+        );
+        assert_eq!(
+            ServerList::from_file(&path, 1080).unwrap().entries[0].name,
+            "beta"
+        );
+
+        // a hand-added link lands in the manual section and survives a refresh
+        let d = "vless://00000000-0000-0000-0000-000000000004@d.example:443?security=tls#delta";
+        list.add_link(d, 1080).unwrap();
+        list.apply_subscription(&sub, 1080).unwrap();
+        let (subs, manual) =
+            crate::subscription::split_sections(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(subs, vec![B.to_string(), C.to_string()]);
+        assert_eq!(manual, vec![A.to_string(), d.to_string()]);
+        assert_eq!(list.len(), 4);
     }
 
     #[test]

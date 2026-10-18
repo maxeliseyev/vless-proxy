@@ -34,6 +34,10 @@ struct Args {
     probe: bool,
     /// `--ping`: measure every server's handshake and exit.
     ping: bool,
+    /// `-s URL`: fetch a subscription into the links file first.
+    subscription: Option<String>,
+    /// `--refresh`: update the links file from its subscription and exit.
+    refresh: bool,
     tun: bool,
     print_tun_config: bool,
     tui: bool,
@@ -77,6 +81,10 @@ async fn main() -> Result<()> {
         return run_subcommand(command.clone(), args).await;
     }
     info!("vproxy {} starting", env!("CARGO_PKG_VERSION"));
+    let mut args = args;
+    if prepare_subscription(&mut args).await? {
+        return Ok(());
+    }
 
     let (mut config, servers) = load_config(args.clone())?;
     if args.tun || args.print_tun_config {
@@ -315,10 +323,134 @@ fn log_targets(level: Level) -> tracing_subscriber::filter::Targets {
         .with_target("rustls", Level::INFO)
 }
 
-/// First `vless://` or `vpn://` link in a text file (blank lines and `#` comment lines skipped).
+/// The links file a run will use: `-f`, else the discovered one.
+fn links_file_in_use(args: &Args) -> Option<PathBuf> {
+    if let Some(f) = &args.url_file {
+        return Some(f.clone());
+    }
+    if args.config_path.is_some() || args.vless_url.is_some() {
+        return None;
+    }
+    let local = PathBuf::from("server.txt");
+    if local.is_file() {
+        return Some(local);
+    }
+    let dir = user_config_dir()?;
+    if dir.join("config.toml").is_file() {
+        return None;
+    }
+    let links = dir.join("server.txt");
+    links.is_file().then_some(links)
+}
+
+/// `-s URL`, `--refresh` and the automatic refresh of a stale subscription.
+/// Returns true when the run should end here (`--refresh`).
+async fn prepare_subscription(args: &mut Args) -> Result<bool> {
+    let inbound_port = args.inbound_port.unwrap_or(1080);
+    if let Some(url) = args.subscription.clone() {
+        let file = args.url_file.clone().unwrap_or_else(|| {
+            user_config_dir()
+                .map(|d| d.join("server.txt"))
+                .unwrap_or_else(|| PathBuf::from("server.txt"))
+        });
+        info!("Fetching subscription {url}");
+        let sub = vproxy::subscription::fetch(&url).await?;
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut list = if file.is_file() {
+            ServerList::from_file(&file, inbound_port).unwrap_or_else(|_| ServerList {
+                file: Some(file.clone()),
+                ..Default::default()
+            })
+        } else {
+            std::fs::write(&file, "")?;
+            ServerList {
+                file: Some(file.clone()),
+                ..Default::default()
+            }
+        };
+        list.apply_subscription(&sub, inbound_port)?;
+        info!("{}", subscription_summary(&sub, &list, &file));
+        args.url_file = Some(file);
+        args.subscription = None;
+    }
+
+    let Some(file) = links_file_in_use(args) else {
+        if args.refresh {
+            anyhow::bail!(
+                "--refresh needs a links file with a subscription (start once with -s URL)"
+            );
+        }
+        return Ok(false);
+    };
+    let Ok(content) = std::fs::read_to_string(&file) else {
+        return Ok(false);
+    };
+    let Some(meta) = vproxy::subscription::Meta::from_lines(content.lines()) else {
+        if args.refresh {
+            anyhow::bail!(
+                "{} has no `# subscription:` header; start once with -s URL",
+                file.display()
+            );
+        }
+        return Ok(false);
+    };
+    if args.refresh || meta.is_stale() {
+        if !args.refresh {
+            info!(
+                "Subscription {} ({}): refreshing",
+                meta.title.as_deref().unwrap_or(&meta.url),
+                meta.age_text()
+            );
+        }
+        match vproxy::subscription::fetch(&meta.url).await {
+            Ok(sub) => {
+                let mut list = ServerList::from_file(&file, inbound_port)?;
+                list.apply_subscription(&sub, inbound_port)?;
+                info!("{}", subscription_summary(&sub, &list, &file));
+            }
+            Err(e) if args.refresh => return Err(e),
+            Err(e) => tracing::warn!("Subscription refresh failed, using the saved list: {e:#}"),
+        }
+    }
+    Ok(args.refresh)
+}
+
+fn subscription_summary(
+    sub: &vproxy::subscription::Subscription,
+    list: &ServerList,
+    file: &std::path::Path,
+) -> String {
+    let mut text = format!(
+        "Subscription {}: {} servers saved to {}",
+        sub.meta.title.as_deref().unwrap_or(&sub.meta.url),
+        list.len(),
+        file.display()
+    );
+    if sub.skipped > 0 {
+        text.push_str(&format!(
+            " ({} links of other protocols skipped)",
+            sub.skipped
+        ));
+    }
+    if let Some(info) = &sub.meta.userinfo {
+        let summary = info.summary();
+        if !summary.is_empty() {
+            text.push_str(&format!("; {summary}"));
+        }
+    }
+    text
+}
+
+/// First `vless://` or `vpn://` link in a text file (blank lines and `#`
+/// comment lines skipped), or the `# active:` link when the file names one.
 fn read_url_file(path: &PathBuf) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", path.display()))?;
+    if let Some(active) = vproxy::servers::active_link(&content) {
+        return Ok(active);
+    }
     content
         .lines()
         .map(str::trim)
@@ -536,6 +668,8 @@ fn parse_args() -> Result<Args> {
     let mut check_config = false;
     let mut probe = false;
     let mut ping = false;
+    let mut subscription = None;
+    let mut refresh = false;
     let mut tun = false;
     let mut print_tun_config = false;
     let mut tui = false;
@@ -602,6 +736,17 @@ fn parse_args() -> Result<Args> {
             Some("--check-config") => check_config = true,
             Some("--probe") => probe = true,
             Some("--ping") => ping = true,
+            Some("--refresh") => refresh = true,
+            Some("-s") | Some("--subscription") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--subscription requires a URL"))?;
+                subscription = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("Invalid URL encoding"))?,
+                );
+            }
             Some("--tun") => tun = true,
             Some("--print-tun-config") => print_tun_config = true,
             Some("--tui") => tui = true,
@@ -652,6 +797,8 @@ fn parse_args() -> Result<Args> {
         check_config,
         probe,
         ping,
+        subscription,
+        refresh,
         tun,
         print_tun_config,
         tui,
@@ -677,6 +824,10 @@ Options:
   -c, --config <PATH>       Path to TOML config, an Xray/Happ JSON config (*.json) or an Amnezia *.vpn file
   -u, --url <LINK>          vless:// link or Amnezia vpn:// link, quote it in the shell
   -f, --url-file <PATH>     Read the link from a file (first non-comment line)
+  -s, --subscription <URL>  Fetch a subscription (base64 or plain list of links) into the links file
+                            (-f or ~/.config/vproxy/server.txt), then run; refreshed automatically
+                            when older than the provider's interval, by u in the TUI, or --refresh
+      --refresh             Update the links file from its subscription and exit
   -p, --inbound-port <PORT> Local inbound port (default: 1080)
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
@@ -703,6 +854,7 @@ Examples:
   vproxy -u 'vless://...' -p 8080
   vproxy -f server.txt -p 1080
   vproxy --ping -f server.txt                     # latency of every server in the file
+  vproxy -s 'https://provider/sub/token' --tui    # subscription → ~/.config/vproxy/server.txt
   sudo vproxy --tun -f server.txt
   sudo vproxy --tui --tun -f server.txt
   vproxy service install -f server.txt            # background local proxy, starts at login
