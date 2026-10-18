@@ -80,6 +80,11 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 26. **Ping и автовыбор сервера (2026-10-18)**
+     - `runtime::measure_handshake` / `ping_servers`: полный transport handshake (TCP + TLS/REALITY/WS/XHTTP) с таймаутом, соединение сразу закрывается, без VLESS-трафика
+     - TUI: колонка задержки в списке, замер всех серверов параллельно при старте и по `p`, `b` переключает на самый быстрый; результаты старых раундов отбрасываются; `--ping` печатает таблицу, отсортированную по задержке
+     - проверено в pty на двух боевых серверах и одном недоступном адресе
+
  25. **Отпечаток TLS как у Chrome (2026-10-18)**
      - форк rustls: `ClientConfig::client_hello_rewriter` — хук получает закодированный ClientHello и отдаёт замену; байты идут в сеть и в transcript, список предложенных шифров и расширений перечитывается из них (ответы на ALPS/ECH не «unsolicited»), добавленный GREASE ECH переводит статус ECH в Grease; применяется до `session_id_hook`, который теперь работает по байтам; не применяется при resumption
      - `src/fingerprint.rs`: профиль uTLS `HelloChrome_133` (его шлёт Xray 26.x): 16 шифров с GREASE, 16 расширений + 2 GREASE, порядок случайный на соединение и одинаковый для HRR, GREASE в cipher/group/ext1/ext2/version, GREASE ECH как у BoringSSL, ALPS (17613), SCT, session ticket, renegotiation_info, compress_certificate brotli (включена фича rustls `brotli`); random, session id, key shares, SNI и ALPN rustls сохраняются; `fp=none` отключает; при отпечатке resumption выключен

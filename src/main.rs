@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -31,6 +32,8 @@ struct Args {
     verbose: bool,
     check_config: bool,
     probe: bool,
+    /// `--ping`: measure every server's handshake and exit.
+    ping: bool,
     tun: bool,
     print_tun_config: bool,
     tui: bool,
@@ -120,6 +123,38 @@ async fn main() -> Result<()> {
     if args.probe {
         let report = vproxy::runtime::probe_transport(config.as_ref()).await?;
         info!("{report}");
+        return Ok(());
+    }
+
+    if args.ping {
+        let limit = Duration::from_secs(config.runtime.connect_timeout_secs.clamp(1, 10));
+        let list: Vec<_> = servers.entries.iter().map(|e| e.server.clone()).collect();
+        let results = vproxy::runtime::ping_servers(&list, limit).await;
+        let mut rows: Vec<(usize, &vproxy::ServerEntry, &Result<Duration, String>)> = servers
+            .entries
+            .iter()
+            .zip(results.iter())
+            .enumerate()
+            .map(|(i, (e, r))| (i, e, r))
+            .collect();
+        rows.sort_by_key(|(_, _, r)| r.as_ref().map(|d| d.as_millis()).unwrap_or(u128::MAX));
+        for (i, entry, result) in rows {
+            let latency = match result {
+                Ok(d) => format!("{:>6} ms", d.as_millis()),
+                Err(e) => format!("   fail   {e}"),
+            };
+            println!(
+                "{:<28} {:<22} {:<16} {}",
+                entry.name,
+                entry.server.endpoint(),
+                entry.kind(),
+                if i == 0 {
+                    format!("{latency}  (current)")
+                } else {
+                    latency
+                }
+            );
+        }
         return Ok(());
     }
 
@@ -500,6 +535,7 @@ fn parse_args() -> Result<Args> {
     let mut verbose = false;
     let mut check_config = false;
     let mut probe = false;
+    let mut ping = false;
     let mut tun = false;
     let mut print_tun_config = false;
     let mut tui = false;
@@ -565,6 +601,7 @@ fn parse_args() -> Result<Args> {
             Some("-v") | Some("--verbose") => verbose = true,
             Some("--check-config") => check_config = true,
             Some("--probe") => probe = true,
+            Some("--ping") => ping = true,
             Some("--tun") => tun = true,
             Some("--print-tun-config") => print_tun_config = true,
             Some("--tui") => tui = true,
@@ -614,6 +651,7 @@ fn parse_args() -> Result<Args> {
         verbose,
         check_config,
         probe,
+        ping,
         tun,
         print_tun_config,
         tui,
@@ -643,6 +681,7 @@ Options:
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
+      --ping                Measure the handshake latency of every server in the list and exit
       --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
       --print-tun-config    Print the generated sing-box config for --tun and exit
       --tui                 Terminal UI with live counters and logs (q to quit)
@@ -663,6 +702,7 @@ Examples:
   vproxy --url 'vless://uuid@host:port?security=tls'
   vproxy -u 'vless://...' -p 8080
   vproxy -f server.txt -p 1080
+  vproxy --ping -f server.txt                     # latency of every server in the file
   sudo vproxy --tun -f server.txt
   sudo vproxy --tui --tun -f server.txt
   vproxy service install -f server.txt            # background local proxy, starts at login

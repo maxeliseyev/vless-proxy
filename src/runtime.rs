@@ -1138,6 +1138,45 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
     })
 }
 
+/// Time a full transport handshake (TCP + TLS/REALITY/WebSocket/XHTTP) to
+/// the server; the connection is dropped right after. What the TUI and
+/// `--ping` show as latency.
+pub async fn measure_handshake(server: &ServerConfig, limit: Duration) -> Result<Duration> {
+    let started = std::time::Instant::now();
+    let remote = timeout(limit, connect_remote(server))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout after {}s", limit.as_secs()))??;
+    let elapsed = started.elapsed();
+    drop(remote);
+    Ok(elapsed)
+}
+
+/// Handshake latency of every server, measured concurrently.
+pub async fn ping_servers(
+    servers: &[ServerConfig],
+    limit: Duration,
+) -> Vec<std::result::Result<Duration, String>> {
+    let tasks: Vec<_> = servers
+        .iter()
+        .map(|server| {
+            let server = server.clone();
+            tokio::spawn(async move {
+                measure_handshake(&server, limit)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        out.push(match task.await {
+            Ok(r) => r,
+            Err(e) => Err(format!("task failed: {e}")),
+        });
+    }
+    out
+}
+
 async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStream>> {
     let addr = (server.address.as_str(), server.port);
     match (server.transport_kind()?, server.transport_security()?) {

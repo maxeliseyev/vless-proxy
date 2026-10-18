@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -101,6 +102,9 @@ enum Mode {
     ConfirmDelete(usize),
 }
 
+/// Outcome of one handshake measurement.
+type PingResult = Result<Duration, String>;
+
 struct App {
     mode: Mode,
     config: Arc<Config>,
@@ -115,9 +119,84 @@ struct App {
     up_rate: f64,
     down_rate: f64,
     status: String,
+    /// Latency per server: `None` = not measured yet / in flight.
+    latency: Vec<Option<PingResult>>,
+    ping_rx: mpsc::UnboundedReceiver<(usize, u64, PingResult)>,
+    ping_tx: mpsc::UnboundedSender<(usize, u64, PingResult)>,
+    /// Generation of the current ping round; stale results are dropped.
+    ping_round: u64,
+    pings_in_flight: usize,
 }
 
 impl App {
+    /// Measure every server concurrently; results arrive through `ping_rx`.
+    fn ping_all(&mut self) {
+        if self.servers.is_empty() {
+            return;
+        }
+        self.ping_round += 1;
+        let round = self.ping_round;
+        self.latency = vec![None; self.servers.len()];
+        self.pings_in_flight = self.servers.len();
+        let limit = Duration::from_secs(self.config.runtime.connect_timeout_secs.clamp(1, 10));
+        for (i, entry) in self.servers.entries.iter().enumerate() {
+            let server = entry.server.clone();
+            let tx = self.ping_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::runtime::measure_handshake(&server, limit)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx.send((i, round, result));
+            });
+        }
+        self.status = format!("pinging {} servers…", self.servers.len());
+    }
+
+    fn collect_pings(&mut self) {
+        while let Ok((i, round, result)) = self.ping_rx.try_recv() {
+            if round != self.ping_round || i >= self.latency.len() {
+                continue;
+            }
+            self.latency[i] = Some(result);
+            self.pings_in_flight = self.pings_in_flight.saturating_sub(1);
+            if self.pings_in_flight == 0 {
+                self.status = match self.best_index() {
+                    Some(best) => format!(
+                        "fastest: {} ({}); b switches to it",
+                        self.servers.entries[best].name,
+                        latency_text(&self.latency[best])
+                    ),
+                    None => "ping finished: no server answered".to_string(),
+                };
+            }
+        }
+    }
+
+    /// Index of the lowest measured latency.
+    fn best_index(&self) -> Option<usize> {
+        self.latency
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match l {
+                Some(Ok(d)) => Some((i, *d)),
+                _ => None,
+            })
+            .min_by_key(|(_, d)| *d)
+            .map(|(i, _)| i)
+    }
+
+    fn switch_to_best(&mut self) {
+        match self.best_index() {
+            Some(best) => {
+                self.selected = best;
+                self.switch_to_selected();
+            }
+            None if self.pings_in_flight > 0 => {
+                self.status = "still pinging…".to_string();
+            }
+            None => self.status = "no latency data: press p to ping".to_string(),
+        }
+    }
     fn tick(&mut self) {
         let now = Instant::now();
         let snap = STATS.snapshot();
@@ -145,6 +224,9 @@ impl App {
         }
         match self.servers.remove(i) {
             Ok(entry) => {
+                if i < self.latency.len() {
+                    self.latency.remove(i);
+                }
                 if i < self.active_index {
                     self.active_index -= 1;
                 }
@@ -165,6 +247,7 @@ impl App {
             Ok(entry) => {
                 self.status = format!("added {}", entry.name);
                 self.selected = self.servers.len() - 1;
+                self.latency.push(None);
             }
             Err(e) => self.status = format!("cannot add: {e}"),
         }
@@ -216,6 +299,8 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => self.select(-1),
                     KeyCode::Down | KeyCode::Char('j') => self.select(1),
                     KeyCode::Enter => self.switch_to_selected(),
+                    KeyCode::Char('p') => self.ping_all(),
+                    KeyCode::Char('b') => self.switch_to_best(),
                     KeyCode::Char('a') => {
                         self.mode = Mode::Adding(String::new());
                         self.status =
@@ -353,11 +438,13 @@ impl App {
                 .enumerate()
                 .map(|(i, e)| {
                     let marker = if i == self.active_index { "● " } else { "  " };
+                    let latency = latency_text(self.latency.get(i).unwrap_or(&None));
                     let line = format!(
-                        "{marker}{:<28} {:<16} {}",
+                        "{marker}{:<28} {:<16} {:<16} {:>8}",
                         e.name,
                         e.server.endpoint(),
-                        e.kind()
+                        e.kind(),
+                        latency
                     );
                     let style = if i == self.active_index {
                         Style::default()
@@ -370,14 +457,13 @@ impl App {
                 })
                 .collect();
             let mut state = ListState::default().with_selected(Some(self.selected));
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" servers (↑↓ select, Enter switch, a add, d remove) "),
-                )
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("▶ ");
+            let list =
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(
+                        " servers (↑↓ select, Enter switch, p ping, b best, a add, d remove) ",
+                    ))
+                    .highlight_style(Style::default().bg(Color::DarkGray))
+                    .highlight_symbol("▶ ");
             frame.render_stateful_widget(list, chunks[1], &mut state);
         }
 
@@ -469,11 +555,24 @@ impl App {
                 Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" add  "),
                 Span::styled(" d ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                Span::raw(" remove   "),
+                Span::raw(" remove  "),
+                Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" ping  "),
+                Span::styled(" b ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" best   "),
                 Span::styled(&self.status, Style::default().fg(Color::Yellow)),
             ])),
             chunks[5],
         );
+    }
+}
+
+/// `123 ms`, `fail`, `…` or blank.
+fn latency_text(l: &Option<PingResult>) -> String {
+    match l {
+        None => "…".to_string(),
+        Some(Ok(d)) => format!("{} ms", d.as_millis()),
+        Some(Err(_)) => "fail".to_string(),
     }
 }
 
@@ -487,6 +586,7 @@ pub async fn run(
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+    let (ping_tx, ping_rx) = mpsc::unbounded_channel();
     let active_index = servers
         .entries
         .iter()
@@ -508,11 +608,20 @@ pub async fn run(
         up_rate: 0.0,
         down_rate: 0.0,
         status: String::new(),
+        latency: Vec::new(),
+        ping_rx,
+        ping_tx,
+        ping_round: 0,
+        pings_in_flight: 0,
     };
+    if app.servers.len() > 1 {
+        app.ping_all();
+    }
 
     let mut quitting = false;
     let outcome = loop {
         app.tick();
+        app.collect_pings();
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(anyhow::Error::from(e));
         }
