@@ -25,3 +25,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
       - run: cargo test
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
