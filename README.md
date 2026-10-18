@@ -16,7 +16,14 @@ curl -fsSL https://raw.githubusercontent.com/maxeliseyev/vless-proxy/main/instal
 
 Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически).
 
-Для системного режима (TUN) дополнительно нужен [sing-box](https://sing-box.sagernet.org): `brew install sing-box`.
+Для системного режима (TUN) дополнительно нужен [sing-box](https://sing-box.sagernet.org). Его ставит сам vproxy:
+
+```sh
+vproxy install-sing-box              # Homebrew на macOS, официальный репозиторий sing-box на deb/rpm/Arch,
+                                     # иначе релиз с GitHub в ~/.config/vproxy/bin; --download принудительно скачивает
+```
+
+Без Homebrew на macOS команда предложит поставить и его. При `sudo vproxy --tun` без sing-box vproxy тоже предложит установку. Свой бинарник указывается `--sing-box /path` или `tun.sing_box_path` в TOML.
 
 ## Быстрый старт
 
@@ -36,6 +43,18 @@ sudo vproxy --tui --tun     # системный режим с интерфей�
 ```
 
 Проверка: `curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org` (локальный режим) или просто `curl https://api.ipify.org` (TUN).
+
+### В фоне
+
+Чтобы vproxy работал после закрытия терминала и поднимался при входе или загрузке, он ставится как сервис (launchd на macOS, systemd на Linux):
+
+```sh
+vproxy service install -f server.txt            # локальный прокси, агент пользователя
+sudo vproxy service install --tun -f server.txt # системный VPN, демон с root
+vproxy service status | logs | uninstall        # с --tun для системного
+```
+
+Пути к бинарнику, конфигу и sing-box записываются в сервис абсолютными. Логи: `~/Library/Logs/vproxy.log` или `/var/log/vproxy.log` на macOS, `journalctl -u vproxy` на Linux.
 
 Другие способы указать сервер:
 

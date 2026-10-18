@@ -244,8 +244,9 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
         .spawn()
         .with_context(|| {
             format!(
-                "Failed to start sing-box binary `{}` for TUN mode (brew install sing-box, or set tun.sing_box_path)",
-                config.tun.sing_box_path
+                "Failed to start sing-box binary `{}` for TUN mode. {}",
+                config.tun.sing_box_path,
+                crate::singbox::not_found_hint()
             )
         })?;
 

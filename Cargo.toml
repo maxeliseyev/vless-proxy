@@ -20,6 +20,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand = "0.8"
 base64 = "0.22"
 flate2 = "1"
+tar = "0.4"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

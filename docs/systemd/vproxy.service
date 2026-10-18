@@ -1,6 +1,8 @@
 # System-wide vproxy on Linux. With tun.enabled = true the unit needs root
 # (CAP_NET_ADMIN) because sing-box creates the TUN interface.
 #
+# Preferred: `vproxy service install [--tun] -f server.txt` writes and enables a unit for you.
+# Manual way:
 # install:
 #   sudo cp target/release/vproxy /usr/local/bin/vproxy
 #   sudo mkdir -p /etc/vproxy && sudo cp config.toml /etc/vproxy/config.toml

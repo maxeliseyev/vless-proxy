@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, Level};
@@ -8,8 +8,22 @@ use tracing_subscriber::Layer;
 use vproxy::servers::config_from_link;
 use vproxy::{serve, serve_with_server, ActiveServer, Config, ServerList};
 
+/// Subcommands that run instead of the proxy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Subcommand {
+    InstallSingBox,
+    Service(String),
+}
+
 #[derive(Clone)]
 struct Args {
+    command: Option<Subcommand>,
+    /// `--sing-box <PATH>`: sing-box binary for TUN mode.
+    sing_box: Option<PathBuf>,
+    /// `--yes`: accept the default answer to every question.
+    yes: bool,
+    /// `--download`: fetch the sing-box release instead of using a package manager.
+    download: bool,
     config_path: Option<PathBuf>,
     vless_url: Option<String>,
     url_file: Option<PathBuf>,
@@ -48,6 +62,7 @@ async fn main() -> Result<()> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stderr)
+                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
                     .with_target(false)
                     .with_filter(log_targets(level)),
             )
@@ -55,11 +70,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    if let Some(command) = &args.command {
+        return run_subcommand(command.clone(), args).await;
+    }
     info!("vproxy {} starting", env!("CARGO_PKG_VERSION"));
+
     let (mut config, servers) = load_config(args.clone())?;
     if args.tun || args.print_tun_config {
         config.tun.enabled = true;
         config.validate()?;
+    }
+    if args.tun {
+        config.tun.sing_box_path = resolve_sing_box(&args, &config.tun.sing_box_path).await?;
     }
     let config = Arc::new(config);
     let sidecar = if config.needs_xray_sidecar()? {
@@ -109,6 +131,140 @@ async fn main() -> Result<()> {
         }
         None => serve(config).await,
     }
+}
+
+/// Find sing-box for TUN mode, offering to install it on a terminal.
+async fn resolve_sing_box(args: &Args, configured: &str) -> Result<String> {
+    if let Some(path) = &args.sing_box {
+        return match vproxy::singbox::locate(&path.display().to_string()) {
+            Some(p) => Ok(p.display().to_string()),
+            None => anyhow::bail!("--sing-box {} is not an executable", path.display()),
+        };
+    }
+    if let Some(found) = vproxy::singbox::locate(configured) {
+        return Ok(found.display().to_string());
+    }
+    eprintln!("{}", vproxy::singbox::not_found_hint());
+    if vproxy::singbox::ask("Install sing-box now?", true, args.yes)? {
+        let path = vproxy::singbox::install(args.yes).await?;
+        return Ok(path.display().to_string());
+    }
+    anyhow::bail!("sing-box is required for --tun")
+}
+
+/// `install-sing-box` and `service ...`.
+async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
+    match command {
+        Subcommand::InstallSingBox => {
+            let path = if args.download {
+                vproxy::singbox::download_release(args.yes).await?
+            } else {
+                vproxy::singbox::install(args.yes).await?
+            };
+            info!("sing-box ready at {}", path.display());
+            Ok(())
+        }
+        Subcommand::Service(action) => match action.as_str() {
+            "install" => service_install(args).await,
+            "uninstall" | "remove" => {
+                let p = vproxy::service::uninstall(args.tun)?;
+                info!("Service removed ({})", p.unit.display());
+                Ok(())
+            }
+            "status" => {
+                print!("{}", vproxy::service::status(args.tun)?);
+                Ok(())
+            }
+            "logs" | "log" => vproxy::service::logs(args.tun),
+            other => {
+                anyhow::bail!("unknown service action {other:?} (install, uninstall, status, logs)")
+            }
+        },
+    }
+}
+
+/// Resolve the config source to absolute paths, check it loads, pick the
+/// sing-box binary for `--tun`, then install the launchd/systemd service.
+async fn service_install(args: Args) -> Result<()> {
+    use vproxy::service::absolute;
+    let mut service_args: Vec<String> = Vec::new();
+    let mut check = args.clone();
+    check.command = None;
+    if let Some(path) = &args.config_path {
+        let path = absolute(path)?;
+        service_args.extend(["-c".to_string(), path.display().to_string()]);
+        check.config_path = Some(path);
+    } else if let Some(file) = &args.url_file {
+        let file = absolute(file)?;
+        service_args.extend(["-f".to_string(), file.display().to_string()]);
+        check.url_file = Some(file);
+    } else if let Some(link) = &args.vless_url {
+        // The service cannot take the link on its command line safely; keep it in a file.
+        let dir = vproxy::singbox::real_home()
+            .map(|h| h.join(".config").join("vproxy"))
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("service.txt");
+        std::fs::write(&file, format!("{link}\n"))?;
+        service_args.extend(["-f".to_string(), file.display().to_string()]);
+        check.vless_url = None;
+        check.url_file = Some(file);
+    } else {
+        // Same discovery as a plain `vproxy`, but the daemon has no cwd of ours.
+        match discover_source()? {
+            Some(DiscoveredSource::Url(_, path)) => {
+                let path = absolute(&path)?;
+                service_args.extend(["-f".to_string(), path.display().to_string()]);
+                check.url_file = Some(path);
+            }
+            Some(DiscoveredSource::ConfigFile(path)) => {
+                let path = absolute(&path)?;
+                service_args.extend(["-c".to_string(), path.display().to_string()]);
+                check.config_path = Some(path);
+            }
+            None => anyhow::bail!(
+                "No config to install: pass -c config.toml, -f server.txt or -u 'vless://...'"
+            ),
+        }
+    }
+    if let Some(port) = args.inbound_port {
+        service_args.extend(["-p".to_string(), port.to_string()]);
+    }
+    let (mut config, _) = load_config(check.clone())?;
+    if args.tun {
+        config.tun.enabled = true;
+        config.validate()?;
+        let sing_box = resolve_sing_box(&args, &config.tun.sing_box_path).await?;
+        service_args.push("--tun".to_string());
+        service_args.extend(["--sing-box".to_string(), sing_box]);
+    } else {
+        config.validate()?;
+    }
+    if args.verbose {
+        service_args.push("-v".to_string());
+    }
+    let binary = std::env::current_exe()?
+        .canonicalize()
+        .context("cannot resolve the vproxy binary path")?;
+    let plan = vproxy::service::ServicePlan {
+        tun: args.tun,
+        binary,
+        args: service_args,
+    };
+    let p = vproxy::service::install(&plan)?;
+    info!(
+        "Service installed and started: {} ({} {})",
+        p.unit.display(),
+        plan.binary.display(),
+        plan.args.join(" ")
+    );
+    info!(
+        "Logs: {}. Remove with: {}vproxy service uninstall{}",
+        p.log.display(),
+        if args.tun { "sudo " } else { "" },
+        if args.tun { " --tun" } else { "" }
+    );
+    Ok(())
 }
 
 /// Our own logs at `level`; the HTTP and TLS libraries only when something
@@ -347,8 +503,29 @@ fn parse_args() -> Result<Args> {
     let mut tun = false;
     let mut print_tun_config = false;
     let mut tui = false;
+    let mut command = None;
+    let mut sing_box = None;
+    let mut yes = false;
+    let mut download = false;
 
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
+    match args.peek().and_then(|a| a.to_str()) {
+        Some("install-sing-box") => {
+            args.next();
+            command = Some(Subcommand::InstallSingBox);
+        }
+        Some("service") => {
+            args.next();
+            let action = args
+                .next()
+                .and_then(|a| a.to_str().map(str::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("service needs an action: install, uninstall, status, logs")
+                })?;
+            command = Some(Subcommand::Service(action));
+        }
+        _ => {}
+    }
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-c") | Some("--config") => {
@@ -391,6 +568,14 @@ fn parse_args() -> Result<Args> {
             Some("--tun") => tun = true,
             Some("--print-tun-config") => print_tun_config = true,
             Some("--tui") => tui = true,
+            Some("--sing-box") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--sing-box requires a path"))?;
+                sing_box = Some(PathBuf::from(value));
+            }
+            Some("-y") | Some("--yes") => yes = true,
+            Some("--download") => download = true,
             Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
@@ -418,6 +603,10 @@ fn parse_args() -> Result<Args> {
     }
 
     Ok(Args {
+        command,
+        sing_box,
+        yes,
+        download,
         config_path,
         vless_url,
         url_file,
@@ -438,6 +627,8 @@ vproxy - terminal VLESS client
 
 Usage:
   vproxy [OPTIONS] [config-path|vless://...|vpn://...]
+  vproxy install-sing-box [--yes] [--download]
+  vproxy service install|uninstall|status|logs [--tun] [config options]
 
 Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
 ~/.config/vproxy/server.txt; if none exists it asks for a vless:// link (pasted as
@@ -455,8 +646,17 @@ Options:
       --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
       --print-tun-config    Print the generated sing-box config for --tun and exit
       --tui                 Terminal UI with live counters and logs (q to quit)
+      --sing-box <PATH>     sing-box binary for --tun (default: ~/.config/vproxy/bin, PATH, Homebrew, Happ)
+  -y, --yes                 Answer yes to questions (install prompts)
+      --download            install-sing-box: skip package managers, download the GitHub release
   -h, --help                Show this help
   -V, --version             Print version
+
+Commands:
+  install-sing-box          Install sing-box for TUN mode: Homebrew / the official repo script
+                            when available, otherwise the GitHub release into ~/.config/vproxy/bin
+  service install           Run vproxy in the background (launchd / systemd), start at login or boot;
+                            with --tun a system daemon (sudo). uninstall, status and logs manage it
 
 Examples:
   vproxy config.toml
@@ -465,6 +665,8 @@ Examples:
   vproxy -f server.txt -p 1080
   sudo vproxy --tun -f server.txt
   sudo vproxy --tui --tun -f server.txt
+  vproxy service install -f server.txt            # background local proxy, starts at login
+  sudo vproxy service install --tun -f server.txt # background system-wide VPN
 "
     );
 }

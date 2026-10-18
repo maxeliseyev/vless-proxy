@@ -3,6 +3,9 @@
 <!--
   Local SOCKS5/HTTP proxy only (no TUN), as a per-user launchd agent.
 
+  Preferred: `vproxy service install -f server.txt` generates and loads this for you.
+  Manual way:
+
   install:
     mkdir -p ~/.config/vproxy && cp config.toml ~/.config/vproxy/config.toml
     sed "s#HOME#$HOME#g" docs/launchd/com.vproxy.local.plist > ~/Library/LaunchAgents/com.vproxy.local.plist

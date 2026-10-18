@@ -90,5 +90,6 @@ cat >&2 <<MSG
 Next steps:
   echo 'vless://...' > server.txt
   vproxy -f server.txt -p 1080            # local SOCKS5 proxy
-  sudo vproxy --tui --tun -f server.txt   # system-wide (needs sing-box: brew install sing-box)
+  sudo vproxy --tui --tun -f server.txt   # system-wide (asks to install sing-box if missing)
+  vproxy service install -f server.txt    # keep it running in the background
 MSG

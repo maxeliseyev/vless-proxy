@@ -80,6 +80,11 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 24. **Установка sing-box и фоновый сервис (2026-10-18)**
+     - `src/singbox.rs`: поиск бинарника (`--sing-box`/`tun.sing_box_path`, `~/.config/vproxy/bin`, PATH, Homebrew, системные префиксы, бандл Happ; под sudo ищется и дом реального пользователя); `vproxy install-sing-box`: Homebrew на macOS (без него предлагает поставить Homebrew), официальный скрипт репозитория sing-box на deb/rpm/Arch, иначе релиз с GitHub под ОС/CPU в `~/.config/vproxy/bin` (`--download` принудительно); `--tun` без sing-box предлагает установку на месте
+     - `src/service.rs`: `vproxy service install|uninstall|status|logs [--tun]` генерирует launchd plist (агент пользователя или системный демон) или systemd unit (user или system с root и CAP_NET_ADMIN), пишет абсолютные пути к бинарнику, конфигу и sing-box, запускает и включает автозапуск; логи в файл без ANSI
+     - проверено: загрузка релиза в scratch-HOME и запуск `sing-box version`; цикл install → status → слушающий порт → uninstall для launchd-агента
+
  23. **XHTTP-транспорт (2026-10-17)**
      - `src/xhttp.rs` на hyper 1.x (`client::conn::http1/http2` поверх наших TLS/REALITY-потоков): stream-one (один POST, тело запроса = uplink, тело ответа = downlink), stream-up (GET + потоковый POST), packet-up (GET + POST-пакеты с seq, батчинг до 1 МБ, интервал 30 мс); по HTTP/1.1 только packet-up на отдельном соединении для upload
      - URL/заголовки как у Xray: `/path/` + session id (uuid) + seq, `Referer` с `x_padding` 100–1000 X, `Content-Type: application/grpc` на потоковых запросах, кастомные `headers`; из `extra`/`xhttpSettings` читаются mode, headers, noGRPCHeader, xPaddingBytes, scMaxEachPostBytes, scMinPostsIntervalMs, uplinkHTTPMethod (downloadSettings, нестандартные placement и obfs-паддинг пока нет)

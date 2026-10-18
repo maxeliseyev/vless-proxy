@@ -18,6 +18,8 @@ pub mod reality_tls;
 pub mod routing;
 pub mod runtime;
 pub mod servers;
+pub mod service;
+pub mod singbox;
 pub mod socks5;
 pub mod stats;
 pub mod tls;

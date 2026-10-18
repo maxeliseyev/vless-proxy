@@ -3,6 +3,9 @@
 <!--
   System-wide vproxy (TUN mode) as a launchd daemon on macOS.
 
+  Preferred: `sudo vproxy service install --tun -f server.txt` generates and loads this for you.
+  Manual way:
+
   install:
     sudo cp target/release/vproxy /usr/local/bin/vproxy
     sudo mkdir -p /usr/local/etc/vproxy && sudo cp config.toml /usr/local/etc/vproxy/config.toml   # set tun.enabled = true
