@@ -33,8 +33,17 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64|amd64) asset="vproxy-linux-x86_64" ;;
+      aarch64|arm64) asset="vproxy-linux-arm64" ;;
       *) die "unsupported Linux architecture: $arch (build from source: cargo build --release)" ;;
-    esac ;;
+    esac
+    # Static musl build on Alpine and other systems without glibc, or on request.
+    libc="${VPROXY_LIBC:-}"
+    if [ -z "$libc" ]; then
+      if [ -f /etc/alpine-release ] || ! (ldd --version 2>&1 | grep -qi glibc); then
+        libc=musl
+      fi
+    fi
+    [ "$libc" = musl ] && asset="$asset-musl" ;;
   *) die "unsupported OS: $os" ;;
 esac
 
@@ -91,5 +100,6 @@ Next steps:
   echo 'vless://...' > server.txt
   vproxy -f server.txt -p 1080            # local SOCKS5 proxy
   sudo vproxy --tui --tun -f server.txt   # system-wide (asks to install sing-box if missing)
+  docker run -p 1080:1080 ghcr.io/maxeliseyev/vproxy -s 'https://...'   # or the container
   vproxy service install -f server.txt    # keep it running in the background
 MSG

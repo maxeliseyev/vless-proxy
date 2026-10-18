@@ -1,0 +1,6 @@
+target
+scratchpad
+*.log
+server.txt
+tun-*.toml
+.git

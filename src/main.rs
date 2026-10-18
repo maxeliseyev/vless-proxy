@@ -29,6 +29,8 @@ struct Args {
     vless_url: Option<String>,
     url_file: Option<PathBuf>,
     inbound_port: Option<u16>,
+    /// `-l ADDR`: address the local inbound listens on (default 127.0.0.1).
+    listen: Option<String>,
     verbose: bool,
     check_config: bool,
     probe: bool,
@@ -87,6 +89,9 @@ async fn main() -> Result<()> {
     }
 
     let (mut config, servers) = load_config(args.clone())?;
+    if let Some(listen) = &args.listen {
+        config.inbound.address = listen.clone();
+    }
     if args.tun || args.print_tun_config {
         config.tun.enabled = true;
         config.validate()?;
@@ -272,6 +277,9 @@ async fn service_install(args: Args) -> Result<()> {
     }
     if let Some(port) = args.inbound_port {
         service_args.extend(["-p".to_string(), port.to_string()]);
+    }
+    if let Some(listen) = &args.listen {
+        service_args.extend(["-l".to_string(), listen.clone()]);
     }
     let (mut config, _) = load_config(check.clone())?;
     if args.tun {
@@ -665,6 +673,7 @@ fn parse_args() -> Result<Args> {
     let mut vless_url = None;
     let mut url_file = None;
     let mut inbound_port = None;
+    let mut listen = None;
     let mut verbose = false;
     let mut check_config = false;
     let mut probe = false;
@@ -733,6 +742,18 @@ fn parse_args() -> Result<Args> {
                         .map_err(|_| anyhow::anyhow!("Invalid port number"))?,
                 );
             }
+            Some("-l") | Some("--listen") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--listen requires an address"))?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("Invalid listen address"))?;
+                value.parse::<std::net::IpAddr>().map_err(|_| {
+                    anyhow::anyhow!("--listen must be an IP address, got {value:?}")
+                })?;
+                listen = Some(value);
+            }
             Some("-v") | Some("--verbose") => verbose = true,
             Some("--check-config") => check_config = true,
             Some("--probe") => probe = true,
@@ -794,6 +815,7 @@ fn parse_args() -> Result<Args> {
         vless_url,
         url_file,
         inbound_port,
+        listen,
         verbose,
         check_config,
         probe,
@@ -830,6 +852,7 @@ Options:
                             when older than the provider's interval, by u in the TUI, or --refresh
       --refresh             Update the links file from its subscription and exit
   -p, --inbound-port <PORT> Local inbound port (default: 1080)
+  -l, --listen <ADDR>       Inbound address (default: 127.0.0.1; 0.0.0.0 inside a container)
   -v, --verbose             Enable debug logging
       --check-config        Validate config and exit
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit

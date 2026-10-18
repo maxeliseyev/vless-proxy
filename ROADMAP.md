@@ -80,6 +80,11 @@
      - Подключение через `xray-core` sidecar для `security=reality` / `xtls-rprx-vision`
      - **Комментарий:** это дало рабочий transport для реальных ссылок до появления нативной реализации.
 
+ 29. **Сборки arm64/musl и Docker-образ (2026-10-18)**
+     - release.yml: `linux-arm64` (нативно на `ubuntu-22.04-arm`), `linux-x86_64-musl` и `linux-arm64-musl` (musl-tools, статические бинарники); job `docker` собирает multi-arch образ `ghcr.io/maxeliseyev/vproxy:<ver>` и `:latest` из musl-бинарников (`.github/docker/Dockerfile`)
+     - корневой `Dockerfile` собирает из исходников на `rust:1-alpine` (aws-lc-sys под musl: build-base, cmake, perl); образ на `alpine` с `ca-certificates`, слушает `0.0.0.0:1080`, конфиг через `/data/server.txt`, `-s URL` или `-u`
+     - `-l/--listen <ADDR>` для адреса inbound (в контейнере `0.0.0.0`), пробрасывается и в `service install`; `install.sh` понимает arm64 и выбирает musl на Alpine / без glibc (`VPROXY_LIBC=musl` принудительно)
+
  28. **Структура исходников (2026-10-18)**
      - `src/` разложен по слоям: `config/` (+ `import/`), `protocol/` (+ `reality/`), `transport/`, `inbound/`, `proxy/`, `system/`, `ui/`; публичные типы для CLI и тестов реэкспортируются из `lib.rs`; история файлов сохранена через `git mv`
 

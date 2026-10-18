@@ -6,13 +6,21 @@
 
 ## Установка
 
-Готовые сборки для macOS (Apple Silicon и Intel) и Linux x86-64 в [GitHub Releases](https://github.com/maxeliseyev/vless-proxy/releases):
+Готовые сборки для macOS (Apple Silicon и Intel) и Linux (x86-64 и arm64, glibc и статические musl для Alpine) в [GitHub Releases](https://github.com/maxeliseyev/vless-proxy/releases):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/maxeliseyev/vless-proxy/main/install.sh | sh
 ```
 
 Скрипт определяет платформу, проверяет sha256 и ставит `vproxy` в `/usr/local/bin` (или `~/.local/bin`). Переменные: `VPROXY_VERSION=v0.10.0`, `VPROXY_PREFIX=~/.local/bin`.
+
+Docker (образ `ghcr.io/maxeliseyev/vproxy`, linux/amd64 и linux/arm64, слушает `0.0.0.0:1080` внутри контейнера):
+
+```sh
+docker run -d --name vproxy -p 127.0.0.1:1080:1080 -v "$PWD/server.txt:/data/server.txt:ro" ghcr.io/maxeliseyev/vproxy
+docker run -d --name vproxy -p 127.0.0.1:1080:1080 ghcr.io/maxeliseyev/vproxy -s 'https://provider/sub/token'
+docker build -t vproxy .      # собрать самому (Alpine, статический musl)
+```
 
 Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически).
 
