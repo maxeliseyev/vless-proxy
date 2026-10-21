@@ -39,7 +39,10 @@ resolve = "remote"
 
 [runtime]
 connect_timeout_secs = 10
+# target sent a request and has not answered at all: dropped as an error
 read_timeout_secs = 300
+# one write pending towards the client or the server
 write_timeout_secs = 60
+# nothing moving on a working (or never used) connection: closed quietly
 idle_timeout_secs = 600
 max_connections = 1024

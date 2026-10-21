@@ -636,14 +636,17 @@ async fn handle_socks5_tcp_request(
         );
     }
     socks5::send_success(&mut client).await?;
-    prime_remote(&mut client, &mut remote, write_timeout).await?;
+    let request_sent = prime_remote(&mut client, &mut remote, write_timeout).await?;
 
     let result = copy_bidirectional_with_timeouts(
         &mut client,
         &mut remote,
-        read_timeout,
-        write_timeout,
-        idle_timeout,
+        RelayTimeouts {
+            read: read_timeout,
+            write: write_timeout,
+            idle: idle_timeout,
+        },
+        request_sent,
     )
     .await;
 
@@ -819,14 +822,18 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
             .await
             .map_err(|_| anyhow::anyhow!("Flush timeout"))??;
     }
-    prime_remote(&mut client, &mut remote, write_timeout).await?;
+    let primed = prime_remote(&mut client, &mut remote, write_timeout).await?;
+    let request_sent = primed || !request.initial_payload.is_empty();
 
     let result = copy_bidirectional_with_timeouts(
         &mut client,
         &mut remote,
-        read_timeout,
-        write_timeout,
-        idle_timeout,
+        RelayTimeouts {
+            read: read_timeout,
+            write: write_timeout,
+            idle: idle_timeout,
+        },
+        request_sent,
     )
     .await;
 
@@ -834,28 +841,52 @@ async fn handle_http_connection(mut client: TcpStream, connector: ProxyClient) -
     result.map(|_| ())
 }
 
+/// Timeouts of an established relay, see [`RuntimeConfig`](crate::RuntimeConfig).
+#[derive(Clone, Copy)]
+struct RelayTimeouts {
+    /// Target has been sent a request and nothing has come back yet.
+    read: Duration,
+    /// A single write pending towards one peer.
+    write: Duration,
+    /// No bytes in either direction on an otherwise healthy connection.
+    idle: Duration,
+}
+
 /// Relay both directions until either side reads EOF or an error. The two
 /// directions make progress independently (a stalled write towards one peer
 /// never stops reads from the other), which matters for multiplexed sessions
-/// where several relays share one connection. Timeouts: a single write
-/// pending longer than `write_timeout`, or no bytes moving in either
-/// direction for `min(read_timeout, idle_timeout)`, end the relay with an
-/// error.
+/// where several relays share one connection.
+///
+/// Timeouts: a single write pending longer than `write` is an error. While
+/// the client has sent something and the target has not answered at all,
+/// `read` of silence is an error (the target is not responding). Otherwise a
+/// connection nobody uses for `idle` is closed quietly and successfully: a
+/// browser's spare keep-alive socket is not a failure. `request_sent` says
+/// whether the caller already forwarded client bytes before the relay began.
 async fn copy_bidirectional_with_timeouts<A, B>(
     a: &mut A,
     b: &mut B,
-    read_timeout: Duration,
-    write_timeout: Duration,
-    idle_timeout: Duration,
+    timeouts: RelayTimeouts,
+    request_sent: bool,
 ) -> Result<(u64, u64)>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin + Send,
     B: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    let activity_timeout = read_timeout.min(idle_timeout);
-    let mut a_to_b = RelayDirection::new("remote", write_timeout, true);
-    let mut b_to_a = RelayDirection::new("client", write_timeout, false);
-    let mut activity = Box::pin(tokio::time::sleep(activity_timeout));
+    let mut a_to_b = RelayDirection::new("remote", timeouts.write, true);
+    let mut b_to_a = RelayDirection::new("client", timeouts.write, false);
+    let awaiting_reply = |a_to_b: &RelayDirection, b_to_a: &RelayDirection| {
+        b_to_a.copied == 0 && (request_sent || a_to_b.copied > 0)
+    };
+    let silence_limit = |waiting: bool| {
+        if waiting {
+            timeouts.read
+        } else {
+            timeouts.idle
+        }
+    };
+    let mut waiting = awaiting_reply(&a_to_b, &b_to_a);
+    let mut activity = Box::pin(tokio::time::sleep(silence_limit(waiting)));
 
     std::future::poll_fn(|cx| {
         let mut progress = false;
@@ -869,12 +900,20 @@ where
             _ => {}
         }
         if progress {
+            waiting = awaiting_reply(&a_to_b, &b_to_a);
             activity
                 .as_mut()
-                .reset(tokio::time::Instant::now() + activity_timeout);
+                .reset(tokio::time::Instant::now() + silence_limit(waiting));
         }
         if activity.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(anyhow::anyhow!("Idle timeout")));
+            if waiting {
+                return Poll::Ready(Err(anyhow::anyhow!(
+                    "Read timeout: no response from target in {}s",
+                    timeouts.read.as_secs()
+                )));
+            }
+            debug!("Connection idle for {}s, closing", timeouts.idle.as_secs());
+            return Poll::Ready(Ok((a_to_b.copied, b_to_a.copied)));
         }
         Poll::Pending
     })
@@ -1347,11 +1386,12 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
 /// Send the VLESS request header the way Xray-core does: bundled with the
 /// first client payload, or, if none arrives within 500 ms, with an empty
 /// Vision padding block (or alone when Vision is off).
+/// Returns whether any client bytes were forwarded.
 async fn prime_remote(
     client: &mut TcpStream,
     remote: &mut OutboundStream,
     write_timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     let pending = match remote {
         OutboundStream::Proxy(r) => r.header_pending(),
         // A mux session opens with its first payload, or alone when the
@@ -1359,14 +1399,16 @@ async fn prime_remote(
         OutboundStream::Mux(_) | OutboundStream::Direct(_) => false,
     };
     if !pending {
-        return Ok(());
+        return Ok(false);
     }
+    let mut sent = false;
     let mut buf = vec![0u8; 8192];
     match timeout(Duration::from_millis(500), client.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => {
             timeout(write_timeout, remote.write_all(&buf[..n]))
                 .await
                 .map_err(|_| anyhow::anyhow!("Write timeout to remote"))??;
+            sent = true;
         }
         Ok(Ok(_)) => {} // client closed already; still send the header so the relay ends cleanly
         Ok(Err(e)) => return Err(e.into()),
@@ -1379,7 +1421,7 @@ async fn prime_remote(
     timeout(write_timeout, remote.flush())
         .await
         .map_err(|_| anyhow::anyhow!("Flush timeout to remote"))??;
-    Ok(())
+    Ok(sent)
 }
 
 /// Short, non-secret tag for a UUID (first 4 bytes of its SHA-256), for logs
@@ -1570,6 +1612,81 @@ impl UdpTunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_timeouts(read_ms: u64, idle_ms: u64) -> RelayTimeouts {
+        RelayTimeouts {
+            read: Duration::from_millis(read_ms),
+            write: Duration::from_secs(5),
+            idle: Duration::from_millis(idle_ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_relay_closes_successfully() {
+        let (mut client, _client_peer) = tokio::io::duplex(1024);
+        let (mut remote, _remote_peer) = tokio::io::duplex(1024);
+        let result = copy_bidirectional_with_timeouts(
+            &mut client,
+            &mut remote,
+            relay_timeouts(5_000, 50),
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn unanswered_request_is_an_error() {
+        let (mut client, mut client_peer) = tokio::io::duplex(1024);
+        let (mut remote, _remote_peer) = tokio::io::duplex(1024);
+        client_peer
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let err = copy_bidirectional_with_timeouts(
+            &mut client,
+            &mut remote,
+            relay_timeouts(50, 5_000),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no response from target"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn request_sent_before_relay_counts_as_waiting() {
+        let (mut client, _client_peer) = tokio::io::duplex(1024);
+        let (mut remote, _remote_peer) = tokio::io::duplex(1024);
+        let err = copy_bidirectional_with_timeouts(
+            &mut client,
+            &mut remote,
+            relay_timeouts(50, 5_000),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no response from target"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn answered_request_then_silence_is_idle() {
+        let (mut client, mut client_peer) = tokio::io::duplex(1024);
+        let (mut remote, mut remote_peer) = tokio::io::duplex(1024);
+        client_peer.write_all(b"hello").await.unwrap();
+        remote_peer.write_all(b"world").await.unwrap();
+        let result = copy_bidirectional_with_timeouts(
+            &mut client,
+            &mut remote,
+            relay_timeouts(5_000, 50),
+            true,
+        )
+        .await;
+        assert_eq!(result.unwrap(), (5, 5));
+        let mut buf = [0u8; 5];
+        client_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"world");
+    }
 
     #[test]
     fn loopback_detection() {

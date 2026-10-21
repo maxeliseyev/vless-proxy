@@ -382,12 +382,19 @@ fn default_rule_resolve() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuntimeConfig {
+    /// Opening the connection to the server (or the target when direct).
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+    /// How long a target may stay silent after the client sent it a request
+    /// before the connection is dropped as an error. The client handshake
+    /// (SOCKS5/HTTP) gets at most 30 s of this.
     #[serde(default = "default_read_timeout")]
     pub read_timeout_secs: u64,
+    /// A single write pending towards either peer.
     #[serde(default = "default_write_timeout")]
     pub write_timeout_secs: u64,
+    /// No bytes in either direction on a connection that already works (or
+    /// that nobody has used yet): closed quietly, not an error.
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     #[serde(default = "default_max_connections")]
