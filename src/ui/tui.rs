@@ -1,8 +1,9 @@
-//! Minimal terminal UI: server/mode header, live counters, recent log lines.
+//! Minimal terminal UI: server/mode header, live counters, scrollable log.
 //! `q` (or Esc / Ctrl-C) shuts the proxy down gracefully.
 
 use crate::config::servers::ServerList;
 use crate::config::Config;
+use crate::logging::RotatingFile;
 use crate::proxy::runtime::ActiveServer;
 use crate::proxy::stats::{human_bytes, Snapshot, STATS};
 use anyhow::Result;
@@ -15,25 +16,46 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// Ring buffer of formatted log lines, fed by a tracing writer.
+/// Ring buffer of formatted log lines, fed by a tracing writer; every
+/// write is also appended to the rotating file when one is attached.
 pub struct LogBuffer {
     lines: Mutex<VecDeque<String>>,
     capacity: usize,
+    file: Mutex<Option<RotatingFile>>,
+    file_path: Option<PathBuf>,
 }
 
 impl LogBuffer {
-    pub fn new(capacity: usize) -> Arc<Self> {
+    pub fn new(capacity: usize, file: Option<RotatingFile>) -> Arc<Self> {
         Arc::new(Self {
             lines: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            file_path: file.as_ref().map(|f| f.path().to_path_buf()),
+            file: Mutex::new(file),
         })
+    }
+
+    /// Where lines are persisted, if anywhere.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
+    }
+
+    fn write_file(&self, buf: &[u8]) {
+        let mut file = self.file.lock().expect("log file poisoned");
+        if let Some(f) = file.as_mut() {
+            // A failing disk must not take the UI down; drop the file instead.
+            if f.write_all(buf).is_err() {
+                *file = None;
+            }
+        }
     }
 
     fn push(&self, line: String) {
@@ -44,9 +66,29 @@ impl LogBuffer {
         lines.push_back(line);
     }
 
-    pub fn tail(&self, n: usize) -> Vec<String> {
+    pub fn len(&self) -> usize {
+        self.lines.lock().expect("log buffer poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Up to `n` lines ending `skip` lines before the newest one, oldest first.
+    pub fn window(&self, skip: usize, n: usize) -> Vec<String> {
         let lines = self.lines.lock().expect("log buffer poisoned");
-        lines.iter().rev().take(n).rev().cloned().collect()
+        lines
+            .iter()
+            .rev()
+            .skip(skip)
+            .take(n)
+            .rev()
+            .cloned()
+            .collect()
+    }
+
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        self.window(0, n)
     }
 
     pub fn writer(self: &Arc<Self>) -> LogWriter {
@@ -65,6 +107,7 @@ pub struct LogWriter {
 
 impl io::Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.write_file(buf);
         self.partial.push_str(&String::from_utf8_lossy(buf));
         while let Some(idx) = self.partial.find('\n') {
             let line = self.partial[..idx].trim_end().to_string();
@@ -113,6 +156,10 @@ struct App {
     active_index: usize,
     selected: usize,
     logs: Arc<LogBuffer>,
+    /// Lines scrolled back from the newest; 0 follows the tail.
+    log_scroll: usize,
+    /// Rows the log pane showed on the last draw (one PgUp/PgDn step).
+    log_page: usize,
     started: Instant,
     last: Snapshot,
     last_at: Instant,
@@ -322,10 +369,35 @@ impl App {
         }
     }
 
+    fn scroll_log(&mut self, delta: isize) {
+        let max = self.logs.len().saturating_sub(1);
+        self.log_scroll = (self.log_scroll as isize + delta).clamp(0, max as isize) as usize;
+    }
+
     /// Returns true when the key asks to quit.
     fn handle_key(&mut self, key: event::KeyEvent) -> bool {
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        // Log scrolling works in every mode; the keys clash with nothing else.
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_log(self.log_page as isize);
+                return false;
+            }
+            KeyCode::PageDown => {
+                self.scroll_log(-(self.log_page as isize));
+                return false;
+            }
+            KeyCode::Home => {
+                self.scroll_log(isize::MAX / 2);
+                return false;
+            }
+            KeyCode::End => {
+                self.log_scroll = 0;
+                return false;
+            }
+            _ => {}
+        }
         match &mut self.mode {
             Mode::Adding(input) => {
                 if ctrl_c {
@@ -422,7 +494,7 @@ impl App {
         }
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let adding = matches!(self.mode, Mode::Adding(_));
         let list_height = if self.servers.len() > 1 || adding {
             (self.servers.len() as u16 + 2).min(8)
@@ -589,30 +661,7 @@ impl App {
             chunks[3],
         );
 
-        let height = chunks[4].height.saturating_sub(2) as usize;
-        let lines: Vec<Line> = self
-            .logs
-            .tail(height)
-            .into_iter()
-            .map(|l| {
-                let style = if l.contains("ERROR") {
-                    Style::default().fg(Color::Red)
-                } else if l.contains(" WARN") {
-                    Style::default().fg(Color::Yellow)
-                } else if l.contains("DEBUG") {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(l, style))
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(" log ")),
-            chunks[4],
-        );
+        self.draw_log(frame, chunks[4]);
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -629,11 +678,96 @@ impl App {
                 Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" ping  "),
                 Span::styled(" b ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                Span::raw(" best   "),
+                Span::raw(" best  "),
+                Span::styled(
+                    " PgUp/PgDn ",
+                    Style::default().fg(Color::Black).bg(Color::Gray),
+                ),
+                Span::raw(" log   "),
                 Span::styled(&self.status, Style::default().fg(Color::Yellow)),
             ])),
             chunks[5],
         );
+    }
+}
+
+impl App {
+    /// The log pane, anchored at the bottom: the newest line (or the one
+    /// `log_scroll` lines back) is always fully visible, long lines wrap.
+    fn draw_log(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let height = area.height.saturating_sub(2) as usize;
+        self.log_page = height.max(1);
+        let total = self.logs.len();
+        self.log_scroll = self.log_scroll.min(total.saturating_sub(1));
+
+        // Pull lines from the end until they fill the pane once wrapped.
+        let mut rows_needed = 0;
+        let mut lines: Vec<Line> = Vec::new();
+        let candidates = self.logs.window(self.log_scroll, height);
+        for l in candidates.iter().rev() {
+            let rows = l.chars().count().max(1).div_ceil(width);
+            if rows_needed + rows > height && !lines.is_empty() {
+                break;
+            }
+            rows_needed += rows;
+            lines.push(Line::from(Span::styled(l.clone(), log_style(l))));
+        }
+        lines.reverse();
+        // Scroll inside the paragraph when a single long line overflows.
+        let overflow = rows_needed.saturating_sub(height) as u16;
+
+        let mut title = String::from(" log ");
+        if let Some(path) = self.logs.file_path() {
+            title.push_str(&format!("→ {} ", shorten_home(path)));
+        }
+        if self.log_scroll > 0 {
+            title.push_str(&format!(
+                "│ ↑ {} newer below, End to follow ",
+                self.log_scroll
+            ));
+        } else if total > height {
+            title.push_str("│ PgUp to scroll back ");
+        }
+        let title_style = if self.log_scroll > 0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((overflow, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(Span::styled(title, title_style)),
+                ),
+            area,
+        );
+    }
+}
+
+fn log_style(l: &str) -> Style {
+    if l.contains("ERROR") {
+        Style::default().fg(Color::Red)
+    } else if l.contains(" WARN") {
+        Style::default().fg(Color::Yellow)
+    } else if l.contains("DEBUG") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    }
+}
+
+/// `/Users/me/.config/vproxy/vproxy.log` → `~/.config/vproxy/vproxy.log`.
+fn shorten_home(path: &Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
+            format!("~{}", &shown[home.len()..])
+        }
+        _ => shown,
     }
 }
 
@@ -673,6 +807,8 @@ pub async fn run(
         active_index,
         selected: active_index,
         logs,
+        log_scroll: 0,
+        log_page: 1,
         started: Instant::now(),
         last: STATS.snapshot(),
         last_at: Instant::now(),

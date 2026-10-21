@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, Level};
@@ -43,6 +43,8 @@ struct Args {
     tun: bool,
     print_tun_config: bool,
     tui: bool,
+    /// `--log-file <PATH>`: where the TUI persists its log (`none` disables).
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -54,7 +56,8 @@ async fn main() -> Result<()> {
         Level::INFO
     };
     let tui_logs = if args.tui {
-        let logs = vproxy::ui::tui::LogBuffer::new(1000);
+        let file = open_tui_log_file(args.log_file.as_deref());
+        let logs = vproxy::ui::tui::LogBuffer::new(5000, file);
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
@@ -315,6 +318,33 @@ async fn service_install(args: Args) -> Result<()> {
         if args.tun { " --tun" } else { "" }
     );
     Ok(())
+}
+
+/// The TUI keeps logs in memory and mirrors them to a size-capped file
+/// (`~/.config/vproxy/vproxy.log`, 5 MiB × 3 by default). `none` disables it.
+/// Failing to open the file is reported after the subscriber is up, not fatal.
+fn open_tui_log_file(path: Option<&Path>) -> Option<vproxy::logging::RotatingFile> {
+    if path.map(|p| p.as_os_str() == "none").unwrap_or(false) {
+        return None;
+    }
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => user_config_dir()?.join("vproxy.log"),
+    };
+    match vproxy::logging::RotatingFile::open(
+        &path,
+        vproxy::logging::DEFAULT_MAX_BYTES,
+        vproxy::logging::DEFAULT_KEEP,
+    ) {
+        Ok(mut f) => {
+            let _ = f.write_session_header();
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!("warning: cannot open log file {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Our own logs at `level`; the HTTP and TLS libraries only when something
@@ -685,6 +715,7 @@ fn parse_args() -> Result<Args> {
     let mut tun = false;
     let mut print_tun_config = false;
     let mut tui = false;
+    let mut log_file = None;
     let mut command = None;
     let mut sing_box = None;
     let mut yes = false;
@@ -774,6 +805,12 @@ fn parse_args() -> Result<Args> {
             Some("--tun") => tun = true,
             Some("--print-tun-config") => print_tun_config = true,
             Some("--tui") => tui = true,
+            Some("--log-file") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--log-file requires a path or none"))?;
+                log_file = Some(PathBuf::from(value));
+            }
             Some("--sing-box") => {
                 let value = args
                     .next()
@@ -827,6 +864,7 @@ fn parse_args() -> Result<Args> {
         tun,
         print_tun_config,
         tui,
+        log_file,
     })
 }
 
@@ -861,7 +899,9 @@ Options:
       --ping                Measure the handshake latency of every server in the list and exit
       --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
       --print-tun-config    Print the generated sing-box config for --tun and exit
-      --tui                 Terminal UI with live counters and logs (q to quit)
+      --tui                 Terminal UI with live counters and logs (q to quit); the log is also
+                            written to ~/.config/vproxy/vproxy.log (5 MiB, 3 rotated copies kept)
+      --log-file <PATH>     --tui: log file instead of the default; none keeps logs in memory only
       --sing-box <PATH>     sing-box binary for --tun (default: ~/.config/vproxy/bin, PATH, Homebrew, Happ)
   -y, --yes                 Answer yes to questions (install prompts)
       --download            install-sing-box: skip package managers, download the GitHub release

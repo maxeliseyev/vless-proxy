@@ -10,6 +10,7 @@
 //! - [`proxy`]: the relay, routing, DNS, counters and the `serve` entry point.
 //! - [`system`]: TUN mode (sing-box), installing sing-box, services, the
 //!   xray-core sidecar.
+//! - [`logging`]: the size-capped, rotating log file behind the TUI.
 //! - [`ui`]: the terminal UI.
 //!
 //! The CLI (`main.rs`) only parses arguments and wires these together, so
@@ -17,6 +18,7 @@
 
 pub mod config;
 pub mod inbound;
+pub mod logging;
 pub mod protocol;
 pub mod proxy;
 pub mod system;
