@@ -2,6 +2,8 @@
 
 Стадия 1 плана [docs/h3-transport-plan.md](../../docs/h3-transport-plan.md): измерения без нашего кода. На одном VPS поднимаются сайт с HTTP/3 (Caddy), iperf3 и два сервера Hysteria 2. По нему тестировщики прогоняют [scripts/tspu-trial.sh](../../scripts/tspu-trial.sh) и закрывают гипотезы H1, H2, H3, H4, H6; второй такой же VPS у другого хостера даёт H7.
 
+Пошаговая настройка VPS, выбор провайдера, firewall, проверка стенда и разбор типовых сбоев — в [docs/trial-server-runbook.md](../../docs/trial-server-runbook.md).
+
 ## Что нужно
 
 - VPS с Docker и docker compose, открытые порты: 80/tcp, 443/tcp, 443/udp, 5201/tcp+udp, 8443/udp, 8444/udp.
