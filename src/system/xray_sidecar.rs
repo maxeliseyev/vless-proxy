@@ -36,8 +36,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         .arg("-c")
         .arg(temp.path())
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| {
@@ -46,6 +46,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
                 config.runtime.xray_path
             )
         })?;
+    crate::system::sidecar::forward_logs(&mut child, "xray");
 
     let status = child.wait().await?;
     if !status.success() {

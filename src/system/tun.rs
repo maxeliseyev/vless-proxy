@@ -164,7 +164,8 @@ pub fn build_sing_box_config(config: &Config, self_name: Option<&str>) -> Result
     };
 
     Ok(json!({
-        "log": { "level": if tun.log_level.is_empty() { "warn" } else { tun.log_level.as_str() }, "timestamp": true },
+        // Our log adds the timestamp; sing-box's own would be a second one.
+        "log": { "level": if tun.log_level.is_empty() { "warn" } else { tun.log_level.as_str() }, "timestamp": false },
         "dns": {
             "servers": dns_servers,
             "rules": [
@@ -242,8 +243,8 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
         .arg(temp.path())
         .arg("--disable-color")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| {
@@ -253,6 +254,7 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
                 crate::system::singbox::not_found_hint()
             )
         })?;
+    crate::system::sidecar::forward_logs(&mut child, "sing-box");
 
     tokio::select! {
         status = child.wait() => {

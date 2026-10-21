@@ -2,6 +2,7 @@
 //! running as a service, the xray-core sidecar fallback.
 
 pub mod service;
+pub mod sidecar;
 pub mod singbox;
 pub mod tun;
 pub mod xray_sidecar;
