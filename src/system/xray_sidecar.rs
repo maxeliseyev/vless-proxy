@@ -46,11 +46,16 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
                 config.runtime.xray_path
             )
         })?;
-    crate::system::sidecar::forward_logs(&mut child, "xray");
+    let output = crate::system::sidecar::forward_logs(&mut child, "xray");
 
     let status = child.wait().await?;
     if !status.success() {
-        bail!("xray-core sidecar exited with status {status}");
+        // Give the pipe readers a moment to deliver the final lines.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bail!(
+            "xray-core sidecar exited with {}",
+            output.exit_reason(status)
+        );
     }
 
     Ok(())

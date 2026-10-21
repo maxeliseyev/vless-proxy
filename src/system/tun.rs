@@ -254,12 +254,17 @@ pub async fn run(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) -> Re
                 crate::system::singbox::not_found_hint()
             )
         })?;
-    crate::system::sidecar::forward_logs(&mut child, "sing-box");
+    let output = crate::system::sidecar::forward_logs(&mut child, "sing-box");
 
     tokio::select! {
         status = child.wait() => {
             let status = status?;
-            bail!("sing-box TUN sidecar exited with status {status}");
+            // Give the pipe readers a moment to deliver the final lines.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            bail!(
+                "sing-box TUN sidecar exited with {}",
+                output.exit_reason(status)
+            );
         }
         _ = shutdown.changed() => {
             info!("Stopping sing-box TUN sidecar");
