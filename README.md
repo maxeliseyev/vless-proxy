@@ -1,6 +1,6 @@
 # vproxy
 
-Терминальный VLESS-клиент на Rust для macOS и Linux с **собственной реализацией ядра**: REALITY и XTLS Vision написаны на Rust, а не делегированы xray-core. Один бинарник, локальный SOCKS5/HTTP-прокси или системный VPN через TUN, TUI со статистикой, routing-правила.
+Терминальный VLESS-клиент на Rust для macOS и Linux с **собственной реализацией ядра**: REALITY и XTLS Vision написаны с нуля, а не делегированы xray-core. Один бинарник, локальный SOCKS5/HTTP-прокси или системный VPN через TUN, TUI со статистикой, routing-правила.
 
 Подробный план и история решений: [`ROADMAP.md`](ROADMAP.md).
 
