@@ -129,8 +129,8 @@ impl VlessUrl {
 }
 
 fn parse_host_port(input: &str) -> Result<(String, u16)> {
-    let input = input.split('?').next().unwrap_or(input);
-    let input = input.strip_suffix('/').unwrap_or(input);
+    // Authority ends at the path or the query: `host:443/?…`, `host:443/ws?…`.
+    let input = input.split(['/', '?']).next().unwrap_or(input);
 
     if input.starts_with('[') {
         let end_bracket = input
@@ -145,7 +145,7 @@ fn parse_host_port(input: &str) -> Result<(String, u16)> {
 
         let port: u16 = rest[1..]
             .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid port"))?;
+            .map_err(|_| anyhow::anyhow!("Invalid port {:?}", &rest[1..]))?;
 
         Ok((host.to_string(), port))
     } else {
@@ -156,7 +156,7 @@ fn parse_host_port(input: &str) -> Result<(String, u16)> {
         let host = &input[..last_colon];
         let port: u16 = input[last_colon + 1..]
             .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid port"))?;
+            .map_err(|_| anyhow::anyhow!("Invalid port {:?}", &input[last_colon + 1..]))?;
 
         Ok((host.to_string(), port))
     }
@@ -213,6 +213,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.remark, None);
+    }
+
+    #[test]
+    fn port_ends_at_path() {
+        let parsed = VlessUrl::parse(
+            "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:8443/ws?security=tls&type=ws",
+        )
+        .unwrap();
+        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.transport, "ws");
     }
 
     #[test]

@@ -451,9 +451,13 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
     };
     tokio::pin!(tun_failed);
 
+    let mut tun_done = false;
     let result = tokio::select! {
         result = core => result,
-        result = &mut tun_failed => result,
+        result = &mut tun_failed => {
+            tun_done = true;
+            result
+        }
         _ = shutdown_signal => {
             info!("Shutdown signal received, stopping server");
             let _ = shutdown_tx.send(true);
@@ -462,8 +466,9 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
     };
 
     // Give the TUN sidecar time to restore routes/DNS before we exit.
+    // A finished `tun_failed` must not be polled again.
     let _ = shutdown_tx.send(true);
-    if config.tun.enabled {
+    if config.tun.enabled && !tun_done {
         match tokio::time::timeout(Duration::from_secs(6), &mut tun_failed).await {
             Ok(Err(e)) if result.is_ok() => warn!("TUN sidecar stopped with error: {e}"),
             Err(_) => warn!("TUN sidecar did not stop in time"),
