@@ -21,7 +21,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         log.info("\(RatatoskEngine.version, privacy: .public)")
 
-        try await setTunnelNetworkSettings(RatatoskEngine.networkSettings(serverAddress: "ratatosk"))
+        try await setTunnelNetworkSettings(RatatoskEngine.networkSettings(serverAddress: "127.0.0.1"))
         let engine = RatatoskEngine(flow: packetFlow)
         try engine.start(link: link)
         self.engine = engine
