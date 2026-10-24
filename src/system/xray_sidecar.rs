@@ -7,10 +7,6 @@ use tempfile::Builder;
 use tokio::process::Command;
 use tracing::info;
 
-pub fn should_use(config: &Config) -> Result<bool> {
-    config.needs_xray_sidecar()
-}
-
 pub async fn run(config: Arc<Config>) -> Result<()> {
     let rendered = build_config_json(config.as_ref())?;
     let mut temp = Builder::new()

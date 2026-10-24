@@ -9,20 +9,23 @@
 //! - [`inbound`]: the local SOCKS5 and HTTP listeners.
 //! - [`proxy`]: the relay, routing, DNS, counters and the `serve` entry point.
 //! - [`system`]: TUN mode (sing-box), installing sing-box, services, the
-//!   xray-core sidecar.
+//!   xray-core sidecar. Feature `desktop`.
 //! - [`logging`]: the size-capped, rotating log file behind the TUI.
-//! - [`ui`]: the terminal UI.
+//! - [`ui`]: the terminal UI. Feature `tui`.
 //!
 //! The CLI (`main.rs`) only parses arguments and wires these together, so
-//! the library can be embedded without it.
+//! the library can be embedded without it: `--no-default-features` leaves
+//! the core that spawns no processes (the iOS build).
 
 pub mod config;
 pub mod inbound;
 pub mod logging;
 pub mod protocol;
 pub mod proxy;
+#[cfg(feature = "desktop")]
 pub mod system;
 pub mod transport;
+#[cfg(feature = "tui")]
 pub mod ui;
 
 pub use config::servers::{ServerEntry, ServerList};

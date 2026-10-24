@@ -12,7 +12,6 @@ use crate::protocol::vless::{self, Address, Request, VlessStream, XtlsDirect};
 use crate::proxy::dns::ResolverPolicy;
 use crate::proxy::routing::{Outbound, Router};
 use crate::proxy::stats::STATS;
-use crate::system::xray_sidecar;
 use crate::transport::tls::{self, MaybeTlsStream, WsInner};
 use crate::transport::ws::WsStream;
 use anyhow::{Context, Result};
@@ -411,7 +410,18 @@ pub async fn serve(config: Arc<Config>) -> Result<()> {
 /// switch servers while running (the TUI does this).
 pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let use_sidecar = xray_sidecar::should_use(config.as_ref())?;
+    let use_sidecar = config.needs_xray_sidecar()?;
+    #[cfg(not(feature = "desktop"))]
+    {
+        if use_sidecar {
+            anyhow::bail!(
+                "this server needs the xray-core sidecar, which this build does not include"
+            );
+        }
+        if config.tun.enabled {
+            anyhow::bail!("TUN mode runs sing-box, which this build does not include");
+        }
+    }
 
     let mut ctrl_c_stream =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -430,16 +440,16 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
     };
 
     let core = async {
+        #[cfg(feature = "desktop")]
         if use_sidecar {
-            xray_sidecar::run(config.clone()).await
-        } else {
-            serve_with_shutdown(config.clone(), active.clone(), shutdown_rx.clone()).await
+            return crate::system::xray_sidecar::run(config.clone()).await;
         }
+        serve_with_shutdown(config.clone(), active.clone(), shutdown_rx.clone()).await
     };
     let mut tun_task = config
         .tun
         .enabled
-        .then(|| tokio::spawn(crate::system::tun::run(config.clone(), shutdown_rx.clone())));
+        .then(|| tokio::spawn(run_tun(config.clone(), shutdown_rx.clone())));
     let tun_failed = async {
         match tun_task.as_mut() {
             Some(task) => match task.await {
@@ -477,6 +487,17 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
     }
 
     result
+}
+
+#[cfg(feature = "desktop")]
+async fn run_tun(config: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<()> {
+    crate::system::tun::run(config, shutdown).await
+}
+
+/// Never reached: `serve_with_server` refuses TUN configs in this build.
+#[cfg(not(feature = "desktop"))]
+async fn run_tun(_config: Arc<Config>, _shutdown: watch::Receiver<bool>) -> Result<()> {
+    anyhow::bail!("TUN mode is not available in this build")
 }
 
 async fn serve_with_shutdown(
