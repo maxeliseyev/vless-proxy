@@ -1,4 +1,4 @@
-# План: iOS-клиент на ядре vproxy
+# План: Ratatosk, iOS-клиент на ядре vproxy
 
 Статус: этап 0 сделан 2026-10-24, остальное план. Цель: VPN-приложение для iPhone, которое использует то же Rust-ядро, что и CLI (REALITY, Vision, Mux, XHTTP, WS, routing, подписки), без xray-core и sing-box.
 
