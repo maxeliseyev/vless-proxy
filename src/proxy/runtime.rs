@@ -694,11 +694,13 @@ async fn handle_socks5_tcp_request(
 
 /// Connect to `address:port` through routing and relay `client` there: the
 /// TCP path of the netstack, where there is no handshake to answer.
+/// `on_dialed` runs once the remote side is connected, before any data.
 pub(crate) async fn relay_tcp<C>(
     mut client: C,
     connector: &ProxyClient,
     address: Address,
     port: u16,
+    on_dialed: impl FnOnce(),
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -716,6 +718,7 @@ where
     .await
     .map_err(|_| anyhow::anyhow!("Connection timeout"))?
     .map_err(|error| anyhow::anyhow!("Failed to connect to target: {error}"))?;
+    on_dialed();
     let request_sent = prime_remote(&mut client, &mut remote, timeouts.write).await?;
     copy_bidirectional_with_timeouts(&mut client, &mut remote, timeouts, request_sent).await?;
     Ok(())

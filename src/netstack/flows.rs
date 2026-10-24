@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Records kept; enough for a screenful and then some, small in memory.
@@ -25,10 +25,21 @@ struct Inner {
     records: VecDeque<Arc<Flow>>,
 }
 
+/// Not measured (yet) in the millisecond fields of [`Flow`].
+const UNSET: u64 = u64::MAX;
+
 /// One TCP connection or UDP flow. Counters are updated while it runs.
 pub struct Flow {
     id: u64,
     started_ms: u64,
+    started: Instant,
+    /// From the start: the server connection was ready (TCP + TLS/REALITY,
+    /// including the wait for a handshake slot), the first byte came back,
+    /// the flow ended.
+    dial_ms: AtomicU64,
+    first_down_ms: AtomicU64,
+    ended_ms: AtomicU64,
+    error: Mutex<Option<String>>,
     proto: &'static str,
     host: String,
     port: u16,
@@ -45,12 +56,75 @@ impl Flow {
     }
 
     pub fn add_down(&self, n: usize) {
+        if n > 0 && self.first_down_ms.load(Ordering::Relaxed) == UNSET {
+            self.first_down_ms
+                .store(self.elapsed_ms(), Ordering::Relaxed);
+        }
         self.down.fetch_add(n as u64, Ordering::Relaxed);
     }
 
+    /// The connection to the server (or the direct target) is ready.
+    pub fn dialed(&self) {
+        self.dial_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
     pub fn close(&self, ok: bool) {
+        self.ended_ms.store(self.elapsed_ms(), Ordering::Relaxed);
         self.failed.store(!ok, Ordering::Relaxed);
         self.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Close as failed, keeping why.
+    pub fn fail(&self, error: String) {
+        *self.error.lock().expect("flow lock poisoned") = Some(error);
+        self.close(false);
+    }
+
+    /// One line for the diagnostic log, written when the flow ends:
+    /// `#12 tcp proxy example.com:443 dial 312ms first 640ms up 1.2 KB
+    /// down 18.0 KB in 34.1s: Read timeout: …`. A stall shows as bytes up,
+    /// a few KB down and a timeout.
+    pub fn summary(&self) -> String {
+        let mut line = format!(
+            "#{} {} {} {}:{}",
+            self.id,
+            self.proto,
+            self.route.as_str(),
+            self.host,
+            self.port
+        );
+        let ms = |field: &AtomicU64| Some(field.load(Ordering::Relaxed)).filter(|v| *v != UNSET);
+        if let Some(dial) = ms(&self.dial_ms) {
+            line += &format!(" dial {dial}ms");
+        }
+        if let Some(first) = ms(&self.first_down_ms) {
+            line += &format!(" first {first}ms");
+        }
+        line += &format!(
+            " up {} down {}",
+            human(self.up.load(Ordering::Relaxed)),
+            human(self.down.load(Ordering::Relaxed))
+        );
+        if let Some(ended) = ms(&self.ended_ms) {
+            line += &format!(" in {:.1}s", ended as f64 / 1000.0);
+        }
+        match self.error.lock().expect("flow lock poisoned").as_deref() {
+            Some(error) => line + ": " + error,
+            None if self.failed.load(Ordering::Relaxed) => line + ": failed",
+            None => line + ": ok",
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
+fn human(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
     }
 }
 
@@ -73,6 +147,11 @@ impl FlowLog {
         let flow = Arc::new(Flow {
             id: inner.next_id,
             started_ms,
+            started: Instant::now(),
+            dial_ms: AtomicU64::new(UNSET),
+            first_down_ms: AtomicU64::new(UNSET),
+            ended_ms: AtomicU64::new(UNSET),
+            error: Mutex::new(None),
             proto,
             host,
             port,
@@ -90,7 +169,8 @@ impl FlowLog {
     }
 
     /// The newest `max` records, newest first, as a JSON array of
-    /// `{id, t (unix ms), proto, host, port, route, up, down, open, failed}`.
+    /// `{id, t (unix ms), proto, host, port, route, up, down, open, failed,
+    /// dial, first (ms from t, or null), error (or null)}`.
     pub fn to_json(&self, max: usize) -> String {
         let inner = self.inner.lock().expect("flow log lock poisoned");
         let rows: Vec<serde_json::Value> = inner
@@ -99,6 +179,8 @@ impl FlowLog {
             .rev()
             .take(max)
             .map(|f| {
+                let ms =
+                    |field: &AtomicU64| Some(field.load(Ordering::Relaxed)).filter(|v| *v != UNSET);
                 serde_json::json!({
                     "id": f.id,
                     "t": f.started_ms,
@@ -110,6 +192,9 @@ impl FlowLog {
                     "down": f.down.load(Ordering::Relaxed),
                     "open": !f.closed.load(Ordering::Relaxed),
                     "failed": f.failed.load(Ordering::Relaxed),
+                    "dial": ms(&f.dial_ms),
+                    "first": ms(&f.first_down_ms),
+                    "error": *f.error.lock().expect("flow lock poisoned"),
                 })
             })
             .collect();
@@ -193,11 +278,46 @@ mod tests {
             (Some(10), Some(20))
         );
         assert_eq!(rows[1]["open"], false);
+        assert_eq!(rows[1]["dial"], serde_json::Value::Null);
         assert_eq!(
             serde_json::from_str::<Vec<serde_json::Value>>(&log.to_json(1))
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn summary_tells_a_stall_from_a_clean_close() {
+        let log = FlowLog::new(4);
+        let stalled = log.open("tcp", "example.com".into(), 443, Outbound::Proxy);
+        stalled.dialed();
+        stalled.add_up(600);
+        stalled.add_down(18 * 1024);
+        stalled.fail("Read timeout: no response from target in 30s".into());
+        let line = stalled.summary();
+        assert!(
+            line.starts_with("#1 tcp proxy example.com:443 dial "),
+            "{line}"
+        );
+        assert!(line.contains(" first "), "{line}");
+        assert!(line.contains(" up 600 B down 18.0 KB in "), "{line}");
+        assert!(
+            line.ends_with(": Read timeout: no response from target in 30s"),
+            "{line}"
+        );
+
+        let quiet = log.open("udp", "dns.test".into(), 53, Outbound::Direct);
+        quiet.close(true);
+        let line = quiet.summary();
+        assert!(!line.contains("dial") && !line.contains("first"), "{line}");
+        assert!(line.ends_with(": ok"), "{line}");
+
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&log.to_json(2)).unwrap();
+        assert_eq!(
+            rows[1]["error"],
+            "Read timeout: no response from target in 30s"
+        );
+        assert!(rows[1]["dial"].is_u64() && rows[1]["first"].is_u64());
     }
 }

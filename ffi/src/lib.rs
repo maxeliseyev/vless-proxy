@@ -136,6 +136,16 @@ fn start(
         }
     });
     tracing::info!("Tunnel core started for {}", config.server.endpoint());
+    let server = &config.server;
+    tracing::info!(
+        "server: {} {} flow {} sni {} fp {} mux {}",
+        server.security,
+        server.transport,
+        server.flow.as_deref().unwrap_or("-"),
+        server.sni.as_deref().unwrap_or("-"),
+        server.fingerprint.as_deref().unwrap_or("-"),
+        if config.mux.enabled { "on" } else { "off" },
+    );
     Ok(Tunnel {
         runtime: Some(runtime),
         flows,

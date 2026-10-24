@@ -127,12 +127,18 @@ impl Netstack {
             .open("tcp", address.to_string(), dst.port(), route);
         STATS.connection_opened();
         let client = Counted::new(tcp, flow.clone());
-        let result = relay_tcp(client, &self.connector, address.clone(), dst.port()).await;
-        if let Err(error) = &result {
-            STATS.error();
-            debug!("TCP to {address}:{}: {error}", dst.port());
+        let result = relay_tcp(client, &self.connector, address.clone(), dst.port(), || {
+            flow.dialed()
+        })
+        .await;
+        match result {
+            Ok(()) => flow.close(true),
+            Err(error) => {
+                STATS.error();
+                flow.fail(format!("{error:#}"));
+            }
         }
-        flow.close(result.is_ok());
+        info!("flow {}", flow.summary());
         STATS.connection_closed();
     }
 
@@ -146,6 +152,7 @@ impl Netstack {
             return;
         };
         let route = self.connector.router().decide(&address, dst.port());
+        let started = std::time::Instant::now();
         let outbound = match self.connector.open_udp(address.clone(), dst.port()).await {
             Ok(outbound) => outbound,
             Err(error) => {
@@ -161,8 +168,9 @@ impl Netstack {
                         .close(true);
                 } else {
                     warn!(
-                        "Failed to open UDP session to {address}:{}: {text}",
-                        dst.port()
+                        "Failed to open UDP session to {address}:{} after {}ms: {text}",
+                        dst.port(),
+                        started.elapsed().as_millis()
                     );
                 }
                 return;
@@ -181,6 +189,7 @@ impl Netstack {
         }
         // A UDP flow normally ends by timing out, which is not a failure.
         flow.close(true);
+        info!("flow {}", flow.summary());
     }
 
     /// Answer queries to the tunnel's DNS address from the fake pool.
