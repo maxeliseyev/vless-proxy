@@ -46,3 +46,7 @@ write_timeout_secs = 60
 # nothing moving on a working (or never used) connection: closed quietly
 idle_timeout_secs = 600
 max_connections = 1024
+# server connections being set up at once (TCP + TLS/REALITY); the rest wait.
+# Bursts of parallel handshakes to one SNI are reported to trigger TSPU
+# freezes. 0 = no limit
+max_parallel_handshakes = 3

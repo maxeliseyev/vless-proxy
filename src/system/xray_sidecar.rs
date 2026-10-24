@@ -167,6 +167,7 @@ mod tests {
                 write_timeout_secs: 60,
                 idle_timeout_secs: 600,
                 max_connections: 1024,
+                max_parallel_handshakes: 3,
                 xray_path: "xray".to_string(),
                 reality_engine: "auto".to_string(),
             },

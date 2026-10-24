@@ -556,6 +556,7 @@ fn proxy_config(
             write_timeout_secs: 10,
             idle_timeout_secs: 60,
             max_connections: 100,
+            max_parallel_handshakes: 3,
             xray_path: "xray".to_string(),
             reality_engine: "auto".to_string(),
         },

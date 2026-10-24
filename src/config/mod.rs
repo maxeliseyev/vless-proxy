@@ -399,6 +399,11 @@ pub struct RuntimeConfig {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Connections to the server being set up (TCP + TLS/REALITY) at the
+    /// same time; more wait their turn. A burst of parallel handshakes to one
+    /// SNI is what TSPU is reported to freeze on. 0 means no limit.
+    #[serde(default = "default_max_parallel_handshakes")]
+    pub max_parallel_handshakes: usize,
     #[serde(default = "default_xray_path")]
     pub xray_path: String,
     /// How REALITY connections are made: `auto` (native Rust unless the flow
@@ -442,6 +447,7 @@ fn default_runtime_config() -> RuntimeConfig {
         write_timeout_secs: default_write_timeout(),
         idle_timeout_secs: default_idle_timeout(),
         max_connections: default_max_connections(),
+        max_parallel_handshakes: default_max_parallel_handshakes(),
         xray_path: default_xray_path(),
         reality_engine: default_reality_engine(),
     }
@@ -469,6 +475,10 @@ fn default_idle_timeout() -> u64 {
 
 fn default_max_connections() -> usize {
     1024
+}
+
+fn default_max_parallel_handshakes() -> usize {
+    3
 }
 
 fn default_xray_path() -> String {
@@ -878,6 +888,7 @@ impl Config {
             write_timeout_secs: default_write_timeout(),
             idle_timeout_secs: default_idle_timeout(),
             max_connections: default_max_connections(),
+            max_parallel_handshakes: default_max_parallel_handshakes(),
             xray_path: default_xray_path(),
             reality_engine: default_reality_engine(),
         };
@@ -973,6 +984,7 @@ mod tests {
                 write_timeout_secs: default_write_timeout(),
                 idle_timeout_secs: default_idle_timeout(),
                 max_connections: default_max_connections(),
+                max_parallel_handshakes: default_max_parallel_handshakes(),
                 xray_path: default_xray_path(),
                 reality_engine: default_reality_engine(),
             },

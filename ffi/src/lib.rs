@@ -88,11 +88,18 @@ fn start(
     on_packet: PacketCallback,
     ctx: HostContext,
 ) -> anyhow::Result<Tunnel> {
-    let config = vproxy::config::servers::config_from_link(link, 0)?;
+    let mut config = vproxy::config::servers::config_from_link(link, 0)?;
     if config.needs_xray_sidecar()? {
         anyhow::bail!(
             "this server needs xray-core (XTLS Vision over plain TLS), which iOS cannot run"
         );
+    }
+    // A phone opens dozens of connections at once. Without Vision the server
+    // accepts Mux.Cool, so they share a few server connections instead of
+    // each costing a handshake. Vision cannot be multiplexed; there the
+    // handshake limiter (runtime.max_parallel_handshakes) paces them.
+    if config.server.vision_flow()?.is_none() {
+        config.mux.enabled = true;
     }
     // Two workers: the Packet Tunnel extension has a tight memory budget.
     let runtime = tokio::runtime::Builder::new_multi_thread()

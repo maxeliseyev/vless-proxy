@@ -147,6 +147,8 @@ pub struct ProxyClient {
     runtime: RuntimeConfig,
     router: Arc<Router>,
     mux: Option<Arc<MuxManager>>,
+    /// Admits server handshakes a few at a time (`runtime.max_parallel_handshakes`).
+    handshakes: Option<Arc<Semaphore>>,
     /// Whether `direct` may reach loopback, private and link-local addresses.
     /// On when the inbound listens on loopback only (the default); off for a
     /// network-reachable inbound, where it would turn the proxy into a pivot
@@ -172,12 +174,15 @@ impl ProxyClient {
             }
             Arc::new(MuxManager::new(concurrency))
         });
+        let handshakes = (runtime.max_parallel_handshakes > 0)
+            .then(|| Arc::new(Semaphore::new(runtime.max_parallel_handshakes)));
         Ok(Self {
             server,
             resolver: ResolverPolicy::new(dns)?,
             runtime,
             router: Arc::new(router),
             mux,
+            handshakes,
             private_direct: true,
         })
     }
@@ -283,10 +288,14 @@ impl ProxyClient {
         // Logged on failures: identify the account without printing the UUID.
         let key = format!("{}#{}", server.endpoint(), account_tag(&server.uuid));
         let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
+        let handshakes = self.handshakes.clone();
         let dial = async move {
-            let remote = timeout(connect_timeout, connect_remote(&server))
-                .await
-                .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+            let remote = admitted(
+                handshakes.as_deref(),
+                connect_timeout,
+                connect_remote(&server),
+            )
+            .await?;
             let request = Request {
                 uuid: server.uuid,
                 command: vless::Command::Mux,
@@ -366,9 +375,12 @@ impl ProxyClient {
             }
         }
 
-        let remote = timeout(connect_timeout, connect_remote(&server))
-            .await
-            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+        let remote = admitted(
+            self.handshakes.as_deref(),
+            connect_timeout,
+            connect_remote(&server),
+        )
+        .await?;
 
         // Vision applies to TCP sessions only (UDP keeps an empty flow), and
         // needs a transport that can hand us the raw socket.
@@ -1390,6 +1402,28 @@ pub async fn ping_servers(
     out
 }
 
+/// Run `dial` (a connection to the server) once `handshakes` admits it, so a
+/// burst of new sessions becomes a steady trickle of handshakes. Waiting for
+/// a slot and the dial itself each get `limit`.
+async fn admitted<T>(
+    handshakes: Option<&Semaphore>,
+    limit: Duration,
+    dial: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let _slot = match handshakes {
+        Some(handshakes) => Some(
+            timeout(limit, handshakes.acquire())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timed out waiting for a handshake slot"))?
+                .map_err(|_| anyhow::anyhow!("handshake limiter closed"))?,
+        ),
+        None => None,
+    };
+    timeout(limit, dial)
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timeout"))?
+}
+
 async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStream>> {
     let addr = (server.address.as_str(), server.port);
     match (server.transport_kind()?, server.transport_security()?) {
@@ -1667,6 +1701,40 @@ impl UdpTunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handshakes_are_admitted_a_few_at_a_time() {
+        let limiter = Arc::new(Semaphore::new(3));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let dials: Vec<_> = (0..10)
+            .map(|_| {
+                let (limiter, in_flight, peak) = (limiter.clone(), in_flight.clone(), peak.clone());
+                tokio::spawn(async move {
+                    admitted(Some(&limiter), Duration::from_secs(5), async {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for dial in dials {
+            dial.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_handshake_slot_times_out() {
+        let limiter = Semaphore::new(1);
+        let _busy = limiter.acquire().await.unwrap();
+        let result = admitted(Some(&limiter), Duration::from_millis(30), async { Ok(()) }).await;
+        assert!(result.unwrap_err().to_string().contains("handshake slot"));
+    }
 
     fn relay_timeouts(read_ms: u64, idle_ms: u64) -> RelayTimeouts {
         RelayTimeouts {
