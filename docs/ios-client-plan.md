@@ -1,6 +1,6 @@
 # План: Ratatosk, iOS-клиент на ядре vproxy
 
-Статус: этап 0 сделан 2026-10-24, этап 1 в работе, остальное план. Цель: VPN-приложение для iPhone, которое использует то же Rust-ядро, что и CLI (REALITY, Vision, Mux, XHTTP, WS, routing, подписки), без xray-core и sing-box.
+Статус: этапы 0–2 сделаны 2026-10-24, этап 1 проверен на живом сервере, дальше Xcode-проект. Цель: VPN-приложение для iPhone, которое использует то же Rust-ядро, что и CLI (REALITY, Vision, Mux, XHTTP, WS, routing, подписки), без xray-core и sing-box.
 
 ## 1. Чем iOS отличается от desktop
 
@@ -46,7 +46,7 @@
 
 0. **Сделано.** Cargo features: `cli = tui + desktop` по умолчанию; `tui` включает ratatui, crossterm и `ui`; `desktop` включает `system` (sing-box, xray-core, установщик, службы), tempfile и tar. Бинарь требует `cli`. `cargo build --lib --no-default-features --target aarch64-apple-ios` собирается, aws-lc-rs и форк rustls тоже. Без `desktop` конфиг с xray-сайдкаром или TUN через sing-box отклоняется понятной ошибкой. CI-джоб `ios-core` проверяет это на каждом push.
 1. **Rust netstack + FakeDNS, первая версия готова.** `src/netstack/`: `ipstack` превращает пакеты в TCP-потоки и UDP-потоки, каждый идёт через `ProxyClient` (TCP через `relay_tcp`, тот же relay и таймауты, что у SOCKS). `FakeDns` раздаёт адреса из `198.18.0.0/15` (DNS-сервер туннеля `198.18.0.2`), на сервер уходит домен; AAAA и HTTPS получают пустой ответ. `device::channel_device` — устройство на каналах для iOS. Проверено e2e-тестами на вручную собранных пакетах (TCP и UDP до mock VLESS-сервера). Осталось: прогон на живом сервере через `examples/utun.rs` (нужен sudo), замер памяти под нагрузкой, ICMP не поддерживается.
-2. **FFI-крейт `vproxy-ffi`** и скрипт сборки xcframework.
+2. **FFI готов.** Крейт `ffi/` (`vproxy-ffi`, staticlib, ручной C ABI в `ffi/include/ratatosk.h`): `ratatosk_start` по ссылке, `ratatosk_push_packet`, callback с пакетами наружу, `ratatosk_stats`, `ratatosk_stop`, `ratatosk_set_logger`. `scripts/build-xcframework.sh` собирает `target/RatatoskCore.xcframework` (iPhone + симулятор Apple Silicon, профиль `ios`). Swift-обёртка `ffi/swift/RatatoskCore.swift` (`RatatoskEngine`: настройки сети, цикл `readPackets`/`writePackets`) и шаблон `PacketTunnelProvider.swift`. Проверено: тесты через C ABI, C-программа в симуляторе iOS (DNS-пакет туда и обратно), Swift проходит typecheck против iOS SDK; бинарь со статической библиотекой после strip около 7 МБ. Пока нет: событий потоков для экрана лога, смены сервера, пинга.
 3. **Xcode-проект.** Приложение и Packet Tunnel extension, минимальный UI.
 4. **Доводка на устройстве.** Память под Instruments, Wi-Fi ↔ LTE (пересоздание соединений и Mux), сон и пробуждение, on-demand, kill switch (`includeAllNetworks`).
 5. **Распространение.**

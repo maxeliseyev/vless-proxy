@@ -1,0 +1,4 @@
+module RatatoskCore {
+    header "ratatosk.h"
+    export *
+}

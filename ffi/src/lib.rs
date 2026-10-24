@@ -1,0 +1,276 @@
+//! C ABI over the vproxy core for the Ratatosk iOS Packet Tunnel; the
+//! header is `include/ratatosk.h`, the Swift wrapper `swift/RatatoskCore.swift`.
+//!
+//! One [`Tunnel`] owns a small tokio runtime running the netstack. The host
+//! pushes packets it read from `packetFlow` with [`ratatosk_push_packet`] and
+//! gets the stack's packets back through the callback given to
+//! [`ratatosk_start`], to write to `packetFlow`. Both may be used from any
+//! thread; [`ratatosk_stop`] must not be called from the callback.
+
+use std::ffi::{c_char, c_void, CStr};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+use vproxy::netstack::device::channel_device;
+use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
+use vproxy::netstack::Netstack;
+use vproxy::proxy::stats::STATS;
+use vproxy::{ActiveServer, ProxyClient};
+
+/// Names handed out by the fake DNS before the oldest is reused.
+const FAKE_DNS_CAPACITY: u32 = 16_384;
+
+/// Called with each IP packet the stack sends towards the system.
+pub type PacketCallback = extern "C" fn(ctx: *mut c_void, packet: *const u8, len: usize);
+/// Called with each log line (NUL-terminated, valid only during the call).
+pub type LogCallback = extern "C" fn(ctx: *mut c_void, level: u8, line: *const c_char);
+
+/// The host's context pointer, passed back untouched. The host promises it
+/// stays valid and usable from any thread until `ratatosk_stop` returns.
+#[derive(Clone, Copy)]
+struct HostContext(*mut c_void);
+unsafe impl Send for HostContext {}
+unsafe impl Sync for HostContext {}
+
+pub struct Tunnel {
+    runtime: Option<tokio::runtime::Runtime>,
+    to_stack: mpsc::Sender<Vec<u8>>,
+    stop: watch::Sender<bool>,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RatatoskStats {
+    pub active: u64,
+    pub total: u64,
+    pub up: u64,
+    pub down: u64,
+    pub errors: u64,
+}
+
+/// Start the tunnel core for a `vless://` or `vpn://` link. Returns NULL on
+/// failure with the reason in `error` (truncated, NUL-terminated).
+///
+/// # Safety
+/// `link` is a NUL-terminated string; `error` is NULL or `error_len`
+/// writable bytes; `ctx` is valid for `on_packet` until `ratatosk_stop`.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_start(
+    link: *const c_char,
+    mtu: u16,
+    on_packet: PacketCallback,
+    ctx: *mut c_void,
+    error: *mut c_char,
+    error_len: usize,
+) -> *mut Tunnel {
+    let link = if link.is_null() {
+        Err(anyhow::anyhow!("link is NULL"))
+    } else {
+        CStr::from_ptr(link)
+            .to_str()
+            .map_err(|_| anyhow::anyhow!("link is not UTF-8"))
+    };
+    match link.and_then(|link| start(link, mtu, on_packet, HostContext(ctx))) {
+        Ok(tunnel) => Box::into_raw(Box::new(tunnel)),
+        Err(e) => {
+            write_error(error, error_len, &format!("{e:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn start(
+    link: &str,
+    mtu: u16,
+    on_packet: PacketCallback,
+    ctx: HostContext,
+) -> anyhow::Result<Tunnel> {
+    let config = vproxy::config::servers::config_from_link(link, 0)?;
+    if config.needs_xray_sidecar()? {
+        anyhow::bail!(
+            "this server needs xray-core (XTLS Vision over plain TLS), which iOS cannot run"
+        );
+    }
+    // Two workers: the Packet Tunnel extension has a tight memory budget.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("ratatosk")
+        .enable_all()
+        .build()?;
+    let _guard = runtime.enter();
+    let connector = ProxyClient::new(
+        ActiveServer::new(config.server.clone()),
+        config.dns.clone(),
+        config.runtime.clone(),
+        &config.routing,
+        &config.mux,
+    )?;
+    let netstack = Netstack {
+        connector,
+        dns: Arc::new(FakeDns::new(DEFAULT_POOL, FAKE_DNS_CAPACITY)),
+        mtu,
+    };
+    let (device, mut host) = channel_device();
+    let (stop, shutdown) = watch::channel(false);
+    runtime.spawn(async move {
+        if let Err(e) = netstack.run(device, shutdown).await {
+            tracing::error!("netstack stopped: {e:#}");
+        }
+    });
+    runtime.spawn(async move {
+        let ctx = ctx;
+        while let Some(packet) = host.from_stack.recv().await {
+            on_packet(ctx.0, packet.as_ptr(), packet.len());
+        }
+    });
+    tracing::info!("Tunnel core started for {}", config.server.endpoint());
+    Ok(Tunnel {
+        runtime: Some(runtime),
+        to_stack: host.to_stack,
+        stop,
+    })
+}
+
+/// Hand one IP packet read from the system to the stack. Returns false when
+/// it was dropped (queue full or tunnel stopping).
+///
+/// # Safety
+/// `tunnel` comes from `ratatosk_start`; `packet` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_push_packet(
+    tunnel: *const Tunnel,
+    packet: *const u8,
+    len: usize,
+) -> bool {
+    let Some(tunnel) = tunnel.as_ref() else {
+        return false;
+    };
+    if packet.is_null() || len == 0 {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(packet, len).to_vec();
+    tunnel.to_stack.try_send(bytes).is_ok()
+}
+
+/// Process-wide traffic counters.
+///
+/// # Safety
+/// `out` is NULL or points to a writable `RatatoskStats`.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_stats(out: *mut RatatoskStats) {
+    let Some(out) = out.as_mut() else { return };
+    let s = STATS.snapshot();
+    *out = RatatoskStats {
+        active: s.active as u64,
+        total: s.total,
+        up: s.up,
+        down: s.down,
+        errors: s.errors,
+    };
+}
+
+/// Stop the tunnel and free it; waits up to two seconds for tasks to end.
+///
+/// # Safety
+/// `tunnel` comes from `ratatosk_start` and is not used afterwards. Not to
+/// be called from inside a callback.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_stop(tunnel: *mut Tunnel) {
+    if tunnel.is_null() {
+        return;
+    }
+    let mut tunnel = Box::from_raw(tunnel);
+    let _ = tunnel.stop.send(true);
+    if let Some(runtime) = tunnel.runtime.take() {
+        runtime.shutdown_timeout(Duration::from_secs(2));
+    }
+    tracing::info!("Tunnel core stopped");
+}
+
+/// Send the core's logs to `on_log`, up to `max_level` (1 error .. 5 trace).
+/// Only the first call in a process takes effect.
+///
+/// # Safety
+/// `ctx` stays valid for `on_log` for the life of the process.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_set_logger(on_log: LogCallback, ctx: *mut c_void, max_level: u8) {
+    let level = match max_level {
+        0 | 1 => tracing::Level::ERROR,
+        2 => tracing::Level::WARN,
+        3 => tracing::Level::INFO,
+        4 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    };
+    let ctx = HostContext(ctx);
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(move || LineWriter {
+            on_log,
+            ctx,
+            buf: Vec::new(),
+        })
+        .try_init();
+}
+
+/// `vproxy-ffi <version>`, static.
+#[no_mangle]
+pub extern "C" fn ratatosk_version() -> *const c_char {
+    concat!("vproxy-ffi ", env!("CARGO_PKG_VERSION"), "\0")
+        .as_ptr()
+        .cast()
+}
+
+/// Collects one formatted event and hands it to the host on drop.
+struct LineWriter {
+    on_log: LogCallback,
+    ctx: HostContext,
+    buf: Vec<u8>,
+}
+
+impl Write for LineWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for LineWriter {
+    fn drop(&mut self) {
+        while self.buf.last().is_some_and(|b| *b == b'\n') {
+            self.buf.pop();
+        }
+        if self.buf.is_empty() {
+            return;
+        }
+        self.buf.retain(|b| *b != 0);
+        let start = self.buf.iter().take_while(|b| **b == b' ').count();
+        self.buf.drain(..start);
+        let level = match self.buf.split(|b| *b == b' ').find(|w| !w.is_empty()) {
+            Some(b"ERROR") => 1,
+            Some(b"WARN") => 2,
+            Some(b"INFO") => 3,
+            Some(b"DEBUG") => 4,
+            _ => 5,
+        };
+        self.buf.push(0);
+        (self.on_log)(self.ctx.0, level, self.buf.as_ptr().cast());
+    }
+}
+
+unsafe fn write_error(error: *mut c_char, error_len: usize, message: &str) {
+    if error.is_null() || error_len == 0 {
+        return;
+    }
+    let bytes = message.as_bytes();
+    let n = bytes.len().min(error_len - 1);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), error.cast::<u8>(), n);
+    *error.add(n) = 0;
+}

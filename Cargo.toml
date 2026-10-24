@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "ffi"]
+
 [package]
 name = "vproxy"
 version = "0.15.2"
@@ -67,3 +70,10 @@ tun-rs = { version = "2.8.13", default-features = false, features = ["async"] }
 # ClientConfig::client_hello_rewriter (Chrome TLS fingerprint).
 # Branch reality-0.23, pinned to the commit that was tested.
 rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "7df70d14" }
+
+# The iOS static library (scripts/build-xcframework.sh): smaller and a bit
+# faster than plain release, without slowing down desktop release builds.
+[profile.ios]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

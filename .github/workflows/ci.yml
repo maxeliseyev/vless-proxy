@@ -49,3 +49,7 @@ jobs:
       - run: cargo clippy --lib --no-default-features --target aarch64-apple-ios -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
       - run: cargo build --lib --no-default-features --target aarch64-apple-ios-sim
       - run: cargo test --no-default-features
+      - run: cargo clippy -p vproxy-ffi --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
+      - run: cargo test -p vproxy-ffi
+      - run: cargo build -p vproxy-ffi --target aarch64-apple-ios
+      - run: xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -I ffi/include -typecheck ffi/swift/*.swift

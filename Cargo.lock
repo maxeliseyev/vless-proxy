@@ -3426,6 +3426,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vproxy-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "etherparse",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vproxy",
+]
+
+[[package]]
 name = "vtparse"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
