@@ -680,6 +680,35 @@ async fn handle_socks5_tcp_request(
     result.map(|_| ())
 }
 
+/// Connect to `address:port` through routing and relay `client` there: the
+/// TCP path of the netstack, where there is no handshake to answer.
+pub(crate) async fn relay_tcp<C>(
+    mut client: C,
+    connector: &ProxyClient,
+    address: Address,
+    port: u16,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let runtime = connector.runtime();
+    let timeouts = RelayTimeouts {
+        read: Duration::from_secs(runtime.read_timeout_secs),
+        write: Duration::from_secs(runtime.write_timeout_secs),
+        idle: Duration::from_secs(runtime.idle_timeout_secs),
+    };
+    let mut remote = timeout(
+        Duration::from_secs(runtime.connect_timeout_secs),
+        connector.open_tcp(address, port),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Connection timeout"))?
+    .map_err(|error| anyhow::anyhow!("Failed to connect to target: {error}"))?;
+    let request_sent = prime_remote(&mut client, &mut remote, timeouts.write).await?;
+    copy_bidirectional_with_timeouts(&mut client, &mut remote, timeouts, request_sent).await?;
+    Ok(())
+}
+
 async fn handle_socks5_udp_associate(
     mut control: TcpStream,
     connector: ProxyClient,
@@ -1413,8 +1442,8 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
 /// first client payload, or, if none arrives within 500 ms, with an empty
 /// Vision padding block (or alone when Vision is off).
 /// Returns whether any client bytes were forwarded.
-async fn prime_remote(
-    client: &mut TcpStream,
+async fn prime_remote<C: AsyncRead + Unpin>(
+    client: &mut C,
     remote: &mut OutboundStream,
     write_timeout: Duration,
 ) -> Result<bool> {

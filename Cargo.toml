@@ -54,9 +54,13 @@ crossterm = { version = "0.29", optional = true }
 tokio-util = "0.7"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Userspace TCP/IP stack for the in-process TUN (iOS Packet Tunnel).
+ipstack = "1.0.1"
 
 [dev-dependencies]
 tempfile = "3"
+etherparse = "0.20"
+tun-rs = { version = "2.8.13", default-features = false, features = ["async"] }
 
 [patch.crates-io]
 # vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook (REALITY) and

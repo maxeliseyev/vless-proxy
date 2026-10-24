@@ -10,6 +10,8 @@
 //! - [`proxy`]: the relay, routing, DNS, counters and the `serve` entry point.
 //! - [`system`]: TUN mode (sing-box), installing sing-box, services, the
 //!   xray-core sidecar. Feature `desktop`.
+//! - [`netstack`]: in-process TUN (userspace TCP/IP and fake DNS) for hosts
+//!   that hand over packets, such as the iOS Packet Tunnel.
 //! - [`logging`]: the size-capped, rotating log file behind the TUI.
 //! - [`ui`]: the terminal UI. Feature `tui`.
 //!
@@ -20,6 +22,7 @@
 pub mod config;
 pub mod inbound;
 pub mod logging;
+pub mod netstack;
 pub mod protocol;
 pub mod proxy;
 #[cfg(feature = "desktop")]

@@ -803,3 +803,215 @@ fn reserve_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     Ok(listener.local_addr()?.port())
 }
+
+// --- netstack: hand-built IP packets through the in-process TUN ---
+
+use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use vproxy::netstack::device::{channel_device, HostPackets};
+use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
+use vproxy::netstack::Netstack;
+
+const APP_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn netstack_carries_tcp_to_a_fake_dns_name() -> Result<()> {
+    let server = spawn_mock_vless_server(|mut stream| async move {
+        let request = read_vless_request(&mut stream).await?;
+        assert_eq!(request.command, vless::Command::Tcp);
+        assert_eq!(
+            request.address,
+            vless::Address::Domain("echo.example".to_string())
+        );
+        assert_eq!(request.port, 7000);
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"ping");
+        send_vless_response(&mut stream).await?;
+        stream.write_all(b"pong").await?;
+        stream.flush().await?;
+        Ok(())
+    })
+    .await?;
+    let (mut host, _stop) = spawn_netstack(server.addr)?;
+
+    let fake = resolve(&mut host, "echo.example").await?;
+    assert!(fake.octets()[..2] == [198, 18], "fake address {fake}");
+
+    let (app, target) = ((APP_IP, 40_000), (fake, 7000));
+    host.to_stack
+        .send(tcp_packet(app, target, 1000, None, b""))
+        .await?;
+    let syn_ack = next_tcp(&mut host, |p| p.syn).await?;
+    assert_eq!(syn_ack.ack, 1001);
+    let their_seq = syn_ack.seq.wrapping_add(1);
+    host.to_stack
+        .send(tcp_packet(app, target, 1001, Some(their_seq), b""))
+        .await?;
+    host.to_stack
+        .send(tcp_packet(app, target, 1001, Some(their_seq), b"ping"))
+        .await?;
+
+    let reply = next_tcp(&mut host, |p| !p.payload.is_empty()).await?;
+    assert_eq!(reply.payload, b"pong");
+    assert_eq!((reply.src, reply.dst), (target.into(), app.into()));
+    server.finish().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn netstack_carries_udp_to_a_fake_dns_name() -> Result<()> {
+    let server = spawn_mock_vless_server(|mut stream| async move {
+        let request = read_vless_request(&mut stream).await?;
+        assert_eq!(request.command, vless::Command::Udp);
+        assert_eq!(
+            request.address,
+            vless::Address::Domain("dns.example".to_string())
+        );
+        assert_eq!(request.port, 5353);
+        let payload = vless::read_udp_frame(&mut stream).await?;
+        assert_eq!(payload, b"hello-udp");
+        send_vless_response(&mut stream).await?;
+        vless::write_udp_frame(&mut stream, b"hello-back").await?;
+        stream.flush().await?;
+        Ok(())
+    })
+    .await?;
+    let (mut host, _stop) = spawn_netstack(server.addr)?;
+
+    let fake = resolve(&mut host, "dns.example").await?;
+    host.to_stack
+        .send(udp_packet((APP_IP, 50_000), (fake, 5353), b"hello-udp"))
+        .await?;
+    let reply = next_udp(&mut host, (fake, 5353).into()).await?;
+    assert_eq!(reply, b"hello-back");
+    server.finish().await?;
+    Ok(())
+}
+
+/// Netstack over a channel device, wired to the mock server; dropping the
+/// returned sender stops it.
+fn spawn_netstack(
+    server_addr: SocketAddr,
+) -> Result<(HostPackets, tokio::sync::watch::Sender<bool>)> {
+    let config = proxy_config(
+        "socks5",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        server_addr,
+        RoutingConfig::default(),
+        "tcp",
+    );
+    let connector = vproxy::ProxyClient::new(
+        ActiveServer::new(config.server.clone()),
+        config.dns.clone(),
+        config.runtime.clone(),
+        &config.routing,
+        &config.mux,
+    )?;
+    let netstack = Netstack {
+        connector,
+        dns: Arc::new(FakeDns::new(DEFAULT_POOL, 1024)),
+        mtu: 1500,
+    };
+    let (device, host) = channel_device();
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(netstack.run(device, shutdown));
+    Ok((host, stop))
+}
+
+/// Ask the tunnel's DNS (198.18.0.2) for `name`, return the A record.
+async fn resolve(host: &mut HostPackets, name: &str) -> Result<Ipv4Addr> {
+    let dns = (Ipv4Addr::new(198, 18, 0, 2), 53);
+    let mut query = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 1, 0, 1]);
+    host.to_stack
+        .send(udp_packet((APP_IP, 53_000), dns, &query))
+        .await?;
+    let reply = next_udp(host, dns.into()).await?;
+    assert_eq!(&reply[..2], &[0xab, 0xcd]);
+    let ip: [u8; 4] = reply[reply.len() - 4..].try_into()?;
+    Ok(ip.into())
+}
+
+fn udp_packet(src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16), payload: &[u8]) -> Vec<u8> {
+    let builder = PacketBuilder::ipv4(src.0.octets(), dst.0.octets(), 64).udp(src.1, dst.1);
+    let mut packet = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut packet, payload).unwrap();
+    packet
+}
+
+/// A SYN when `ack` is `None`, else an ACK (with PSH when there is data).
+fn tcp_packet(
+    src: (Ipv4Addr, u16),
+    dst: (Ipv4Addr, u16),
+    seq: u32,
+    ack: Option<u32>,
+    payload: &[u8],
+) -> Vec<u8> {
+    let builder =
+        PacketBuilder::ipv4(src.0.octets(), dst.0.octets(), 64).tcp(src.1, dst.1, seq, 65_535);
+    let builder = match ack {
+        None => builder.syn(),
+        Some(ack) if payload.is_empty() => builder.ack(ack),
+        Some(ack) => builder.ack(ack).psh(),
+    };
+    let mut packet = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut packet, payload).unwrap();
+    packet
+}
+
+struct TcpSeen {
+    src: SocketAddr,
+    dst: SocketAddr,
+    syn: bool,
+    seq: u32,
+    ack: u32,
+    payload: Vec<u8>,
+}
+
+/// Next TCP packet from the stack that `wanted` accepts; others are skipped.
+async fn next_tcp(host: &mut HostPackets, wanted: impl Fn(&TcpSeen) -> bool) -> Result<TcpSeen> {
+    loop {
+        let packet = timeout(TEST_TIMEOUT, host.from_stack.recv())
+            .await?
+            .ok_or_else(|| anyhow!("netstack closed"))?;
+        let sliced = SlicedPacket::from_ip(&packet)?;
+        let (Some(NetSlice::Ipv4(ip)), Some(TransportSlice::Tcp(tcp))) =
+            (&sliced.net, &sliced.transport)
+        else {
+            continue;
+        };
+        let seen = TcpSeen {
+            src: (ip.header().source_addr(), tcp.source_port()).into(),
+            dst: (ip.header().destination_addr(), tcp.destination_port()).into(),
+            syn: tcp.syn(),
+            seq: tcp.sequence_number(),
+            ack: tcp.acknowledgment_number(),
+            payload: tcp.payload().to_vec(),
+        };
+        if wanted(&seen) {
+            return Ok(seen);
+        }
+    }
+}
+
+/// Payload of the next UDP packet from `from`.
+async fn next_udp(host: &mut HostPackets, from: SocketAddr) -> Result<Vec<u8>> {
+    loop {
+        let packet = timeout(TEST_TIMEOUT, host.from_stack.recv())
+            .await?
+            .ok_or_else(|| anyhow!("netstack closed"))?;
+        let sliced = SlicedPacket::from_ip(&packet)?;
+        if let (Some(NetSlice::Ipv4(ip)), Some(TransportSlice::Udp(udp))) =
+            (&sliced.net, &sliced.transport)
+        {
+            let src: SocketAddr = (ip.header().source_addr(), udp.source_port()).into();
+            if src == from {
+                return Ok(udp.payload().to_vec());
+            }
+        }
+    }
+}
