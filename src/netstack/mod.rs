@@ -12,12 +12,14 @@
 
 pub mod device;
 pub mod fakedns;
+pub mod flows;
 
 use crate::protocol::vless::{self, Address};
 use crate::proxy::runtime::{relay_tcp, ProxyClient, UdpOutbound};
 use crate::proxy::stats::STATS;
 use anyhow::Result;
 use fakedns::FakeDns;
+use flows::{Counted, Flow, FlowLog};
 use ipstack::{
     IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream, TcpConfig,
 };
@@ -36,6 +38,8 @@ pub struct Netstack {
     pub dns: Arc<FakeDns>,
     /// MTU of the tunnel interface; packets are read into a buffer this big.
     pub mtu: u16,
+    /// Every TCP connection and UDP flow is recorded here for the host's log.
+    pub flows: Arc<FlowLog>,
 }
 
 impl Netstack {
@@ -117,11 +121,18 @@ impl Netstack {
             return;
         };
         debug!("TCP {} -> {address}:{}", tcp.local_addr(), dst.port());
+        let route = self.connector.router().decide(&address, dst.port());
+        let flow = self
+            .flows
+            .open("tcp", address.to_string(), dst.port(), route);
         STATS.connection_opened();
-        if let Err(error) = relay_tcp(tcp, &self.connector, address.clone(), dst.port()).await {
+        let client = Counted::new(tcp, flow.clone());
+        let result = relay_tcp(client, &self.connector, address.clone(), dst.port()).await;
+        if let Err(error) = &result {
             STATS.error();
             debug!("TCP to {address}:{}: {error}", dst.port());
         }
+        flow.close(result.is_ok());
         STATS.connection_closed();
     }
 
@@ -134,13 +145,20 @@ impl Netstack {
             debug!("UDP to unknown fake address {dst}, dropped");
             return;
         };
+        let route = self.connector.router().decide(&address, dst.port());
         let outbound = match self.connector.open_udp(address.clone(), dst.port()).await {
             Ok(outbound) => outbound,
             Err(error) => {
-                // Vision refuses UDP/443 on purpose: QUIC falls back to TCP.
+                // Vision refuses UDP/443 on purpose: QUIC falls back to TCP,
+                // which then shows up in the log; the refusal itself does not.
                 let text = error.to_string();
-                if text.contains("XTLS rejected") || text.contains("blocked by routing") {
+                if text.contains("XTLS rejected") {
                     debug!("Dropping UDP to {address}:{}: {text}", dst.port());
+                } else if text.contains("blocked by routing") {
+                    debug!("Dropping UDP to {address}:{}: {text}", dst.port());
+                    self.flows
+                        .open("udp", address.to_string(), dst.port(), route)
+                        .close(true);
                 } else {
                     warn!(
                         "Failed to open UDP session to {address}:{}: {text}",
@@ -151,13 +169,18 @@ impl Netstack {
             }
         };
         debug!("UDP {} -> {address}:{}", udp.local_addr(), dst.port());
+        let flow = self
+            .flows
+            .open("udp", address.to_string(), dst.port(), route);
         let result = match outbound {
-            UdpOutbound::Proxy(remote) => relay_udp_vless(&mut udp, *remote).await,
-            UdpOutbound::Direct(socket) => relay_udp_direct(&mut udp, socket).await,
+            UdpOutbound::Proxy(remote) => relay_udp_vless(&mut udp, *remote, &flow).await,
+            UdpOutbound::Direct(socket) => relay_udp_direct(&mut udp, socket, &flow).await,
         };
-        if let Err(error) = result {
+        if let Err(error) = &result {
             debug!("UDP to {address}:{} ended: {error}", dst.port());
         }
+        // A UDP flow normally ends by timing out, which is not a failure.
+        flow.close(true);
     }
 
     /// Answer queries to the tunnel's DNS address from the fake pool.
@@ -181,6 +204,7 @@ impl Netstack {
 async fn relay_udp_vless(
     udp: &mut IpStackUdpStream,
     remote: crate::proxy::runtime::RemoteStream,
+    flow: &Flow,
 ) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(remote);
     let (mut udp_in, mut udp_out) = tokio::io::split(udp);
@@ -194,12 +218,14 @@ async fn relay_udp_vless(
             vless::write_udp_frame(&mut writer, &buf[..n]).await?;
             writer.flush().await?;
             STATS.add_up(n);
+            flow.add_up(n);
         }
     };
     let down = async {
         loop {
             let payload = vless::read_udp_frame(&mut reader).await?;
             STATS.add_down(payload.len());
+            flow.add_down(payload.len());
             udp_out.write_all(&payload).await?;
         }
     };
@@ -210,7 +236,11 @@ async fn relay_udp_vless(
 }
 
 /// One UDP flow sent straight from this host (routing said `direct`).
-async fn relay_udp_direct(udp: &mut IpStackUdpStream, socket: tokio::net::UdpSocket) -> Result<()> {
+async fn relay_udp_direct(
+    udp: &mut IpStackUdpStream,
+    socket: tokio::net::UdpSocket,
+    flow: &Flow,
+) -> Result<()> {
     let (mut udp_in, mut udp_out) = tokio::io::split(udp);
     let up = async {
         let mut buf = vec![0u8; 65_535];
@@ -221,6 +251,7 @@ async fn relay_udp_direct(udp: &mut IpStackUdpStream, socket: tokio::net::UdpSoc
             }
             socket.send(&buf[..n]).await?;
             STATS.add_up(n);
+            flow.add_up(n);
         }
     };
     let down = async {
@@ -228,6 +259,7 @@ async fn relay_udp_direct(udp: &mut IpStackUdpStream, socket: tokio::net::UdpSoc
         loop {
             let n = socket.recv(&mut buf).await?;
             STATS.add_down(n);
+            flow.add_down(n);
             udp_out.write_all(&buf[..n]).await?;
         }
     };

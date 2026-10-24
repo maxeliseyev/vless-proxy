@@ -18,6 +18,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use vproxy::netstack::device::channel_device;
 use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
+use vproxy::netstack::flows::{FlowLog, DEFAULT_CAPACITY};
 use vproxy::netstack::Netstack;
 use vproxy::{ActiveServer, ProxyClient};
 
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
         connector,
         dns: Arc::new(FakeDns::new(DEFAULT_POOL, 16_384)),
         mtu: MTU,
+        flows: Arc::new(FlowLog::new(DEFAULT_CAPACITY)),
     };
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(netstack.run(device, shutdown));

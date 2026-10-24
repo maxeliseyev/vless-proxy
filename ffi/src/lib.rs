@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use vproxy::netstack::device::channel_device;
 use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
+use vproxy::netstack::flows::{FlowLog, DEFAULT_CAPACITY};
 use vproxy::netstack::Netstack;
 use vproxy::proxy::stats::STATS;
 use vproxy::{ActiveServer, ProxyClient};
@@ -35,6 +36,7 @@ unsafe impl Sync for HostContext {}
 
 pub struct Tunnel {
     runtime: Option<tokio::runtime::Runtime>,
+    flows: Arc<FlowLog>,
     to_stack: mpsc::Sender<Vec<u8>>,
     stop: watch::Sender<bool>,
 }
@@ -106,10 +108,12 @@ fn start(
         &config.routing,
         &config.mux,
     )?;
+    let flows = Arc::new(FlowLog::new(DEFAULT_CAPACITY));
     let netstack = Netstack {
         connector,
         dns: Arc::new(FakeDns::new(DEFAULT_POOL, FAKE_DNS_CAPACITY)),
         mtu,
+        flows: flows.clone(),
     };
     let (device, mut host) = channel_device();
     let (stop, shutdown) = watch::channel(false);
@@ -127,6 +131,7 @@ fn start(
     tracing::info!("Tunnel core started for {}", config.server.endpoint());
     Ok(Tunnel {
         runtime: Some(runtime),
+        flows,
         to_stack: host.to_stack,
         stop,
     })
@@ -168,6 +173,32 @@ pub unsafe extern "C" fn ratatosk_stats(out: *mut RatatoskStats) {
         down: s.down,
         errors: s.errors,
     };
+}
+
+/// The newest `max` flows, newest first, as a JSON array of
+/// `{id, t, proto, host, port, route, up, down, open, failed}` (`t` in unix
+/// ms). Writes it NUL-terminated into `buf` when it fits and returns its
+/// length without the NUL; a return of `buf_len` or more means it did not
+/// fit and nothing was written.
+///
+/// # Safety
+/// `tunnel` comes from `ratatosk_start`; `buf` is NULL or `buf_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_flows_json(
+    tunnel: *const Tunnel,
+    max: usize,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> usize {
+    let Some(tunnel) = tunnel.as_ref() else {
+        return 0;
+    };
+    let json = tunnel.flows.to_json(max);
+    if !buf.is_null() && json.len() < buf_len {
+        std::ptr::copy_nonoverlapping(json.as_ptr(), buf.cast::<u8>(), json.len());
+        *buf.add(json.len()) = 0;
+    }
+    json.len()
 }
 
 /// Stop the tunnel and free it; waits up to two seconds for tasks to end.

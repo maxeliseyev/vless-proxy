@@ -45,6 +45,12 @@ bool ratatosk_push_packet(const RatatoskTunnel *tunnel, const uint8_t *packet, s
 
 void ratatosk_stats(RatatoskStats *out);
 
+// The newest `max` flows, newest first, as a JSON array of
+// {id, t (unix ms), proto, host, port, route, up, down, open, failed}.
+// Written NUL-terminated into `buf` when it fits; returns the JSON length.
+// A result >= buf_len means it did not fit and nothing was written.
+size_t ratatosk_flows_json(const RatatoskTunnel *tunnel, size_t max, char *buf, size_t buf_len);
+
 // Stop and free. Not from inside a callback.
 void ratatosk_stop(RatatoskTunnel *tunnel);
 

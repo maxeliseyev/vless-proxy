@@ -809,6 +809,7 @@ fn reserve_port() -> Result<u16> {
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use vproxy::netstack::device::{channel_device, HostPackets};
 use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
+use vproxy::netstack::flows::FlowLog;
 use vproxy::netstack::Netstack;
 
 const APP_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -832,7 +833,7 @@ async fn netstack_carries_tcp_to_a_fake_dns_name() -> Result<()> {
         Ok(())
     })
     .await?;
-    let (mut host, _stop) = spawn_netstack(server.addr)?;
+    let (mut host, _stop, flows) = spawn_netstack(server.addr)?;
 
     let fake = resolve(&mut host, "echo.example").await?;
     assert!(fake.octets()[..2] == [198, 18], "fake address {fake}");
@@ -855,6 +856,23 @@ async fn netstack_carries_tcp_to_a_fake_dns_name() -> Result<()> {
     assert_eq!(reply.payload, b"pong");
     assert_eq!((reply.src, reply.dst), (target.into(), app.into()));
     server.finish().await?;
+
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&flows.to_json(10))?;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(
+        (&row["proto"], &row["host"], &row["port"], &row["route"]),
+        (
+            &"tcp".into(),
+            &"echo.example".into(),
+            &7000.into(),
+            &"proxy".into()
+        )
+    );
+    assert_eq!(
+        (row["up"].as_u64(), row["down"].as_u64()),
+        (Some(4), Some(4))
+    );
     Ok(())
 }
 
@@ -876,7 +894,7 @@ async fn netstack_carries_udp_to_a_fake_dns_name() -> Result<()> {
         Ok(())
     })
     .await?;
-    let (mut host, _stop) = spawn_netstack(server.addr)?;
+    let (mut host, _stop, flows) = spawn_netstack(server.addr)?;
 
     let fake = resolve(&mut host, "dns.example").await?;
     host.to_stack
@@ -885,6 +903,13 @@ async fn netstack_carries_udp_to_a_fake_dns_name() -> Result<()> {
     let reply = next_udp(&mut host, (fake, 5353).into()).await?;
     assert_eq!(reply, b"hello-back");
     server.finish().await?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&flows.to_json(10))?;
+    assert_eq!(rows[0]["host"], "dns.example");
+    assert_eq!(rows[0]["proto"], "udp");
+    assert_eq!(
+        (rows[0]["up"].as_u64(), rows[0]["down"].as_u64()),
+        (Some(9), Some(10))
+    );
     Ok(())
 }
 
@@ -892,7 +917,7 @@ async fn netstack_carries_udp_to_a_fake_dns_name() -> Result<()> {
 /// returned sender stops it.
 fn spawn_netstack(
     server_addr: SocketAddr,
-) -> Result<(HostPackets, tokio::sync::watch::Sender<bool>)> {
+) -> Result<(HostPackets, tokio::sync::watch::Sender<bool>, Arc<FlowLog>)> {
     let config = proxy_config(
         "socks5",
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -911,11 +936,13 @@ fn spawn_netstack(
         connector,
         dns: Arc::new(FakeDns::new(DEFAULT_POOL, 1024)),
         mtu: 1500,
+        flows: Arc::new(FlowLog::new(64)),
     };
+    let flows = netstack.flows.clone();
     let (device, host) = channel_device();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     tokio::spawn(netstack.run(device, shutdown));
-    Ok((host, stop))
+    Ok((host, stop, flows))
 }
 
 /// Ask the tunnel's DNS (198.18.0.2) for `name`, return the A record.

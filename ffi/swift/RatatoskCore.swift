@@ -88,6 +88,21 @@ final class RatatoskEngine {
         if let running { ratatosk_stop(running) }
     }
 
+    /// The newest `max` flows as the core's JSON array (see ratatosk.h).
+    func flowsJSON(max: Int = 100) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let tunnel else { return nil }
+        var buf = [CChar](repeating: 0, count: 32 * 1024)
+        var len = ratatosk_flows_json(tunnel, max, &buf, buf.count)
+        if len >= buf.count {
+            buf = [CChar](repeating: 0, count: len + 1)
+            len = ratatosk_flows_json(tunnel, max, &buf, buf.count)
+            guard len < buf.count else { return nil }
+        }
+        return buf.withUnsafeBytes { Data($0.prefix(len)) }
+    }
+
     var stats: RatatoskStats {
         var stats = RatatoskStats()
         ratatosk_stats(&stats)
