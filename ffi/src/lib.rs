@@ -6,8 +6,12 @@
 //! gets the stack's packets back through the callback given to
 //! [`ratatosk_start`], to write to `packetFlow`. Both may be used from any
 //! thread; [`ratatosk_stop`] must not be called from the callback.
+//!
+//! Outside a tunnel, for the app as well: [`ratatosk_ping`] times server
+//! handshakes and [`ratatosk_fetch_subscription`] downloads a subscription.
+//! Both block and return a JSON string to free with [`ratatosk_string_free`].
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
@@ -307,6 +311,112 @@ pub unsafe extern "C" fn ratatosk_set_logger(on_log: LogCallback, ctx: *mut c_vo
         tracing::error!("panic in {}: {info}", thread.name().unwrap_or("?"));
         default(info);
     }));
+}
+
+/// Handshake time to each server of `links_json`, a JSON array of link
+/// strings, all measured at once from this process with `timeout_ms` each:
+/// a JSON array of milliseconds, `null` where the link is bad or the server
+/// did not answer. NULL when `links_json` is not such an array.
+///
+/// Blocks. Inside the Packet Tunnel the sockets bypass the tunnel; an app
+/// with the VPN on would measure through it, so it asks the extension.
+///
+/// # Safety
+/// `links_json` is a NUL-terminated string. Free the result with
+/// `ratatosk_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_ping(links_json: *const c_char, timeout_ms: u32) -> *mut c_char {
+    let Some(links) = c_str(links_json).and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+    else {
+        return std::ptr::null_mut();
+    };
+    let servers: Vec<Option<vproxy::ServerConfig>> = links
+        .iter()
+        .map(|link| {
+            vproxy::config::servers::config_from_link(link, 0)
+                .ok()
+                .map(|c| c.server)
+        })
+        .collect();
+    let valid: Vec<vproxy::ServerConfig> = servers.iter().flatten().cloned().collect();
+    let limit = Duration::from_millis(u64::from(timeout_ms.max(1)));
+    let measured = match blocking_runtime() {
+        Ok(runtime) => runtime.block_on(vproxy::proxy::runtime::ping_servers(&valid, limit)),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let mut measured = measured.into_iter();
+    let out: Vec<Option<u64>> = servers
+        .iter()
+        .map(|server| {
+            server.as_ref()?;
+            measured.next()?.ok().map(|d| d.as_millis() as u64)
+        })
+        .collect();
+    owned_string(serde_json::Value::from(out).to_string())
+}
+
+/// Download the subscription at `url` (an `https://` link from a panel):
+/// JSON `{title, links, skipped, upload, download, total, expire,
+/// interval_hours}` (`title` and the traffic fields may be null; bytes and
+/// unix seconds), or `{error}`. Blocks.
+///
+/// # Safety
+/// `url` is a NUL-terminated string. Free the result with
+/// `ratatosk_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_fetch_subscription(url: *const c_char) -> *mut c_char {
+    let result = match (c_str(url), blocking_runtime()) {
+        (None, _) => Err(anyhow::anyhow!("url is NULL or not UTF-8")),
+        (_, Err(e)) => Err(e.into()),
+        (Some(url), Ok(runtime)) => runtime.block_on(vproxy::config::subscription::fetch(url)),
+    };
+    let json = match result {
+        Ok(sub) => {
+            let info = sub.meta.userinfo.unwrap_or_default();
+            serde_json::json!({
+                "title": sub.meta.title,
+                "links": sub.links,
+                "skipped": sub.skipped,
+                "upload": info.upload,
+                "download": info.download,
+                "total": info.total,
+                "expire": info.expire,
+                "interval_hours": sub.meta.interval_hours,
+            })
+        }
+        Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+    };
+    owned_string(json.to_string())
+}
+
+/// Free a string returned by `ratatosk_ping` or `ratatosk_fetch_subscription`.
+///
+/// # Safety
+/// `s` is NULL or such a string, not freed before.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        drop(CString::from_raw(s));
+    }
+}
+
+unsafe fn c_str<'a>(s: *const c_char) -> Option<&'a str> {
+    (!s.is_null())
+        .then(|| CStr::from_ptr(s).to_str().ok())
+        .flatten()
+}
+
+/// A runtime for one blocking call from a host thread.
+fn blocking_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+fn owned_string(s: String) -> *mut c_char {
+    CString::new(s)
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `vproxy-ffi <version>`, static.

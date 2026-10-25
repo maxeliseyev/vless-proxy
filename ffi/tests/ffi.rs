@@ -110,3 +110,76 @@ fn header_addresses_match_the_core() {
         Ipv4Addr::new(255, 254, 0, 0)
     );
 }
+
+/// Take a string the core returned and free it.
+fn take(s: *mut std::ffi::c_char) -> String {
+    assert!(!s.is_null());
+    let out = unsafe { CStr::from_ptr(s) }.to_str().unwrap().to_owned();
+    unsafe { ratatosk_string_free(s) };
+    out
+}
+
+#[test]
+fn ping_reports_each_server_or_null() {
+    // security=none: the handshake is just TCP, so a listener answers it.
+    let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let link = |port: u16| {
+        format!("vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@127.0.0.1:{port}?security=none")
+    };
+    let links = serde_json::json!([
+        link(open.local_addr().unwrap().port()),
+        "not a link",
+        link(closed_port)
+    ])
+    .to_string();
+    let links = CString::new(links).unwrap();
+    let out = take(unsafe { ratatosk_ping(links.as_ptr(), 2000) });
+    let ms: Vec<Option<u64>> = serde_json::from_str(&out).unwrap();
+    assert_eq!(ms.len(), 3, "{out}");
+    assert!(
+        ms[0].is_some() && ms[1].is_none() && ms[2].is_none(),
+        "{out}"
+    );
+
+    let garbage = CString::new("{").unwrap();
+    assert!(unsafe { ratatosk_ping(garbage.as_ptr(), 100) }.is_null());
+}
+
+#[test]
+fn subscription_comes_back_with_links_and_traffic() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request);
+        let body = "vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@a.example:443?security=tls#a\n\
+                    h3://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@b.example:8445?sni=b.example#b\n\
+                    trojan://skipped@c.example:443\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+             subscription-userinfo: upload=1000; download=41000; total=100000; expire=1900000000\r\n\
+             profile-title: demo\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    let url = CString::new(format!("http://127.0.0.1:{port}/sub/token")).unwrap();
+    let out = take(unsafe { ratatosk_fetch_subscription(url.as_ptr()) });
+    let sub: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(sub["title"], "demo", "{out}");
+    assert_eq!(sub["links"].as_array().unwrap().len(), 2, "{out}");
+    assert_eq!(sub["skipped"], 1);
+    assert_eq!(
+        (sub["download"].as_u64(), sub["total"].as_u64()),
+        (Some(41000), Some(100000))
+    );
+
+    let nowhere = CString::new("http://127.0.0.1:9/").unwrap();
+    let out = take(unsafe { ratatosk_fetch_subscription(nowhere.as_ptr()) });
+    assert!(out.contains("\"error\""), "{out}");
+}

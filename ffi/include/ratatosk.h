@@ -59,6 +59,21 @@ void ratatosk_set_logger(RatatoskLogCallback on_log, void *ctx, uint8_t max_leve
 
 const char *ratatosk_version(void);
 
+// Handshake time to each server of `links_json` (a JSON array of link
+// strings), measured at once with `timeout_ms` each: a JSON array of
+// milliseconds, null where the link is bad or the server did not answer.
+// NULL when the input is not such an array. Blocks. Free with
+// ratatosk_string_free. Inside the Packet Tunnel its sockets bypass the
+// tunnel; an app with the VPN on should ask the extension instead.
+char *ratatosk_ping(const char *links_json, uint32_t timeout_ms);
+
+// Download a subscription: JSON {title, links, skipped, upload, download,
+// total, expire, interval_hours} (bytes, unix seconds; title and traffic may
+// be null), or {error}. Blocks. Free with ratatosk_string_free.
+char *ratatosk_fetch_subscription(const char *url);
+
+void ratatosk_string_free(char *s);
+
 #ifdef __cplusplus
 }
 #endif
