@@ -299,6 +299,14 @@ pub unsafe extern "C" fn ratatosk_set_logger(on_log: LogCallback, ctx: *mut c_vo
             buf: Vec::new(),
         })
         .try_init();
+    // A panic would otherwise go to stderr, which nobody reads on iOS; the
+    // host writes this line to its log before the process can go away.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        tracing::error!("panic in {}: {info}", thread.name().unwrap_or("?"));
+        default(info);
+    }));
 }
 
 /// `vproxy-ffi <version>`, static.
