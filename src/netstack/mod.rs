@@ -133,6 +133,11 @@ impl Netstack {
         .await;
         match result {
             Ok(()) => flow.close(true),
+            // ipstack's answer to writing after the app's side is gone (it
+            // reset or finished closing): the app hung up, nothing failed.
+            Err(error) if format!("{error:#}").contains("TCP connection closed") => {
+                flow.close_because("closed by app")
+            }
             Err(error) => {
                 STATS.error();
                 flow.fail(format!("{error:#}"));

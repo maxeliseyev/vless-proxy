@@ -39,7 +39,8 @@ pub struct Flow {
     dial_ms: AtomicU64,
     first_down_ms: AtomicU64,
     ended_ms: AtomicU64,
-    error: Mutex<Option<String>>,
+    /// Why it ended, when there is more to say than "ok".
+    reason: Mutex<Option<String>>,
     proto: &'static str,
     host: String,
     port: u16,
@@ -76,8 +77,14 @@ impl Flow {
 
     /// Close as failed, keeping why.
     pub fn fail(&self, error: String) {
-        *self.error.lock().expect("flow lock poisoned") = Some(error);
+        *self.reason.lock().expect("flow lock poisoned") = Some(error);
         self.close(false);
+    }
+
+    /// Close as fine, saying how (`closed by app`).
+    pub fn close_because(&self, reason: &str) {
+        *self.reason.lock().expect("flow lock poisoned") = Some(reason.to_owned());
+        self.close(true);
     }
 
     /// One line for the diagnostic log, written when the flow ends:
@@ -112,8 +119,8 @@ impl Flow {
         if let Some(ended) = ms(&self.ended_ms) {
             line += &format!(" in {:.1}s", ended as f64 / 1000.0);
         }
-        match self.error.lock().expect("flow lock poisoned").as_deref() {
-            Some(error) => line + ": " + error,
+        match self.reason.lock().expect("flow lock poisoned").as_deref() {
+            Some(reason) => line + ": " + reason,
             None if self.failed.load(Ordering::Relaxed) => line + ": failed",
             None => line + ": ok",
         }
@@ -155,7 +162,7 @@ impl FlowLog {
             dial_ms: AtomicU64::new(UNSET),
             first_down_ms: AtomicU64::new(UNSET),
             ended_ms: AtomicU64::new(UNSET),
-            error: Mutex::new(None),
+            reason: Mutex::new(None),
             proto,
             host,
             port,
@@ -209,7 +216,11 @@ impl FlowLog {
                     "failed": f.failed.load(Ordering::Relaxed),
                     "dial": ms(&f.dial_ms),
                     "first": ms(&f.first_down_ms),
-                    "error": *f.error.lock().expect("flow lock poisoned"),
+                    "error": f
+                        .failed
+                        .load(Ordering::Relaxed)
+                        .then(|| f.reason.lock().expect("flow lock poisoned").clone())
+                        .flatten(),
                 })
             })
             .collect();
@@ -323,10 +334,10 @@ mod tests {
         );
 
         let quiet = log.open("udp", "dns.test".into(), 53, Outbound::Direct);
-        quiet.close(true);
+        quiet.close_because("closed by app");
         let line = quiet.summary();
         assert!(!line.contains("dial") && !line.contains("first"), "{line}");
-        assert!(line.ends_with(": ok"), "{line}");
+        assert!(line.ends_with(": closed by app"), "{line}");
 
         let open = log.open("tcp", "push.test".into(), 5223, Outbound::Proxy);
         let line = open.summary();
@@ -343,5 +354,6 @@ mod tests {
             "Read timeout: no response from target in 30s"
         );
         assert!(rows[2]["dial"].is_u64() && rows[2]["first"].is_u64());
+        assert_eq!(rows[1]["error"], serde_json::Value::Null);
     }
 }
