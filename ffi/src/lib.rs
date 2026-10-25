@@ -16,7 +16,7 @@ use vproxy::netstack::device::channel_device;
 use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
 use vproxy::netstack::flows::{FlowLog, DEFAULT_CAPACITY};
 use vproxy::netstack::Netstack;
-use vproxy::proxy::stats::STATS;
+use vproxy::proxy::stats::{human_bytes, STATS};
 use vproxy::{ActiveServer, ProxyClient};
 
 /// Names handed out by the fake DNS before the oldest is reused.
@@ -135,6 +135,7 @@ fn start(
             on_packet(ctx.0, packet.as_ptr(), packet.len());
         }
     });
+    runtime.spawn(log_stats_every(STATS_EVERY));
     tracing::info!("Tunnel core started for {}", config.server.endpoint());
     let server = &config.server;
     tracing::info!(
@@ -229,11 +230,47 @@ pub unsafe extern "C" fn ratatosk_stop(tunnel: *mut Tunnel) {
         return;
     }
     let mut tunnel = Box::from_raw(tunnel);
+    // Flows only log when they end; those cut by the stop would go unsaid.
+    for flow in tunnel.flows.still_open() {
+        tracing::info!("flow {}", flow.summary());
+    }
+    log_stats();
     let _ = tunnel.stop.send(true);
     if let Some(runtime) = tunnel.runtime.take() {
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
     tracing::info!("Tunnel core stopped");
+}
+
+/// How often the traffic counters go to the log while they change.
+const STATS_EVERY: Duration = Duration::from_secs(30);
+
+async fn log_stats_every(period: Duration) {
+    let mut last = None;
+    let mut ticks = tokio::time::interval(period);
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        let s = STATS.snapshot();
+        let now = (s.active, s.total, s.up, s.down, s.errors);
+        if last != Some(now) {
+            last = Some(now);
+            log_stats();
+        }
+    }
+}
+
+/// `stats: 4 open · 57 total · up 1.2 MiB · down 31.0 MiB · 2 errors`
+fn log_stats() {
+    let s = STATS.snapshot();
+    tracing::info!(
+        "stats: {} open · {} total · up {} · down {} · {} errors",
+        s.active,
+        s.total,
+        human_bytes(s.up),
+        human_bytes(s.down),
+        s.errors
+    );
 }
 
 /// Send the core's logs to `on_log`, up to `max_level` (1 error .. 5 trace).

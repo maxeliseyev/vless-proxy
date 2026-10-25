@@ -105,6 +105,10 @@ impl Flow {
             human(self.up.load(Ordering::Relaxed)),
             human(self.down.load(Ordering::Relaxed))
         );
+        if !self.closed.load(Ordering::Relaxed) {
+            let open = self.elapsed_ms() as f64 / 1000.0;
+            return line + &format!(" for {open:.1}s: still open");
+        }
         if let Some(ended) = ms(&self.ended_ms) {
             line += &format!(" in {:.1}s", ended as f64 / 1000.0);
         }
@@ -166,6 +170,17 @@ impl FlowLog {
         }
         inner.records.push_back(flow.clone());
         flow
+    }
+
+    /// Records not closed yet, oldest first (for a last word at shutdown).
+    pub fn still_open(&self) -> Vec<Arc<Flow>> {
+        let inner = self.inner.lock().expect("flow log lock poisoned");
+        inner
+            .records
+            .iter()
+            .filter(|f| !f.closed.load(Ordering::Relaxed))
+            .cloned()
+            .collect()
     }
 
     /// The newest `max` records, newest first, as a JSON array of
@@ -313,11 +328,20 @@ mod tests {
         assert!(!line.contains("dial") && !line.contains("first"), "{line}");
         assert!(line.ends_with(": ok"), "{line}");
 
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&log.to_json(2)).unwrap();
+        let open = log.open("tcp", "push.test".into(), 5223, Outbound::Proxy);
+        let line = open.summary();
+        assert!(
+            line.contains(" for ") && line.ends_with(": still open"),
+            "{line}"
+        );
+        let still: Vec<u64> = log.still_open().iter().map(|f| f.id).collect();
+        assert_eq!(still, vec![3]);
+
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&log.to_json(3)).unwrap();
         assert_eq!(
-            rows[1]["error"],
+            rows[2]["error"],
             "Read timeout: no response from target in 30s"
         );
-        assert!(rows[1]["dial"].is_u64() && rows[1]["first"].is_u64());
+        assert!(rows[2]["dial"].is_u64() && rows[2]["first"].is_u64());
     }
 }
