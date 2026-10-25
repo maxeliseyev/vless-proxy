@@ -1,6 +1,13 @@
 //! What the h3 client and server say to each other inside QUIC: the auth
 //! token, the target header of a stream and the status byte that answers
-//! it. None of it is visible on the wire; QUIC encrypts it all.
+//! it, and the UDP datagram framing. None of it is visible on the wire;
+//! QUIC encrypts it all.
+//!
+//! UDP rides QUIC DATAGRAM frames (RFC 9221), one per UDP packet. Client to
+//! server: `[session varint][target header][payload]`; every datagram names
+//! its target, so a lost first one costs nothing. Server to client:
+//! `[session varint][payload]`. A session is one client flow to one target;
+//! its id is the client's choice, unique per connection.
 
 use crate::protocol::vless::Address;
 use anyhow::{bail, Result};
@@ -112,6 +119,80 @@ pub fn encode_target(address: &Address, port: u16) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// QUIC variable-length integer (RFC 9000 16): 1, 2, 4 or 8 bytes, the top
+/// two bits of the first byte giving the length.
+pub fn put_varint(out: &mut Vec<u8>, value: u64) {
+    match value {
+        0..=0x3f => out.push(value as u8),
+        0x40..=0x3fff => out.extend_from_slice(&(value as u16 | 0x4000).to_be_bytes()),
+        0x4000..=0x3fff_ffff => out.extend_from_slice(&(value as u32 | 0x8000_0000).to_be_bytes()),
+        _ => out.extend_from_slice(
+            &((value & 0x3fff_ffff_ffff_ffff) | 0xc000_0000_0000_0000).to_be_bytes(),
+        ),
+    }
+}
+
+/// Read a varint off the front of `buf`: the value and the rest.
+pub fn take_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
+    let first = *buf.first().ok_or_else(|| anyhow::anyhow!("empty varint"))?;
+    let len = 1usize << (first >> 6);
+    if buf.len() < len {
+        bail!("short varint");
+    }
+    let mut value = u64::from(first & 0x3f);
+    for byte in &buf[1..len] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Ok((value, &buf[len..]))
+}
+
+/// The front of a client datagram for `session` to `address:port`; the
+/// payload follows it.
+pub fn datagram_prefix(session: u64, address: &Address, port: u16) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(32);
+    put_varint(&mut out, session);
+    out.extend_from_slice(&encode_target(address, port)?);
+    Ok(out)
+}
+
+/// A client datagram: session, target, payload.
+pub fn parse_client_datagram(buf: &[u8]) -> Result<(u64, Address, u16, &[u8])> {
+    let (session, rest) = take_varint(buf)?;
+    let need = |n: usize, rest: &[u8]| {
+        if rest.len() < n {
+            bail!("short datagram");
+        }
+        Ok(())
+    };
+    need(1, rest)?;
+    let (address, rest) = match rest[0] {
+        ATYP_IPV4 => {
+            need(5, rest)?;
+            let octets: [u8; 4] = rest[1..5].try_into().expect("4 bytes");
+            (Address::Ipv4(Ipv4Addr::from(octets)), &rest[5..])
+        }
+        ATYP_DOMAIN => {
+            need(2, rest)?;
+            let len = rest[1] as usize;
+            need(2 + len, rest)?;
+            if len == 0 {
+                bail!("empty domain name");
+            }
+            let name = std::str::from_utf8(&rest[2..2 + len])?.to_string();
+            (Address::Domain(name), &rest[2 + len..])
+        }
+        ATYP_IPV6 => {
+            need(17, rest)?;
+            let octets: [u8; 16] = rest[1..17].try_into().expect("16 bytes");
+            (Address::Ipv6(Ipv6Addr::from(octets)), &rest[17..])
+        }
+        other => bail!("unknown address type {other}"),
+    };
+    need(2, rest)?;
+    let port = u16::from_be_bytes([rest[0], rest[1]]);
+    Ok((session, address, port, &rest[2..]))
+}
+
 /// Read what [`encode_target`] wrote.
 pub async fn read_target<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Address, u16)> {
     let address = match reader.read_u8().await? {
@@ -156,6 +237,27 @@ mod tests {
         }
         assert!(encode_target(&Address::Domain(String::new()), 1).is_err());
         assert!(read_target(&mut [9u8, 0, 0].as_slice()).await.is_err());
+    }
+
+    #[test]
+    fn varints_and_datagrams_round_trip() {
+        for value in [0, 63, 64, 16_383, 16_384, 1 << 30, (1 << 62) - 1] {
+            let mut out = Vec::new();
+            put_varint(&mut out, value);
+            out.push(0xaa);
+            let (read, rest) = take_varint(&out).unwrap();
+            assert_eq!((read, rest), (value, &[0xaa][..]), "{value}");
+        }
+        assert!(take_varint(&[0x80, 0]).is_err());
+
+        let mut datagram = datagram_prefix(70, &Address::Domain("dns.example".into()), 53).unwrap();
+        datagram.extend_from_slice(b"query");
+        let (session, address, port, payload) = parse_client_datagram(&datagram).unwrap();
+        assert_eq!(
+            (session, address.to_string(), port, payload),
+            (70, "dns.example".into(), 53, &b"query"[..])
+        );
+        assert!(parse_client_datagram(&datagram[..4]).is_err());
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! certificate; a client that proves its account with the auth token gets
 //! each of its streams relayed to the TCP target it names.
 //!
-//! Prototype scope: certificate from files, TCP only. A connection whose
+//! Prototype scope: certificate from files; TCP as streams, UDP as QUIC
+//! datagrams, one UDP socket per client session. A connection whose
 //! token does not check out is closed with `H3_NO_ERROR`; serving the site
 //! to such clients over HTTP/3 comes later.
 
@@ -11,11 +12,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::TcpStream;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -31,6 +34,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Without any traffic for this long a connection is dropped (clients ping
 /// every 10 s while they want it).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A UDP session nobody sent on for this long is closed, as in vproxy.
+const UDP_IDLE: Duration = Duration::from_secs(120);
+/// UDP sessions per connection; the least recently used goes first.
+const MAX_UDP_SESSIONS: usize = 256;
+
+/// Same as the client's, so datagrams fit from the first packet.
+const INITIAL_MTU: u16 = vproxy::h3::client::INITIAL_MTU;
 
 /// `server.toml`:
 ///
@@ -106,7 +117,9 @@ impl Server {
             .map_err(|e| anyhow!("QUIC server config: {e}"))?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30 s fits a VarInt")));
+        transport
+            .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30 s fits a VarInt")))
+            .initial_mtu(INITIAL_MTU);
         config.transport_config(Arc::new(transport));
         let endpoint = quinn::Endpoint::server(config, listen)
             .with_context(|| format!("listen on {listen}/udp"))?;
@@ -157,6 +170,7 @@ impl Shared {
         };
         let tag = account_tag(&user);
         info!("{remote}: connected as {tag}");
+        tokio::spawn(self.clone().datagrams(conn.clone()));
         loop {
             let (send, recv) = match conn.accept_bi().await {
                 Ok(stream) => stream,
@@ -216,6 +230,20 @@ impl Shared {
     }
 
     async fn connect(&self, address: &Address, port: u16) -> Result<TcpStream, (Status, String)> {
+        let allowed = self.resolve(address, port).await?;
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(allowed.as_slice())).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err((Status::Unreachable, e.to_string())),
+            Err(_) => Err((Status::Timeout, "connect timed out".into())),
+        }
+    }
+
+    /// Addresses of a target the policy lets us reach.
+    async fn resolve(
+        &self,
+        address: &Address,
+        port: u16,
+    ) -> Result<Vec<SocketAddr>, (Status, String)> {
         let candidates: Vec<SocketAddr> = match address {
             Address::Ipv4(ip) => vec![SocketAddr::new((*ip).into(), port)],
             Address::Ipv6(ip) => vec![SocketAddr::new((*ip).into(), port)],
@@ -231,12 +259,121 @@ impl Shared {
         if allowed.is_empty() {
             return Err((Status::Refused, "no public address".into()));
         }
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect(allowed.as_slice())).await {
-            Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(e)) => Err((Status::Unreachable, e.to_string())),
-            Err(_) => Err((Status::Timeout, "connect timed out".into())),
+        Ok(allowed)
+    }
+
+    /// The UDP side of a connection: datagrams in, one UDP socket per
+    /// session to its target, replies back as datagrams, until the
+    /// connection ends.
+    async fn datagrams(self: Arc<Self>, conn: quinn::Connection) {
+        let mut sessions: HashMap<u64, UdpSession> = HashMap::new();
+        // Sessions whose target the policy refused: not looked up again.
+        let mut refused: HashSet<u64> = HashSet::new();
+        let mut sweep = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            let datagram = tokio::select! {
+                datagram = conn.read_datagram() => match datagram {
+                    Ok(datagram) => datagram,
+                    Err(_) => break,
+                },
+                _ = sweep.tick() => {
+                    sessions.retain(|_, s| {
+                        let keep = s.last.elapsed() < UDP_IDLE;
+                        if !keep {
+                            s.task.abort();
+                        }
+                        keep
+                    });
+                    continue;
+                }
+            };
+            let Ok((id, address, port, payload)) = wire::parse_client_datagram(&datagram) else {
+                continue;
+            };
+            if refused.contains(&id) {
+                continue;
+            }
+            if !sessions.contains_key(&id) {
+                if sessions.len() >= MAX_UDP_SESSIONS {
+                    let oldest = sessions.iter().min_by_key(|(_, s)| s.last).map(|(k, _)| *k);
+                    if let Some(session) = oldest.and_then(|k| sessions.remove(&k)) {
+                        session.task.abort();
+                    }
+                }
+                match self.open_udp(&conn, id, &address, port).await {
+                    Ok(session) => {
+                        debug!("udp to {address}:{port}");
+                        sessions.insert(id, session);
+                    }
+                    Err((status, why)) => {
+                        warn!("udp {}: {address}:{port}: {why}", status.describe());
+                        refused.insert(id);
+                        continue;
+                    }
+                }
+            }
+            let session = sessions.get_mut(&id).expect("just inserted");
+            session.last = Instant::now();
+            let _ = session.socket.send(payload).await;
+        }
+        for session in sessions.values() {
+            session.task.abort();
         }
     }
+
+    /// A UDP socket connected to the target, its replies sent back to the
+    /// client as datagrams of session `id`.
+    async fn open_udp(
+        &self,
+        conn: &quinn::Connection,
+        id: u64,
+        address: &Address,
+        port: u16,
+    ) -> Result<UdpSession, (Status, String)> {
+        let target = self.resolve(address, port).await?[0];
+        let bind: SocketAddr = if target.is_ipv4() {
+            "0.0.0.0:0".parse().expect("valid address")
+        } else {
+            "[::]:0".parse().expect("valid address")
+        };
+        let socket = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| (Status::Unreachable, e.to_string()))?;
+        socket
+            .connect(target)
+            .await
+            .map_err(|e| (Status::Unreachable, e.to_string()))?;
+        let socket = Arc::new(socket);
+        let reader = socket.clone();
+        let conn = conn.clone();
+        let task = tokio::spawn(async move {
+            let mut prefix = Vec::with_capacity(8);
+            wire::put_varint(&mut prefix, id);
+            let mut buf = vec![0u8; 65_535];
+            while let Ok(n) = reader.recv(&mut buf).await {
+                let mut datagram = Vec::with_capacity(prefix.len() + n);
+                datagram.extend_from_slice(&prefix);
+                datagram.extend_from_slice(&buf[..n]);
+                match conn.send_datagram(datagram.into()) {
+                    Ok(()) => {}
+                    // Over the path's datagram size: dropped, like an IP fragment lost.
+                    Err(quinn::SendDatagramError::TooLarge) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(UdpSession {
+            socket,
+            last: Instant::now(),
+            task,
+        })
+    }
+}
+
+struct UdpSession {
+    socket: Arc<UdpSocket>,
+    last: Instant,
+    task: JoinHandle<()>,
 }
 
 async fn refuse(mut send: quinn::SendStream, status: Status, why: String) -> Result<()> {

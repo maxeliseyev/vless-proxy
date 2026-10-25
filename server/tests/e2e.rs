@@ -1,6 +1,6 @@
 //! The h3 transport end to end on loopback: `vproxy::h3::H3Client` against
-//! `vproxy_server::Server` with a self-signed certificate, relaying to a
-//! local TCP echo server.
+//! `vproxy_server::Server` with a self-signed certificate, relaying to
+//! local TCP and UDP echo servers.
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
@@ -21,6 +21,7 @@ const ALICE: Uuid = Uuid::from_u128(0xa11ce);
 struct Stand {
     server: SocketAddr,
     echo: SocketAddr,
+    udp_echo: SocketAddr,
     cert: CertificateDer<'static>,
 }
 
@@ -49,9 +50,18 @@ async fn stand(allow_private: bool) -> Stand {
             });
         }
     });
+    let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_echo_addr = udp_echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((n, from)) = udp_echo.recv_from(&mut buf).await {
+            let _ = udp_echo.send_to(&buf[..n], from).await;
+        }
+    });
     Stand {
         server: server_addr,
         echo: echo_addr,
+        udp_echo: udp_echo_addr,
         cert,
     }
 }
@@ -63,10 +73,18 @@ fn client(stand: &Stand, uuid: Uuid) -> H3Client {
 }
 
 fn echo_target(stand: &Stand) -> (Address, u16) {
-    let SocketAddr::V4(echo) = stand.echo else {
+    as_target(stand.echo)
+}
+
+fn udp_echo_target(stand: &Stand) -> (Address, u16) {
+    as_target(stand.udp_echo)
+}
+
+fn as_target(addr: SocketAddr) -> (Address, u16) {
+    let SocketAddr::V4(addr) = addr else {
         unreachable!()
     };
-    (Address::Ipv4(*echo.ip()), echo.port())
+    (Address::Ipv4(*addr.ip()), addr.port())
 }
 
 #[tokio::test]
@@ -169,9 +187,73 @@ async fn proxy_client_routes_h3_links_over_quic() {
             .unwrap();
         assert_eq!(back, [round; 1000]);
     }
+
+    let (address, port) = udp_echo_target(&stand);
+    let vproxy::proxy::runtime::UdpOutbound::H3(session) =
+        proxy.open_udp(address, port).await.unwrap()
+    else {
+        panic!("h3 server, not an h3 UDP session");
+    };
+    let (out, mut incoming) = session.into_split();
+    out.send(b"over quic").unwrap();
+    let back = timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back[..], b"over quic");
+}
+
+#[tokio::test]
+async fn udp_sessions_echo_over_datagrams() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = udp_echo_target(&stand);
+
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        sessions.push(client.open_udp(&address, port).await.unwrap().into_split());
+    }
+    // Interleaved: each reply must come back to its own session.
+    for round in 0..10u8 {
+        for (i, (out, _)) in sessions.iter().enumerate() {
+            out.send(&vec![i as u8; 100 + round as usize * 90]).unwrap();
+        }
+    }
+    for (i, (_, incoming)) in sessions.iter_mut().enumerate() {
+        for round in 0..10u8 {
+            let payload = timeout(Duration::from_secs(10), incoming.recv())
+                .await
+                .expect("reply timed out")
+                .expect("session ended");
+            assert_eq!(payload.len(), 100 + round as usize * 90, "session {i}");
+            assert!(payload.iter().all(|b| *b == i as u8), "session {i}");
+        }
+    }
+    assert_eq!(client.handshakes(), 1, "TCP and UDP share the connection");
+
+    let (out, incoming) = &mut sessions[0];
+    // An app's QUIC Initial is at least 1200 bytes: it must fit from the start.
+    out.send(&[7u8; 1200]).unwrap();
+    let back = timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.len(), 1200);
+    assert!(out.send(&[0u8; 4000]).is_err(), "over the datagram limit");
+}
+
+#[tokio::test]
+async fn private_udp_targets_get_no_replies() {
+    let stand = stand(false).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = udp_echo_target(&stand);
+    let (out, mut incoming) = client.open_udp(&address, port).await.unwrap().into_split();
+    out.send(b"hello?").unwrap();
     assert!(
-        proxy.open_udp(address, port).await.is_err(),
-        "no UDP over h3 yet"
+        timeout(Duration::from_millis(800), incoming.recv())
+            .await
+            .is_err(),
+        "a private target was reached"
     );
 }
 

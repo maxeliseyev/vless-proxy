@@ -161,11 +161,10 @@ impl Netstack {
         let outbound = match self.connector.open_udp(address.clone(), dst.port()).await {
             Ok(outbound) => outbound,
             Err(error) => {
-                // Vision refuses UDP/443 on purpose, h3 has no UDP yet: QUIC
-                // falls back to TCP, which then shows up in the log; the
-                // refusal itself does not.
+                // Vision refuses UDP/443 on purpose: QUIC falls back to TCP,
+                // which then shows up in the log; the refusal itself does not.
                 let text = error.to_string();
-                if text.contains("XTLS rejected") || text.contains("UDP over h3 is not supported") {
+                if text.contains("XTLS rejected") {
                     debug!("Dropping UDP to {address}:{}: {text}", dst.port());
                 } else if text.contains("blocked by routing") {
                     debug!("Dropping UDP to {address}:{}: {text}", dst.port());
@@ -188,6 +187,7 @@ impl Netstack {
             .open("udp", address.to_string(), dst.port(), route);
         let result = match outbound {
             UdpOutbound::Proxy(remote) => relay_udp_vless(&mut udp, *remote, &flow).await,
+            UdpOutbound::H3(session) => relay_udp_h3(&mut udp, session, &flow).await,
             UdpOutbound::Direct(socket) => relay_udp_direct(&mut udp, socket, &flow).await,
         };
         if let Err(error) = &result {
@@ -243,6 +243,45 @@ async fn relay_udp_vless(
             flow.add_down(payload.len());
             udp_out.write_all(&payload).await?;
         }
+    };
+    tokio::select! {
+        result = up => result,
+        result = down => result,
+    }
+}
+
+/// One UDP flow over an h3 datagram session, a datagram per packet. Ends
+/// when the app's side stops or the QUIC connection does.
+async fn relay_udp_h3(
+    udp: &mut IpStackUdpStream,
+    session: crate::h3::H3UdpSession,
+    flow: &Flow,
+) -> Result<()> {
+    let (out, mut incoming) = session.into_split();
+    let (mut udp_in, mut udp_out) = tokio::io::split(udp);
+    let up = async {
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            let n = udp_in.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            // Over the datagram limit: dropped, as UDP may be; the app adapts.
+            if let Err(error) = out.send(&buf[..n]) {
+                debug!("{error}");
+                continue;
+            }
+            STATS.add_up(n);
+            flow.add_up(n);
+        }
+    };
+    let down = async {
+        while let Some(payload) = incoming.recv().await {
+            STATS.add_down(payload.len());
+            flow.add_down(payload.len());
+            udp_out.write_all(&payload).await?;
+        }
+        Ok(())
     };
     tokio::select! {
         result = up => result,

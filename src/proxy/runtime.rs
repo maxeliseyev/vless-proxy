@@ -105,6 +105,8 @@ impl AsyncWrite for OutboundStream {
 /// Where a UDP session ended up after routing.
 pub enum UdpOutbound {
     Proxy(Box<RemoteStream>),
+    /// A datagram session on the shared QUIC connection to an h3 server.
+    H3(crate::h3::H3UdpSession),
     Direct(UdpSocket),
 }
 
@@ -391,8 +393,17 @@ impl ProxyClient {
                 Ok(UdpOutbound::Direct(socket))
             }
             Outbound::Proxy => {
-                if self.server.get().transport_kind()? == Transport::H3 {
-                    anyhow::bail!("UDP over h3 is not supported yet: {address}:{port}");
+                let server = self.server.get();
+                if server.transport_kind()? == Transport::H3 {
+                    let request_address = self.resolver.resolve(address, port).await?;
+                    let client = self.h3_client(&server)?;
+                    let session = timeout(
+                        Duration::from_secs(self.runtime.connect_timeout_secs),
+                        client.open_udp(&request_address, port),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+                    return Ok(UdpOutbound::H3(session));
                 }
                 Ok(UdpOutbound::Proxy(Box::new(
                     self.connect_udp_target(address, port).await?,
@@ -1312,6 +1323,16 @@ async fn create_udp_tunnel(
         UdpOutbound::Direct(udp) => {
             return create_direct_udp_tunnel(udp, address, port, socket, client_addr, shutdown);
         }
+        UdpOutbound::H3(session) => {
+            return Ok(create_h3_udp_tunnel(
+                session,
+                address,
+                port,
+                socket,
+                client_addr,
+                shutdown,
+            ));
+        }
     };
     let (mut reader, mut writer) = tokio::io::split(remote);
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(64);
@@ -1776,6 +1797,78 @@ fn direct_target(address: &Address, port: u16) -> String {
     match address {
         Address::Ipv6(ip) => format!("[{ip}]:{port}"),
         other => format!("{other}:{port}"),
+    }
+}
+
+/// SOCKS5 UDP to one target over an h3 datagram session.
+fn create_h3_udp_tunnel(
+    session: crate::h3::H3UdpSession,
+    address: Address,
+    port: u16,
+    socket: Arc<UdpSocket>,
+    client_addr: std::net::SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> UdpTunnel {
+    let (out, mut incoming) = session.into_split();
+    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(64);
+
+    let mut writer_shutdown = shutdown.clone();
+    let target = address.clone();
+    let writer_task = tokio::spawn(async move {
+        let address = target;
+        loop {
+            tokio::select! {
+                changed = writer_shutdown.changed() => {
+                    if changed.is_err() || *writer_shutdown.borrow() {
+                        break;
+                    }
+                }
+                payload = receiver.recv() => {
+                    let Some(payload) = payload else { break };
+                    // Too large for a datagram now: dropped, as UDP may be.
+                    match out.send(&payload) {
+                        Ok(()) => STATS.add_up(payload.len()),
+                        Err(error) => debug!("h3 UDP to {address}:{port}: {error}"),
+                    }
+                }
+            }
+        }
+    });
+
+    let mut reader_shutdown = shutdown;
+    let response_address = address.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = reader_shutdown.changed() => {
+                    if changed.is_err() || *reader_shutdown.borrow() {
+                        break;
+                    }
+                }
+                payload = incoming.recv() => {
+                    let Some(payload) = payload else { break };
+                    STATS.add_down(payload.len());
+                    let packet = match socks5::build_udp_packet(&response_address, port, &payload) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            debug!("Failed to encode SOCKS5 UDP packet: {}", error);
+                            break;
+                        }
+                    };
+                    if let Err(error) = socket.send_to(&packet, client_addr).await {
+                        debug!("Failed to send SOCKS5 UDP response: {}", error);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    UdpTunnel {
+        sender,
+        writer_task,
+        reader_task,
+        last_used: Instant::now(),
     }
 }
 

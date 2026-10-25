@@ -1,9 +1,12 @@
 //! Client side of the h3 transport: one QUIC connection per server, opened
-//! on first use and again after it dies, never two handshakes at once.
+//! on first use and again after it dies, never two handshakes at once. TCP
+//! targets are streams on it, UDP flows are datagram sessions.
 
 use super::wire::{self, Status, ALPN, AUTH_LABEL, TOKEN_LEN};
 use crate::protocol::vless::Address;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -12,7 +15,7 @@ use std::sync::Arc;
 use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -22,6 +25,25 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// ...so it is pinged this often while it should stay up.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
+/// UDP payload size of QUIC packets from the start, Chrome's value. The
+/// quinn default (1200) leaves no room for a 1200-byte inner QUIC Initial in
+/// a datagram; path MTU discovery raises it further where the path allows.
+pub const INITIAL_MTU: u16 = 1350;
+
+/// Datagrams waiting for a slow UDP flow before newer ones are dropped.
+const SESSION_QUEUE: usize = 256;
+
+/// Where a connection's incoming datagrams go: session id to its flow.
+type Sessions = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<Bytes>>>>;
+
+/// A connection and the routing of its datagrams.
+#[derive(Clone)]
+struct Live {
+    conn: quinn::Connection,
+    sessions: Sessions,
+    next_session: Arc<AtomicU64>,
+}
+
 pub struct H3Client {
     host: String,
     port: u16,
@@ -30,7 +52,7 @@ pub struct H3Client {
     config: quinn::ClientConfig,
     /// The live connection, if any. Held across a handshake, which makes
     /// concurrent callers wait for it instead of dialing their own.
-    conn: Mutex<Option<quinn::Connection>>,
+    conn: Mutex<Option<Live>>,
     handshakes: AtomicU64,
 }
 
@@ -68,7 +90,8 @@ impl H3Client {
         let mut transport = quinn::TransportConfig::default();
         transport
             .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30 s fits a VarInt")))
-            .keep_alive_interval(Some(KEEP_ALIVE));
+            .keep_alive_interval(Some(KEEP_ALIVE))
+            .initial_mtu(INITIAL_MTU);
         config.transport_config(Arc::new(transport));
         Ok(Self {
             host: host.to_string(),
@@ -101,16 +124,54 @@ impl H3Client {
         })
     }
 
+    /// A UDP flow to `address:port` through the server, as QUIC datagrams.
+    /// It ends (`recv` gives `None`) when the connection does.
+    pub async fn open_udp(&self, address: &Address, port: u16) -> Result<H3UdpSession> {
+        let live = self.live().await?;
+        if live.conn.max_datagram_size().is_none() {
+            bail!("h3: the server does not take datagrams");
+        }
+        let id = live.next_session.fetch_add(1, Ordering::Relaxed);
+        let prefix: Arc<[u8]> = wire::datagram_prefix(id, address, port)?.into();
+        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+        live.sessions
+            .lock()
+            .expect("h3 sessions lock poisoned")
+            .insert(id, tx);
+        Ok(H3UdpSession {
+            sender: H3UdpSender {
+                conn: live.conn,
+                prefix,
+            },
+            receiver: H3UdpReceiver {
+                rx,
+                id,
+                sessions: live.sessions,
+            },
+        })
+    }
+
     /// The live connection, dialing (and authenticating) a new one if there
     /// is none or it has closed.
     pub async fn connection(&self) -> Result<quinn::Connection> {
+        Ok(self.live().await?.conn)
+    }
+
+    async fn live(&self) -> Result<Live> {
         let mut slot = self.conn.lock().await;
-        if let Some(conn) = slot.as_ref().filter(|c| c.close_reason().is_none()) {
-            return Ok(conn.clone());
+        if let Some(live) = slot.as_ref().filter(|l| l.conn.close_reason().is_none()) {
+            return Ok(live.clone());
         }
         let conn = self.dial().await?;
-        *slot = Some(conn.clone());
-        Ok(conn)
+        let sessions = Sessions::default();
+        tokio::spawn(dispatch(conn.clone(), sessions.clone()));
+        let live = Live {
+            conn,
+            sessions,
+            next_session: Arc::new(AtomicU64::new(0)),
+        };
+        *slot = Some(live.clone());
+        Ok(live)
     }
 
     async fn dial(&self) -> Result<quinn::Connection> {
@@ -143,6 +204,91 @@ impl H3Client {
         info!("h3: connected to {} ({addr})", self.server_name);
         debug!("h3: rtt {:?}", conn.rtt());
         Ok(conn)
+    }
+}
+
+/// Hand each datagram of `conn` to its session until the connection ends,
+/// then end every session.
+async fn dispatch(conn: quinn::Connection, sessions: Sessions) {
+    while let Ok(datagram) = conn.read_datagram().await {
+        let Ok((id, rest)) = wire::take_varint(&datagram) else {
+            continue;
+        };
+        let payload = datagram.slice(datagram.len() - rest.len()..);
+        let flow = sessions
+            .lock()
+            .expect("h3 sessions lock poisoned")
+            .get(&id)
+            .cloned();
+        if let Some(flow) = flow {
+            // A full queue drops the datagram, as a congested link would.
+            let _ = flow.try_send(payload);
+        }
+    }
+    sessions.lock().expect("h3 sessions lock poisoned").clear();
+}
+
+/// One UDP flow through the server; split it to send and receive at once.
+pub struct H3UdpSession {
+    sender: H3UdpSender,
+    receiver: H3UdpReceiver,
+}
+
+impl H3UdpSession {
+    pub fn into_split(self) -> (H3UdpSender, H3UdpReceiver) {
+        (self.sender, self.receiver)
+    }
+}
+
+#[derive(Clone)]
+pub struct H3UdpSender {
+    conn: quinn::Connection,
+    prefix: Arc<[u8]>,
+}
+
+impl H3UdpSender {
+    /// Send one UDP payload. Fails for a payload the path cannot carry in
+    /// one datagram now (the caller drops it, as a too-small MTU would) and
+    /// when the connection is gone.
+    pub fn send(&self, payload: &[u8]) -> Result<()> {
+        let max = self
+            .conn
+            .max_datagram_size()
+            .ok_or_else(|| anyhow!("h3: datagrams unavailable"))?;
+        if self.prefix.len() + payload.len() > max {
+            bail!(
+                "h3: UDP payload of {} bytes over the datagram limit of {}",
+                payload.len(),
+                max - self.prefix.len()
+            );
+        }
+        let mut datagram = Vec::with_capacity(self.prefix.len() + payload.len());
+        datagram.extend_from_slice(&self.prefix);
+        datagram.extend_from_slice(payload);
+        self.conn
+            .send_datagram(datagram.into())
+            .map_err(|e| anyhow!("h3: send datagram: {e}"))
+    }
+}
+
+pub struct H3UdpReceiver {
+    rx: mpsc::Receiver<Bytes>,
+    id: u64,
+    sessions: Sessions,
+}
+
+impl H3UdpReceiver {
+    /// The next payload from the target; `None` once the connection is gone.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for H3UdpReceiver {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(&self.id);
+        }
     }
 }
 
