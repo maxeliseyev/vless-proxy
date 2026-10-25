@@ -4,7 +4,8 @@
 //! each of its streams relayed to the TCP target it names.
 //!
 //! Prototype scope: certificate from files; TCP as streams, UDP as QUIC
-//! datagrams, one UDP socket per client session. A connection whose
+//! datagrams (fragmented where the path needs it), one UDP socket per
+//! client session. A connection whose
 //! token does not check out is closed with `H3_NO_ERROR`; serving the site
 //! to such clients over HTTP/3 comes later.
 
@@ -269,6 +270,7 @@ impl Shared {
         let mut sessions: HashMap<u64, UdpSession> = HashMap::new();
         // Sessions whose target the policy refused: not looked up again.
         let mut refused: HashSet<u64> = HashSet::new();
+        let mut defrag = wire::Defragger::default();
         let mut sweep = tokio::time::interval(Duration::from_secs(30));
         loop {
             let datagram = tokio::select! {
@@ -287,7 +289,10 @@ impl Shared {
                     continue;
                 }
             };
-            let Ok((id, address, port, payload)) = wire::parse_client_datagram(&datagram) else {
+            let Some((id, body)) = defrag.push(datagram) else {
+                continue;
+            };
+            let Ok((address, port, payload)) = wire::parse_target(&body) else {
                 continue;
             };
             if refused.contains(&id) {
@@ -347,18 +352,23 @@ impl Shared {
         let reader = socket.clone();
         let conn = conn.clone();
         let task = tokio::spawn(async move {
-            let mut prefix = Vec::with_capacity(8);
-            wire::put_varint(&mut prefix, id);
             let mut buf = vec![0u8; 65_535];
-            while let Ok(n) = reader.recv(&mut buf).await {
-                let mut datagram = Vec::with_capacity(prefix.len() + n);
-                datagram.extend_from_slice(&prefix);
-                datagram.extend_from_slice(&buf[..n]);
-                match conn.send_datagram(datagram.into()) {
-                    Ok(()) => {}
-                    // Over the path's datagram size: dropped, like an IP fragment lost.
-                    Err(quinn::SendDatagramError::TooLarge) => {}
-                    Err(_) => break,
+            let mut packet: u16 = 0;
+            'recv: while let Ok(n) = reader.recv(&mut buf).await {
+                let Some(max) = conn.max_datagram_size() else {
+                    break;
+                };
+                packet = packet.wrapping_add(1);
+                // Too big even for fragments: dropped, like a lost IP fragment.
+                let Ok(datagrams) = wire::datagrams(id, &[], &buf[..n], max, packet) else {
+                    continue;
+                };
+                for datagram in datagrams {
+                    match conn.send_datagram(datagram) {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => continue 'recv,
+                        Err(_) => break 'recv,
+                    }
                 }
             }
         });

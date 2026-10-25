@@ -8,11 +8,20 @@
 //! its target, so a lost first one costs nothing. Server to client:
 //! `[session varint][payload]`. A session is one client flow to one target;
 //! its id is the client's choice, unique per connection.
+//!
+//! A body (target and payload, or payload) too big for the path's datagram
+//! limit goes in up to [`MAX_FRAGMENTS`] fragments:
+//! `[session | FRAGMENT varint][count << 4 | index][packet u16][chunk]`.
+//! The receiver joins the chunks of one packet id; a lost fragment loses the
+//! packet, as a lost IP fragment would. The fragment byte is never a valid
+//! address type, so a server from before fragments drops them.
 
 use crate::protocol::vless::Address;
 use anyhow::{bail, Result};
+use bytes::{Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
@@ -146,18 +155,144 @@ pub fn take_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
     Ok((value, &buf[len..]))
 }
 
-/// The front of a client datagram for `session` to `address:port`; the
-/// payload follows it.
-pub fn datagram_prefix(session: u64, address: &Address, port: u16) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(32);
-    put_varint(&mut out, session);
-    out.extend_from_slice(&encode_target(address, port)?);
-    Ok(out)
+/// Session id bit marking a fragment. Ids are counters far below it, and it
+/// keeps the varint at 4 bytes.
+pub const FRAGMENT: u64 = 1 << 29;
+
+/// Fragments one body may take; `count` has 4 bits.
+pub const MAX_FRAGMENTS: usize = 8;
+
+/// `[count << 4 | index][packet u16]` after a fragment's session id.
+const FRAGMENT_HEADER: usize = 3;
+
+/// Packets being joined at once per connection; past it the oldest is
+/// dropped.
+const MAX_PARTIAL: usize = 64;
+
+/// The datagrams carrying `head` then `payload` (a client's target header
+/// and the UDP payload, or just the payload) for `session`: one, or
+/// fragments numbered `packet` when they do not fit in `max` bytes.
+pub fn datagrams(
+    session: u64,
+    head: &[u8],
+    payload: &[u8],
+    max: usize,
+    packet: u16,
+) -> Result<Vec<Bytes>> {
+    let mut id = Vec::with_capacity(4);
+    put_varint(&mut id, session);
+    let body = head.len() + payload.len();
+    if id.len() + body <= max {
+        let mut out = BytesMut::with_capacity(id.len() + body);
+        out.extend_from_slice(&id);
+        out.extend_from_slice(head);
+        out.extend_from_slice(payload);
+        return Ok(vec![out.freeze()]);
+    }
+
+    let mut id = Vec::with_capacity(4);
+    put_varint(&mut id, session | FRAGMENT);
+    let room = max.saturating_sub(id.len() + FRAGMENT_HEADER);
+    if room == 0 {
+        bail!("datagram limit of {max} bytes leaves no room for a fragment");
+    }
+    let count = body.div_ceil(room);
+    if count > MAX_FRAGMENTS {
+        bail!("{body} bytes need {count} fragments of {room}, over {MAX_FRAGMENTS}");
+    }
+    let whole: Vec<u8> = [head, payload].concat();
+    Ok(whole
+        .chunks(room)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut out = BytesMut::with_capacity(id.len() + FRAGMENT_HEADER + chunk.len());
+            out.extend_from_slice(&id);
+            out.extend_from_slice(&[((count as u8) << 4) | index as u8]);
+            out.extend_from_slice(&packet.to_be_bytes());
+            out.extend_from_slice(chunk);
+            out.freeze()
+        })
+        .collect())
 }
 
-/// A client datagram: session, target, payload.
-pub fn parse_client_datagram(buf: &[u8]) -> Result<(u64, Address, u16, &[u8])> {
-    let (session, rest) = take_varint(buf)?;
+/// Joins fragments back into bodies, for one connection's incoming
+/// datagrams.
+#[derive(Default)]
+pub struct Defragger {
+    /// By session: the packet being joined, its chunks so far, and when it
+    /// started (for dropping the oldest).
+    partial: HashMap<u64, Partial>,
+    started: u64,
+}
+
+struct Partial {
+    packet: u16,
+    chunks: Vec<Option<Bytes>>,
+    started: u64,
+}
+
+impl Defragger {
+    /// The session and body of a datagram, once its packet is whole; `None`
+    /// for a fragment that completes nothing yet, or a malformed datagram.
+    pub fn push(&mut self, datagram: Bytes) -> Option<(u64, Bytes)> {
+        let (id, rest) = take_varint(&datagram).ok()?;
+        let rest_at = datagram.len() - rest.len();
+        if id & FRAGMENT == 0 {
+            return Some((id, datagram.slice(rest_at..)));
+        }
+        let session = id & !FRAGMENT;
+        if rest.len() < FRAGMENT_HEADER {
+            return None;
+        }
+        let count = (rest[0] >> 4) as usize;
+        let index = (rest[0] & 0x0f) as usize;
+        let packet = u16::from_be_bytes([rest[1], rest[2]]);
+        if !(2..=MAX_FRAGMENTS).contains(&count) || index >= count {
+            return None;
+        }
+        let chunk = datagram.slice(rest_at + FRAGMENT_HEADER..);
+
+        // A newer packet of the session replaces an unfinished one.
+        let stale = self
+            .partial
+            .get(&session)
+            .is_some_and(|p| p.packet != packet || p.chunks.len() != count);
+        if stale {
+            self.partial.remove(&session);
+        }
+        if !self.partial.contains_key(&session) && self.partial.len() >= MAX_PARTIAL {
+            let oldest = self
+                .partial
+                .iter()
+                .min_by_key(|(_, p)| p.started)
+                .map(|(k, _)| *k);
+            if let Some(oldest) = oldest {
+                self.partial.remove(&oldest);
+            }
+        }
+        self.started += 1;
+        let started = self.started;
+        let partial = self.partial.entry(session).or_insert_with(|| Partial {
+            packet,
+            chunks: vec![None; count],
+            started,
+        });
+        partial.chunks[index] = Some(chunk);
+        if partial.chunks.iter().any(Option::is_none) {
+            return None;
+        }
+        let partial = self.partial.remove(&session).expect("just looked up");
+        let mut body = BytesMut::new();
+        for chunk in partial.chunks.into_iter().flatten() {
+            body.extend_from_slice(&chunk);
+        }
+        Some((session, body.freeze()))
+    }
+}
+
+/// The target header at the front of a client datagram body, and the
+/// payload after it.
+pub fn parse_target(rest: &[u8]) -> Result<(Address, u16, &[u8])> {
     let need = |n: usize, rest: &[u8]| {
         if rest.len() < n {
             bail!("short datagram");
@@ -190,7 +325,7 @@ pub fn parse_client_datagram(buf: &[u8]) -> Result<(u64, Address, u16, &[u8])> {
     };
     need(2, rest)?;
     let port = u16::from_be_bytes([rest[0], rest[1]]);
-    Ok((session, address, port, &rest[2..]))
+    Ok((address, port, &rest[2..]))
 }
 
 /// Read what [`encode_target`] wrote.
@@ -250,14 +385,39 @@ mod tests {
         }
         assert!(take_varint(&[0x80, 0]).is_err());
 
-        let mut datagram = datagram_prefix(70, &Address::Domain("dns.example".into()), 53).unwrap();
-        datagram.extend_from_slice(b"query");
-        let (session, address, port, payload) = parse_client_datagram(&datagram).unwrap();
+        let target = encode_target(&Address::Domain("dns.example".into()), 53).unwrap();
+        let sent = datagrams(70, &target, b"query", 1200, 0).unwrap();
+        assert_eq!(sent.len(), 1);
+        let (session, body) = Defragger::default().push(sent[0].clone()).unwrap();
+        let (address, port, payload) = parse_target(&body).unwrap();
         assert_eq!(
             (session, address.to_string(), port, payload),
             (70, "dns.example".into(), 53, &b"query"[..])
         );
-        assert!(parse_client_datagram(&datagram[..4]).is_err());
+        assert!(parse_target(&body[..4]).is_err());
+    }
+
+    #[test]
+    fn big_bodies_go_in_fragments() {
+        let target = encode_target(&Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 443).unwrap();
+        let payload: Vec<u8> = (0..1250u32).map(|i| i as u8).collect();
+        let sent = datagrams(5, &target, &payload, 1129, 9).unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|d| d.len() <= 1129));
+        // A server from before fragments sees no address type in them.
+        assert!(parse_target(&sent[0][4..]).is_err());
+
+        // Out of order, with a fragment of an older packet in between.
+        let old = datagrams(5, &target, &payload, 1129, 8).unwrap();
+        let mut defrag = Defragger::default();
+        assert!(defrag.push(sent[1].clone()).is_none());
+        assert!(defrag.push(old[0].clone()).is_none());
+        assert!(defrag.push(sent[1].clone()).is_none());
+        let (session, body) = defrag.push(sent[0].clone()).unwrap();
+        let (_, port, got) = parse_target(&body).unwrap();
+        assert_eq!((session, port, got), (5, 443, &payload[..]));
+
+        assert!(datagrams(5, &target, &[0; 20_000], 1129, 0).is_err());
     }
 
     #[test]

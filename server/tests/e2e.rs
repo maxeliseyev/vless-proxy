@@ -239,7 +239,16 @@ async fn udp_sessions_echo_over_datagrams() {
         .unwrap()
         .unwrap();
     assert_eq!(back.len(), 1200);
-    assert!(out.send(&[0u8; 4000]).is_err(), "over the datagram limit");
+
+    // Over the datagram limit: fragments both ways, joined whole.
+    let big: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
+    out.send(&big).unwrap();
+    let back = timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back[..], &big[..]);
+    assert!(out.send(&[0u8; 20_000]).is_err(), "over the fragment limit");
 }
 
 #[tokio::test]

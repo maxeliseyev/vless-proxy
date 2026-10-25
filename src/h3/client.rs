@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Poll};
 use std::time::Duration;
@@ -44,9 +44,9 @@ struct Live {
     conn: quinn::Connection,
     sessions: Sessions,
     next_session: Arc<AtomicU64>,
-    /// Whether a UDP payload over the datagram limit was logged yet; once
+    /// Whether fragmenting for the datagram limit was logged yet; once
     /// per connection, it would flood the log otherwise.
-    oversize_logged: Arc<AtomicBool>,
+    fragments_logged: Arc<AtomicBool>,
 }
 
 pub struct H3Client {
@@ -137,7 +137,7 @@ impl H3Client {
             bail!("h3: the server does not take datagrams");
         }
         let id = live.next_session.fetch_add(1, Ordering::Relaxed);
-        let prefix: Arc<[u8]> = wire::datagram_prefix(id, address, port)?.into();
+        let target: Arc<[u8]> = wire::encode_target(address, port)?.into();
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
         live.sessions
             .lock()
@@ -146,8 +146,10 @@ impl H3Client {
         Ok(H3UdpSession {
             sender: H3UdpSender {
                 conn: live.conn,
-                prefix,
-                oversize_logged: live.oversize_logged,
+                id,
+                target,
+                packet: Arc::default(),
+                fragments_logged: live.fragments_logged,
             },
             receiver: H3UdpReceiver {
                 rx,
@@ -193,7 +195,7 @@ impl H3Client {
             conn,
             sessions,
             next_session: Arc::new(AtomicU64::new(0)),
-            oversize_logged: Arc::default(),
+            fragments_logged: Arc::default(),
         };
         *slot = Some(live.clone());
         Ok(live)
@@ -221,12 +223,13 @@ impl H3Client {
         let mut auth = conn.open_uni().await.context("h3: open auth stream")?;
         auth.write_all(&token).await.context("h3: send auth")?;
         auth.finish().context("h3: send auth")?;
+        // The address only at debug: the shared log masks names, not IPs.
         info!(
-            "h3: connected to {} ({addr}), datagrams up to {} bytes",
+            "h3: connected to {}, datagrams up to {} bytes",
             self.server_name,
             conn.max_datagram_size().unwrap_or(0)
         );
-        debug!("h3: rtt {:?}", conn.rtt());
+        debug!("h3: {addr}, rtt {:?}", conn.rtt());
         Ok((endpoint, addr, conn))
     }
 }
@@ -240,14 +243,14 @@ fn unspecified(remote: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Hand each datagram of `conn` to its session until the connection ends,
-/// then end every session.
+/// Hand each datagram of `conn` to its session (joining fragments) until
+/// the connection ends, then end every session.
 async fn dispatch(conn: quinn::Connection, sessions: Sessions) {
+    let mut defrag = wire::Defragger::default();
     while let Ok(datagram) = conn.read_datagram().await {
-        let Ok((id, rest)) = wire::take_varint(&datagram) else {
+        let Some((id, payload)) = defrag.push(datagram) else {
             continue;
         };
-        let payload = datagram.slice(datagram.len() - rest.len()..);
         let flow = sessions
             .lock()
             .expect("h3 sessions lock poisoned")
@@ -276,38 +279,36 @@ impl H3UdpSession {
 #[derive(Clone)]
 pub struct H3UdpSender {
     conn: quinn::Connection,
-    prefix: Arc<[u8]>,
-    oversize_logged: Arc<AtomicBool>,
+    id: u64,
+    /// The session's target header, at the front of every datagram body.
+    target: Arc<[u8]>,
+    /// Number of the next fragmented packet.
+    packet: Arc<AtomicU16>,
+    fragments_logged: Arc<AtomicBool>,
 }
 
 impl H3UdpSender {
-    /// Send one UDP payload. Fails for a payload the path cannot carry in
-    /// one datagram now (the caller drops it, as a too-small MTU would) and
-    /// when the connection is gone.
+    /// Send one UDP payload, in fragments when it does not fit the path's
+    /// datagram limit. Fails for a payload too big even for those (the
+    /// caller drops it, as a too-small MTU would) and when the connection
+    /// is gone.
     pub fn send(&self, payload: &[u8]) -> Result<()> {
         let max = self
             .conn
             .max_datagram_size()
             .ok_or_else(|| anyhow!("h3: datagrams unavailable"))?;
-        if self.prefix.len() + payload.len() > max {
-            if !self.oversize_logged.swap(true, Ordering::Relaxed) {
-                info!(
-                    "h3: dropping UDP payloads over {} bytes, the path's datagram limit now",
-                    max - self.prefix.len()
-                );
-            }
-            bail!(
-                "h3: UDP payload of {} bytes over the datagram limit of {}",
-                payload.len(),
-                max - self.prefix.len()
-            );
+        let packet = self.packet.fetch_add(1, Ordering::Relaxed);
+        let datagrams = wire::datagrams(self.id, &self.target, payload, max, packet)
+            .map_err(|e| anyhow!("h3: UDP payload of {} bytes: {e}", payload.len()))?;
+        if datagrams.len() > 1 && !self.fragments_logged.swap(true, Ordering::Relaxed) {
+            info!("h3: datagram limit {max} bytes, larger UDP payloads go in fragments");
         }
-        let mut datagram = Vec::with_capacity(self.prefix.len() + payload.len());
-        datagram.extend_from_slice(&self.prefix);
-        datagram.extend_from_slice(payload);
-        self.conn
-            .send_datagram(datagram.into())
-            .map_err(|e| anyhow!("h3: send datagram: {e}"))
+        for datagram in datagrams {
+            self.conn
+                .send_datagram(datagram)
+                .map_err(|e| anyhow!("h3: send datagram: {e}"))?;
+        }
+        Ok(())
     }
 }
 
