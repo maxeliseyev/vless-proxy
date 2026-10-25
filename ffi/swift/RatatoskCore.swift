@@ -36,7 +36,12 @@ final class RatatoskEngine {
         let box = Unmanaged.passRetained(LogSink(sink)).toOpaque() // lives for the process
         ratatosk_set_logger({ ctx, level, line in
             guard let ctx, let line else { return }
-            Unmanaged<LogSink>.fromOpaque(ctx).takeUnretainedValue().sink(level, String(cString: line))
+            // Called on the core's threads, which have no autorelease pool:
+            // without one, whatever Foundation autoreleases stays until the
+            // thread ends, and the core's threads never end.
+            autoreleasepool {
+                Unmanaged<LogSink>.fromOpaque(ctx).takeUnretainedValue().sink(level, String(cString: line))
+            }
         }, box, maxLevel)
     }
 
@@ -129,11 +134,19 @@ final class RatatoskEngine {
         }
     }
 
+    /// Called on a core thread for every packet (see `setLogger` on why the
+    /// pool): without it each write leaks its bridged array and number,
+    /// and the extension dies at its memory limit after ~100 MB of traffic.
     private func write(_ packet: Data) {
-        // IP version from the first nibble: 4 or 6.
-        let family = (packet.first ?? 0) >> 4 == 6 ? AF_INET6 : AF_INET
-        flow.writePackets([packet], withProtocols: [NSNumber(value: family)])
+        autoreleasepool {
+            // IP version from the first nibble: 4 or 6.
+            let family = (packet.first ?? 0) >> 4 == 6 ? Self.inet6 : Self.inet
+            flow.writePackets([packet], withProtocols: [family])
+        }
     }
+
+    private static let inet = NSNumber(value: AF_INET)
+    private static let inet6 = NSNumber(value: AF_INET6)
 }
 
 private final class LogSink {
