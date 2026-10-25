@@ -336,3 +336,49 @@ async fn connection_survives_a_network_change() {
     assert_eq!(&back[..], b"udp after");
     assert_eq!(client.handshakes(), 1, "moved, not reconnected");
 }
+
+/// Past the 30 s idle timeout: kept up by pings while a stream is open.
+#[tokio::test]
+async fn open_stream_keeps_the_connection_alive() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = echo_target(&stand);
+    let mut stream = client.open_tcp(&address, port).await.unwrap();
+    let mut buf = [0u8; 4];
+    stream.write_all(b"ping").await.unwrap();
+    stream.read_exact(&mut buf).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    stream.write_all(b"pong").await.unwrap();
+    timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("stream died while idle")
+        .unwrap();
+    assert_eq!(&buf, b"pong");
+    assert_eq!(client.handshakes(), 1);
+}
+
+/// With nothing open there are no pings: the connection times out, and the
+/// next stream dials a new one.
+#[tokio::test]
+async fn idle_connection_is_let_go() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = echo_target(&stand);
+    let mut buf = [0u8; 4];
+    {
+        let mut stream = client.open_tcp(&address, port).await.unwrap();
+        stream.write_all(b"once").await.unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
+    }
+    let conn = client.connection().await.unwrap();
+    timeout(Duration::from_secs(40), conn.closed())
+        .await
+        .expect("idle connection was kept alive");
+
+    let mut stream = client.open_tcp(&address, port).await.unwrap();
+    stream.write_all(b"back").await.unwrap();
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"back");
+    assert_eq!(client.handshakes(), 2);
+}

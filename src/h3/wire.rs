@@ -155,6 +155,10 @@ pub fn take_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
     Ok((value, &buf[len..]))
 }
 
+/// The client's keep-alive: session 0 with an empty body, which names no
+/// target, so a server drops it after it has reset the idle timer.
+pub const KEEP_ALIVE: &[u8] = &[0];
+
 /// Session id bit marking a fragment. Ids are counters far below it, and it
 /// keeps the varint at 4 bytes.
 pub const FRAGMENT: u64 = 1 << 29;

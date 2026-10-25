@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Poll};
 use std::time::Duration;
@@ -22,7 +22,9 @@ use uuid::Uuid;
 /// Without traffic for this long the connection is gone (both ends agree on
 /// the smaller of their values)...
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// ...so it is pinged this often while it should stay up.
+/// ...so it is pinged this often while a stream or UDP session is open.
+/// With none it is left to time out: pings would keep the phone's cellular
+/// radio from sleeping, and the next flow just dials again.
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 /// UDP payload size of QUIC packets from the start, Chrome's value. The
@@ -44,6 +46,8 @@ struct Live {
     conn: quinn::Connection,
     sessions: Sessions,
     next_session: Arc<AtomicU64>,
+    /// Streams and UDP sessions open on the connection.
+    open: Arc<AtomicUsize>,
     /// Whether fragmenting for the datagram limit was logged yet; once
     /// per connection, it would flood the log otherwise.
     fragments_logged: Arc<AtomicBool>,
@@ -95,7 +99,6 @@ impl H3Client {
         let mut transport = quinn::TransportConfig::default();
         transport
             .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30 s fits a VarInt")))
-            .keep_alive_interval(Some(KEEP_ALIVE))
             .initial_mtu(INITIAL_MTU);
         config.transport_config(Arc::new(transport));
         Ok(Self {
@@ -119,13 +122,15 @@ impl H3Client {
     /// first read.
     pub async fn open_tcp(&self, address: &Address, port: u16) -> Result<H3Stream> {
         let header = wire::encode_target(address, port)?;
-        let conn = self.connection().await?;
-        let (mut send, recv) = conn.open_bi().await.context("h3: open stream")?;
+        let live = self.live().await?;
+        let open = Open::new(&live.open);
+        let (mut send, recv) = live.conn.open_bi().await.context("h3: open stream")?;
         send.write_all(&header).await.context("h3: send target")?;
         Ok(H3Stream {
             send,
             recv,
             status: None,
+            _open: open,
         })
     }
 
@@ -155,6 +160,7 @@ impl H3Client {
                 rx,
                 id,
                 sessions: live.sessions,
+                _open: Open::new(&live.open),
             },
         })
     }
@@ -189,12 +195,15 @@ impl H3Client {
         let (endpoint, remote, conn) = self.dial().await?;
         let sessions = Sessions::default();
         tokio::spawn(dispatch(conn.clone(), sessions.clone()));
+        let open = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(keep_alive(conn.clone(), open.clone()));
         let live = Live {
             endpoint,
             remote,
             conn,
             sessions,
             next_session: Arc::new(AtomicU64::new(0)),
+            open,
             fragments_logged: Arc::default(),
         };
         *slot = Some(live.clone());
@@ -240,6 +249,39 @@ fn unspecified(remote: SocketAddr) -> SocketAddr {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    }
+}
+
+/// Ping `conn` every [`KEEP_ALIVE`] while anything is open on it, until it
+/// closes. The ping is [`wire::KEEP_ALIVE`], a datagram servers ignore; quinn
+/// has no ping of its own to call.
+async fn keep_alive(conn: quinn::Connection, open: Arc<AtomicUsize>) {
+    let mut ticks = tokio::time::interval(KEEP_ALIVE);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = conn.closed() => return,
+            _ = ticks.tick() => {}
+        }
+        if open.load(Ordering::Relaxed) > 0 {
+            let _ = conn.send_datagram(Bytes::from_static(wire::KEEP_ALIVE));
+        }
+    }
+}
+
+/// Counts one stream or session as open while it lives.
+struct Open(Arc<AtomicUsize>);
+
+impl Open {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -316,6 +358,7 @@ pub struct H3UdpReceiver {
     rx: mpsc::Receiver<Bytes>,
     id: u64,
     sessions: Sessions,
+    _open: Open,
 }
 
 impl H3UdpReceiver {
@@ -339,6 +382,7 @@ pub struct H3Stream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     status: Option<Status>,
+    _open: Open,
 }
 
 impl AsyncRead for H3Stream {
