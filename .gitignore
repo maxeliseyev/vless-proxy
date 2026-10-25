@@ -8,6 +8,8 @@ server.txt
 /deploy/trial-server/.env
 /deploy/trial-server/.hy2-password
 /deploy/trial-server/hy2-*.yaml
+/deploy/trial-server/h3-server.toml
+/deploy/trial-server/.h3-uuid
 /deploy/trial-server/site/*.bin
 
 # tspu-trial.sh reports (they carry the tester IP)

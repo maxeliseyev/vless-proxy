@@ -498,7 +498,12 @@ fn read_url_file(path: &PathBuf) -> Result<String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("No vless:// or vpn:// link found in {}", path.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No vless://, h3:// or vpn:// link found in {}",
+                path.display()
+            )
+        })
 }
 
 /// `~/.config/vproxy`
@@ -560,7 +565,7 @@ fn ask_for_link() -> Result<String> {
     for attempt in 1..=3 {
         write!(
             stderr,
-            "Paste your vless:// (or Amnezia vpn://) link and press Enter: "
+            "Paste your vless://, h3:// (or Amnezia vpn://) link and press Enter: "
         )?;
         stderr.flush()?;
         let mut line = String::new();

@@ -6,7 +6,7 @@
 
 ## Что нужно
 
-- VPS с Docker и docker compose, открытые порты: 80/tcp, 443/tcp, 443/udp, 5201/tcp+udp, 8443/udp, 8444/udp.
+- VPS с Docker и docker compose, открытые порты: 80/tcp, 443/tcp, 443/udp, 5201/tcp+udp, 8443/udp, 8444/udp, 8445/udp (h3-транспорт).
 - Домен (или поддомен) с A-записью на IP VPS. Сертификат Let's Encrypt Caddy получает сам по HTTP-01, поэтому порт 80 должен быть доступен снаружи.
 
 ## Запуск
@@ -24,6 +24,7 @@ bash setup.sh example.ru          # .env, site/10m.bin, site/1g.bin, hy2-brutal.
 docker compose up -d              # Caddy + iperf3
 docker compose logs -f caddy      # ждать "certificate obtained successfully"
 docker compose --profile hysteria up -d
+docker compose --profile h3 up -d          # наш h3-транспорт (vproxy-server) на 8445/udp
 ```
 
 Проверки с любой машины (нужен curl с HTTP/3, см. шапку `tspu-trial.sh`):
@@ -37,6 +38,8 @@ iperf3 -u -c example.ru -b 10M -t 10
 `setup.sh` печатает ссылки `hysteria2://…` для официальных клиентов (H4) и готовую команду для тестировщиков.
 
 ## Детали
+
+- h3-транспорт: образ `ghcr.io/maxeliseyev/vproxy-server` из релиза, ничего собирать на VPS не нужно. `setup.sh` создаёт `h3-server.toml` (сертификат из хранилища Caddy, один uuid в `.h3-uuid`) и печатает ссылку `h3://…`, её принимают `vproxy` и Ratatosk. После продления сертификата: `docker compose --profile h3 restart`. Лог: `docker compose logs -f h3`.
 
 - HTTP/3 в Caddy включён по умолчанию, заголовок `Alt-Svc` он добавляет сам. Выпускающий центр закреплён на Let's Encrypt, чтобы путь к сертификату в томе `caddy_data` был известен Hysteria.
 - Hysteria 2 слушает UDP 8443 (Brutal, когда клиент присылает bandwidth) и UDP 8444 (`ignoreClientBandwidth: true`, то есть BBR). Порт 443/udp занят Caddy, это осознанная разница с продуктивной схемой: H4 проверяет сигнатуру реализации, а не порт. Чужие клиенты и активный пробинг получают через Hysteria тот же сайт (маскировка на `http://caddy:8080`).

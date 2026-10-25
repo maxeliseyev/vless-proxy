@@ -55,6 +55,12 @@ jobs:
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: target/${{ matrix.target }}/release/vproxy --version
+      # The h3 server runs on Linux VPSes only.
+      - name: Build vproxy-server
+        if: startsWith(matrix.name, 'linux')
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p vproxy-server
+          target/${{ matrix.target }}/release/vproxy-server --help
       - name: Package
         run: |
           set -eu
@@ -66,6 +72,15 @@ jobs:
           tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
           (cd dist && shasum -a 256 "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
           cat "dist/$pkg.tar.gz.sha256"
+          if [ -f "target/${{ matrix.target }}/release/vproxy-server" ]; then
+            spkg="vproxy-server-${{ matrix.name }}"
+            mkdir -p "dist/$spkg"
+            cp "target/${{ matrix.target }}/release/vproxy-server" "dist/$spkg/"
+            cp server/README.md "dist/$spkg/"
+            tar -C dist -czf "dist/$spkg.tar.gz" "$spkg"
+            (cd dist && shasum -a 256 "$spkg.tar.gz" > "$spkg.tar.gz.sha256")
+            cat "dist/$spkg.tar.gz.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -113,6 +128,8 @@ jobs:
           mkdir -p dist/amd64 dist/arm64
           tar -xzf artifacts/vproxy-linux-x86_64-musl.tar.gz -C dist/amd64 --strip-components=1 vproxy-linux-x86_64-musl/vproxy
           tar -xzf artifacts/vproxy-linux-arm64-musl.tar.gz -C dist/arm64 --strip-components=1 vproxy-linux-arm64-musl/vproxy
+          tar -xzf artifacts/vproxy-server-linux-x86_64-musl.tar.gz -C dist/amd64 --strip-components=1 vproxy-server-linux-x86_64-musl/vproxy-server
+          tar -xzf artifacts/vproxy-server-linux-arm64-musl.tar.gz -C dist/arm64 --strip-components=1 vproxy-server-linux-arm64-musl/vproxy-server
           ls -la dist/*
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -126,6 +143,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           echo "tags=ghcr.io/${{ github.repository_owner }}/vproxy:${version},ghcr.io/${{ github.repository_owner }}/vproxy:latest" >> "$GITHUB_OUTPUT"
+          echo "server=ghcr.io/${{ github.repository_owner }}/vproxy-server:${version},ghcr.io/${{ github.repository_owner }}/vproxy-server:latest" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -133,3 +151,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/server.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.server }}

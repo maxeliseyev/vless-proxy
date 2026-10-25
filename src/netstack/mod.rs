@@ -161,10 +161,11 @@ impl Netstack {
         let outbound = match self.connector.open_udp(address.clone(), dst.port()).await {
             Ok(outbound) => outbound,
             Err(error) => {
-                // Vision refuses UDP/443 on purpose: QUIC falls back to TCP,
-                // which then shows up in the log; the refusal itself does not.
+                // Vision refuses UDP/443 on purpose, h3 has no UDP yet: QUIC
+                // falls back to TCP, which then shows up in the log; the
+                // refusal itself does not.
                 let text = error.to_string();
-                if text.contains("XTLS rejected") {
+                if text.contains("XTLS rejected") || text.contains("UDP over h3 is not supported") {
                     debug!("Dropping UDP to {address}:{}: {text}", dst.port());
                 } else if text.contains("blocked by routing") {
                     debug!("Dropping UDP to {address}:{}: {text}", dst.port());

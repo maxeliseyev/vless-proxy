@@ -36,6 +36,20 @@ gen() {
 gen brutal 8443 false
 gen bbr 8444 true
 
+# h3-транспорт (vproxy-server): один uuid на стенд, сертификат из хранилища Caddy.
+if [ ! -f .h3-uuid ]; then
+    cat /proc/sys/kernel/random/uuid >.h3-uuid
+    chmod 600 .h3-uuid
+fi
+H3_UUID=$(cat .h3-uuid)
+CERTS=/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN
+cat >h3-server.toml <<TOML
+listen = "0.0.0.0:8445"
+cert = "$CERTS/$DOMAIN.crt"
+key = "$CERTS/$DOMAIN.key"
+users = ["$H3_UUID"]
+TOML
+
 cat <<MSG
 
 Готово. Дальше:
@@ -50,6 +64,8 @@ cat <<MSG
 Ссылки для тестировщиков (H4):
   hysteria2://$PASSWORD@$DOMAIN:8443/?sni=$DOMAIN#brutal
   hysteria2://$PASSWORD@$DOMAIN:8444/?sni=$DOMAIN#bbr
+h3-транспорт (docker compose --profile h3 up -d, порт 8445/udp):
+  h3://$H3_UUID@$DOMAIN:8445?sni=$DOMAIN#h3-trial
 Скрипт тестировщиков:
   bash tspu-trial.sh -n "сеть" -i $DOMAIN:5201 https://$DOMAIN
 MSG

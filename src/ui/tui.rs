@@ -445,8 +445,8 @@ impl App {
                     KeyCode::Char('b') => self.switch_to_best(),
                     KeyCode::Char('a') => {
                         self.mode = Mode::Adding(String::new());
-                        self.status =
-                            "paste a vless:// link, Enter to add, Esc to cancel".to_string();
+                        self.status = "paste a vless:// or h3:// link, Enter to add, Esc to cancel"
+                            .to_string();
                     }
                     KeyCode::Char('d') | KeyCode::Delete => {
                         if let Some(entry) = self.servers.entries.get(self.selected) {
@@ -619,11 +619,9 @@ impl App {
                 .saturating_sub(width.saturating_sub(1));
             let shown: String = input.chars().skip(skip).collect();
             frame.render_widget(
-                Paragraph::new(shown.as_str()).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" add server: paste vless:// link, Enter to add, Esc to cancel "),
-                ),
+                Paragraph::new(shown.as_str()).block(Block::default().borders(Borders::ALL).title(
+                    " add server: paste vless:// or h3:// link, Enter to add, Esc to cancel ",
+                )),
                 area,
             );
             frame.set_cursor_position(Position::new(

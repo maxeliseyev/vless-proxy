@@ -53,6 +53,20 @@ services:
     depends_on:
       - caddy
 
+  # Прототип нашего h3-транспорта (vproxy-server, стадия 2 плана). Сертификат тот же,
+  # что у Caddy; поднимать после Caddy: docker compose --profile h3 up -d
+  h3:
+    image: ghcr.io/maxeliseyev/vproxy-server:latest
+    profiles: [h3]
+    restart: unless-stopped
+    ports:
+      - "8445:8445/udp"
+    volumes:
+      - ./h3-server.toml:/etc/vproxy-server/server.toml:ro
+      - caddy_data:/data:ro
+    depends_on:
+      - caddy
+
 volumes:
   caddy_data:
   caddy_config:
