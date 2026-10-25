@@ -34,7 +34,7 @@ typedef void (*RatatoskPacketCallback)(void *ctx, const uint8_t *packet, size_t 
 // Each log line, level 1 error .. 5 trace; `line` is valid only during the call.
 typedef void (*RatatoskLogCallback)(void *ctx, uint8_t level, const char *line);
 
-// Start for a vless:// or vpn:// link. NULL on failure, the reason in `error`.
+// Start for a vless://, h3:// or vpn:// link. NULL on failure, the reason in `error`.
 // `ctx` must stay valid until ratatosk_stop returns.
 RatatoskTunnel *ratatosk_start(const char *link, uint16_t mtu,
                                RatatoskPacketCallback on_packet, void *ctx,

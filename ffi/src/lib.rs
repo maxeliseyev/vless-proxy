@@ -51,7 +51,7 @@ pub struct RatatoskStats {
     pub errors: u64,
 }
 
-/// Start the tunnel core for a `vless://` or `vpn://` link. Returns NULL on
+/// Start the tunnel core for a `vless://`, `h3://` or `vpn://` link. Returns NULL on
 /// failure with the reason in `error` (truncated, NUL-terminated).
 ///
 /// # Safety

@@ -65,7 +65,7 @@ final class RatatoskEngine {
         return settings
     }
 
-    /// Start the core for a vless:// or vpn:// link and begin moving packets.
+    /// Start the core for a vless://, h3:// or vpn:// link and begin moving packets.
     func start(link: String) throws {
         var error = [CChar](repeating: 0, count: 512)
         let ctx = Unmanaged.passUnretained(self).toOpaque()
