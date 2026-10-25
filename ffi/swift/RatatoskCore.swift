@@ -70,10 +70,10 @@ final class RatatoskEngine {
         var error = [CChar](repeating: 0, count: 512)
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         let started = link.withCString { cLink in
-            ratatosk_start(cLink, UInt16(Self.mtu), { ctx, packet, len in
-                guard let ctx, let packet else { return }
+            ratatosk_start(cLink, UInt16(Self.mtu), { ctx, packets, lens, count in
+                guard let ctx, let packets, let lens else { return }
                 let engine = Unmanaged<RatatoskEngine>.fromOpaque(ctx).takeUnretainedValue()
-                engine.write(Data(bytes: packet, count: len))
+                engine.write(packets, lens, count)
             }, ctx, &error, error.count)
         }
         guard let started else {
@@ -141,14 +141,25 @@ final class RatatoskEngine {
         }
     }
 
-    /// Called on a core thread for every packet (see `setLogger` on why the
-    /// pool): without it each write leaks its bridged array and number,
-    /// and the extension dies at its memory limit after ~100 MB of traffic.
-    private func write(_ packet: Data) {
+    /// Called on a core thread with each batch of packets, written in one
+    /// call (see `setLogger` on why the pool): without it each write leaks
+    /// its bridged arrays, and the extension dies at its memory limit after
+    /// ~100 MB of traffic.
+    private func write(
+        _ packets: UnsafePointer<UnsafePointer<UInt8>?>, _ lens: UnsafePointer<Int>, _ count: Int
+    ) {
         autoreleasepool {
-            // IP version from the first nibble: 4 or 6.
-            let family = (packet.first ?? 0) >> 4 == 6 ? Self.inet6 : Self.inet
-            flow.writePackets([packet], withProtocols: [family])
+            var datas = [Data]()
+            var families = [NSNumber]()
+            datas.reserveCapacity(count)
+            families.reserveCapacity(count)
+            for i in 0..<count {
+                guard let packet = packets[i] else { continue }
+                // IP version from the first nibble: 4 or 6.
+                families.append(lens[i] > 0 && packet[0] >> 4 == 6 ? Self.inet6 : Self.inet)
+                datas.append(Data(bytes: packet, count: lens[i]))
+            }
+            flow.writePackets(datas, withProtocols: families)
         }
     }
 

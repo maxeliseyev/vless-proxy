@@ -28,9 +28,11 @@ typedef struct {
     uint64_t errors;
 } RatatoskStats;
 
-// Each IP packet the stack sends towards the system; `packet` is valid only
-// during the call. Called on a core thread.
-typedef void (*RatatoskPacketCallback)(void *ctx, const uint8_t *packet, size_t len);
+// The IP packets the stack sends towards the system, as many as are waiting
+// (up to 64): `count` packets, `packets[i]` of `lens[i]` bytes, valid only
+// during the call. Write them in one go. Called on a core thread.
+typedef void (*RatatoskPacketCallback)(void *ctx, const uint8_t *const *packets,
+                                       const size_t *lens, size_t count);
 // Each log line, level 1 error .. 5 trace; `line` is valid only during the call.
 typedef void (*RatatoskLogCallback)(void *ctx, uint8_t level, const char *line);
 

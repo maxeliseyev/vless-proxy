@@ -9,10 +9,17 @@ use std::time::Duration;
 use vproxy::netstack::fakedns::{FakeDns, DEFAULT_POOL};
 use vproxy_ffi::*;
 
-extern "C" fn collect(ctx: *mut c_void, packet: *const u8, len: usize) {
+extern "C" fn collect(
+    ctx: *mut c_void,
+    packets: *const *const u8,
+    lens: *const usize,
+    count: usize,
+) {
     let sender = unsafe { &*(ctx as *const mpsc::Sender<Vec<u8>>) };
-    let bytes = unsafe { std::slice::from_raw_parts(packet, len) }.to_vec();
-    let _ = sender.send(bytes);
+    for i in 0..count {
+        let bytes = unsafe { std::slice::from_raw_parts(*packets.add(i), *lens.add(i)) }.to_vec();
+        let _ = sender.send(bytes);
+    }
 }
 
 /// Nothing listens there: the server is only dialled for real traffic.
@@ -75,7 +82,7 @@ fn dns_query_round_trips_through_the_c_abi() {
 fn bad_link_is_refused_with_a_reason() {
     let link = CString::new("vless://not-a-uuid@host:443").unwrap();
     let mut error = [0 as std::ffi::c_char; 256];
-    extern "C" fn ignore(_: *mut c_void, _: *const u8, _: usize) {}
+    extern "C" fn ignore(_: *mut c_void, _: *const *const u8, _: *const usize, _: usize) {}
     let tunnel = unsafe {
         ratatosk_start(
             link.as_ptr(),

@@ -26,8 +26,14 @@ use vproxy::{ActiveServer, ProxyClient};
 /// Names handed out by the fake DNS before the oldest is reused.
 const FAKE_DNS_CAPACITY: u32 = 16_384;
 
-/// Called with each IP packet the stack sends towards the system.
-pub type PacketCallback = extern "C" fn(ctx: *mut c_void, packet: *const u8, len: usize);
+/// Called with the IP packets the stack sends towards the system, as many
+/// as are waiting (up to [`PACKET_BATCH`]): `count` pointers and lengths.
+pub type PacketCallback =
+    extern "C" fn(ctx: *mut c_void, packets: *const *const u8, lens: *const usize, count: usize);
+
+/// Packets handed to the host in one call at most. One `writePackets` per
+/// batch instead of per packet is most of the extension's CPU under load.
+const PACKET_BATCH: usize = 64;
 /// Called with each log line (NUL-terminated, valid only during the call).
 pub type LogCallback = extern "C" fn(ctx: *mut c_void, level: u8, line: *const c_char);
 
@@ -136,8 +142,15 @@ fn start(
     });
     runtime.spawn(async move {
         let ctx = ctx;
-        while let Some(packet) = host.from_stack.recv().await {
-            on_packet(ctx.0, packet.as_ptr(), packet.len());
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(PACKET_BATCH);
+        let mut lens = Vec::with_capacity(PACKET_BATCH);
+        while host.from_stack.recv_many(&mut batch, PACKET_BATCH).await > 0 {
+            // Pointers only between awaits: they are not Send.
+            let ptrs: Vec<*const u8> = batch.iter().map(|p| p.as_ptr()).collect();
+            lens.extend(batch.iter().map(Vec::len));
+            on_packet(ctx.0, ptrs.as_ptr(), lens.as_ptr(), batch.len());
+            lens.clear();
+            batch.clear();
         }
     });
     runtime.spawn(log_stats_every(STATS_EVERY));
