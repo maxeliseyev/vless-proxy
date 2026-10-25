@@ -290,3 +290,40 @@ async fn bulk_transfer_on_one_stream() {
     send.await.unwrap();
     assert_eq!(received, SIZE);
 }
+
+/// Wi-Fi to cellular, as far as loopback can show it: the client moves to a
+/// new socket (new source port) mid-stream and the connection carries on.
+#[tokio::test]
+async fn connection_survives_a_network_change() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = echo_target(&stand);
+    let mut stream = client.open_tcp(&address, port).await.unwrap();
+    let mut buf = [0u8; 5];
+
+    stream.write_all(b"wi-fi").await.unwrap();
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"wi-fi");
+
+    client.network_changed().await;
+    stream.write_all(b"cell!").await.unwrap();
+    timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+        .await
+        .expect("stream stalled after the move")
+        .unwrap();
+    assert_eq!(&buf, b"cell!");
+
+    let (udp_address, udp_port) = udp_echo_target(&stand);
+    let (out, mut incoming) = client
+        .open_udp(&udp_address, udp_port)
+        .await
+        .unwrap()
+        .into_split();
+    out.send(b"udp after").unwrap();
+    let back = timeout(Duration::from_secs(10), incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&back[..], b"udp after");
+    assert_eq!(client.handshakes(), 1, "moved, not reconnected");
+}

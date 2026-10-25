@@ -40,6 +40,7 @@ unsafe impl Sync for HostContext {}
 
 pub struct Tunnel {
     runtime: Option<tokio::runtime::Runtime>,
+    connector: ProxyClient,
     flows: Arc<FlowLog>,
     to_stack: mpsc::Sender<Vec<u8>>,
     stop: watch::Sender<bool>,
@@ -121,7 +122,7 @@ fn start(
     )?;
     let flows = Arc::new(FlowLog::new(DEFAULT_CAPACITY));
     let netstack = Netstack {
-        connector,
+        connector: connector.clone(),
         dns: Arc::new(FakeDns::new(DEFAULT_POOL, FAKE_DNS_CAPACITY)),
         mtu,
         flows: flows.clone(),
@@ -153,6 +154,7 @@ fn start(
     );
     Ok(Tunnel {
         runtime: Some(runtime),
+        connector,
         flows,
         to_stack: host.to_stack,
         stop,
@@ -178,6 +180,22 @@ pub unsafe extern "C" fn ratatosk_push_packet(
     }
     let bytes = std::slice::from_raw_parts(packet, len).to_vec();
     tunnel.to_stack.try_send(bytes).is_ok()
+}
+
+/// The device's network changed (the host's path monitor says so): an h3
+/// connection moves to a new socket on the new path instead of timing out.
+///
+/// # Safety
+/// `tunnel` comes from `ratatosk_start`.
+#[no_mangle]
+pub unsafe extern "C" fn ratatosk_network_changed(tunnel: *const Tunnel) {
+    let Some(tunnel) = tunnel.as_ref() else {
+        return;
+    };
+    if let Some(runtime) = tunnel.runtime.as_ref() {
+        let connector = tunnel.connector.clone();
+        runtime.spawn(async move { connector.network_changed().await });
+    }
 }
 
 /// Process-wide traffic counters.

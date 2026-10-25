@@ -312,6 +312,20 @@ impl ProxyClient {
         }
     }
 
+    /// The network under us changed: an h3 connection moves to the new path
+    /// (other transports reconnect per session anyway).
+    pub async fn network_changed(&self) {
+        let client = self
+            .h3
+            .lock()
+            .expect("h3 client lock poisoned")
+            .as_ref()
+            .map(|(_, client)| client.clone());
+        if let Some(client) = client {
+            client.network_changed().await;
+        }
+    }
+
     /// The h3 client for `server`, made on first use and reused while the
     /// server stays the same; one QUIC connection carries all its streams.
     fn h3_client(&self, server: &ServerConfig) -> Result<Arc<crate::h3::H3Client>> {

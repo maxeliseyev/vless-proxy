@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Without traffic for this long the connection is gone (both ends agree on
@@ -36,12 +36,17 @@ const SESSION_QUEUE: usize = 256;
 /// Where a connection's incoming datagrams go: session id to its flow.
 type Sessions = Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<Bytes>>>>;
 
-/// A connection and the routing of its datagrams.
+/// A connection, its socket and the routing of its datagrams.
 #[derive(Clone)]
 struct Live {
+    endpoint: quinn::Endpoint,
+    remote: SocketAddr,
     conn: quinn::Connection,
     sessions: Sessions,
     next_session: Arc<AtomicU64>,
+    /// Whether a UDP payload over the datagram limit was logged yet; once
+    /// per connection, it would flood the log otherwise.
+    oversize_logged: Arc<AtomicBool>,
 }
 
 pub struct H3Client {
@@ -142,6 +147,7 @@ impl H3Client {
             sender: H3UdpSender {
                 conn: live.conn,
                 prefix,
+                oversize_logged: live.oversize_logged,
             },
             receiver: H3UdpReceiver {
                 rx,
@@ -149,6 +155,22 @@ impl H3Client {
                 sessions: live.sessions,
             },
         })
+    }
+
+    /// The network under us changed (Wi-Fi to cellular, say): move the live
+    /// connection to a new socket, so it carries on over the new path (QUIC
+    /// connection migration) instead of dying by idle timeout.
+    pub async fn network_changed(&self) {
+        let slot = self.conn.lock().await;
+        let Some(live) = slot.as_ref().filter(|l| l.conn.close_reason().is_none()) else {
+            return;
+        };
+        let moved = std::net::UdpSocket::bind(unspecified(live.remote))
+            .and_then(|socket| live.endpoint.rebind(socket));
+        match moved {
+            Ok(()) => info!("h3: network changed, connection moved to a new socket"),
+            Err(e) => warn!("h3: network changed, cannot move the connection: {e}"),
+        }
     }
 
     /// The live connection, dialing (and authenticating) a new one if there
@@ -162,31 +184,29 @@ impl H3Client {
         if let Some(live) = slot.as_ref().filter(|l| l.conn.close_reason().is_none()) {
             return Ok(live.clone());
         }
-        let conn = self.dial().await?;
+        let (endpoint, remote, conn) = self.dial().await?;
         let sessions = Sessions::default();
         tokio::spawn(dispatch(conn.clone(), sessions.clone()));
         let live = Live {
+            endpoint,
+            remote,
             conn,
             sessions,
             next_session: Arc::new(AtomicU64::new(0)),
+            oversize_logged: Arc::default(),
         };
         *slot = Some(live.clone());
         Ok(live)
     }
 
-    async fn dial(&self) -> Result<quinn::Connection> {
+    async fn dial(&self) -> Result<(quinn::Endpoint, SocketAddr, quinn::Connection)> {
         let addr = tokio::net::lookup_host((self.host.as_str(), self.port))
             .await
             .with_context(|| format!("h3: resolve {}", self.host))?
             .next()
             .ok_or_else(|| anyhow!("h3: {} has no address", self.host))?;
         // A new socket (and source port) per connection, like a browser.
-        let bind: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("valid address")
-        } else {
-            "[::]:0".parse().expect("valid address")
-        };
-        let endpoint = quinn::Endpoint::client(bind).context("h3: UDP socket")?;
+        let endpoint = quinn::Endpoint::client(unspecified(addr)).context("h3: UDP socket")?;
         self.handshakes.fetch_add(1, Ordering::Relaxed);
         let conn = endpoint
             .connect_with(self.config.clone(), addr, &self.server_name)?
@@ -201,9 +221,22 @@ impl H3Client {
         let mut auth = conn.open_uni().await.context("h3: open auth stream")?;
         auth.write_all(&token).await.context("h3: send auth")?;
         auth.finish().context("h3: send auth")?;
-        info!("h3: connected to {} ({addr})", self.server_name);
+        info!(
+            "h3: connected to {} ({addr}), datagrams up to {} bytes",
+            self.server_name,
+            conn.max_datagram_size().unwrap_or(0)
+        );
         debug!("h3: rtt {:?}", conn.rtt());
-        Ok(conn)
+        Ok((endpoint, addr, conn))
+    }
+}
+
+/// Any local address of `remote`'s family, any port.
+fn unspecified(remote: SocketAddr) -> SocketAddr {
+    if remote.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     }
 }
 
@@ -244,6 +277,7 @@ impl H3UdpSession {
 pub struct H3UdpSender {
     conn: quinn::Connection,
     prefix: Arc<[u8]>,
+    oversize_logged: Arc<AtomicBool>,
 }
 
 impl H3UdpSender {
@@ -256,6 +290,12 @@ impl H3UdpSender {
             .max_datagram_size()
             .ok_or_else(|| anyhow!("h3: datagrams unavailable"))?;
         if self.prefix.len() + payload.len() > max {
+            if !self.oversize_logged.swap(true, Ordering::Relaxed) {
+                info!(
+                    "h3: dropping UDP payloads over {} bytes, the path's datagram limit now",
+                    max - self.prefix.len()
+                );
+            }
             bail!(
                 "h3: UDP payload of {} bytes over the datagram limit of {}",
                 payload.len(),

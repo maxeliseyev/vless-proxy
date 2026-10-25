@@ -108,6 +108,13 @@ final class RatatoskEngine {
         return buf.withUnsafeBytes { Data($0.prefix(len)) }
     }
 
+    /// The device's network changed: lets an h3 connection follow it.
+    func networkChanged() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let tunnel { ratatosk_network_changed(tunnel) }
+    }
+
     var stats: RatatoskStats {
         var stats = RatatoskStats()
         ratatosk_stats(&stats)

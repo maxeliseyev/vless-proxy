@@ -43,6 +43,10 @@ RatatoskTunnel *ratatosk_start(const char *link, uint16_t mtu,
 // One IP packet read from the system. False when dropped (queue full).
 bool ratatosk_push_packet(const RatatoskTunnel *tunnel, const uint8_t *packet, size_t len);
 
+// The device's network changed (Wi-Fi to cellular, say): an h3 connection
+// moves to the new path instead of timing out. Call from the path monitor.
+void ratatosk_network_changed(const RatatoskTunnel *tunnel);
+
 void ratatosk_stats(RatatoskStats *out);
 
 // The newest `max` flows, newest first, as a JSON array of
