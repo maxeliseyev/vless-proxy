@@ -3,7 +3,7 @@ members = [".", "ffi", "server"]
 
 [package]
 name = "vproxy"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2021"
 
 [features]
