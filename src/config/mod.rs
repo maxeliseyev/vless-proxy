@@ -299,6 +299,8 @@ pub enum Transport {
     Tcp,
     Ws,
     Xhttp,
+    /// QUIC to our own `vproxy-server` (`h3://` links), see [`crate::h3`].
+    H3,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -640,7 +642,10 @@ impl ServerConfig {
             "" | "tcp" | "raw" => Ok(Transport::Tcp),
             "ws" | "websocket" => Ok(Transport::Ws),
             "xhttp" | "splithttp" => Ok(Transport::Xhttp),
-            other => bail!("server.transport must be \"tcp\", \"ws\" or \"xhttp\", got {other:?}"),
+            "h3" => Ok(Transport::H3),
+            other => bail!(
+                "server.transport must be \"tcp\", \"ws\", \"xhttp\" or \"h3\", got {other:?}"
+            ),
         }
     }
 
@@ -676,6 +681,15 @@ impl ServerConfig {
                 bail!("server.flow (XTLS Vision) is not available over transport = \"xhttp\"");
             }
             crate::transport::xhttp::XhttpConfig::from_server(self)?;
+        }
+
+        if self.transport_kind()? == Transport::H3 {
+            if !matches!(self.transport_security()?, TransportSecurity::Tls) {
+                bail!("transport = \"h3\" needs security = \"tls\" (QUIC is always TLS 1.3)");
+            }
+            if self.flow.is_some() {
+                bail!("server.flow (XTLS Vision) is not available over transport = \"h3\"");
+            }
         }
 
         if self.flow.is_some() && !matches!(self.transport_security()?, TransportSecurity::Reality)

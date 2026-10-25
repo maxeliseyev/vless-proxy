@@ -9,3 +9,6 @@ server.txt
 /deploy/trial-server/.hy2-password
 /deploy/trial-server/hy2-*.yaml
 /deploy/trial-server/site/*.bin
+
+# tspu-trial.sh reports (they carry the tester IP)
+results/

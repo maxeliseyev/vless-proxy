@@ -37,6 +37,8 @@ pub enum OutboundStream {
     Proxy(Box<RemoteStream>),
     /// A session multiplexed over a shared VLESS connection.
     Mux(MuxStream),
+    /// A stream on the shared QUIC connection to an h3 server.
+    H3(crate::h3::H3Stream),
     Direct(TcpStream),
 }
 
@@ -55,6 +57,7 @@ impl AsyncRead for OutboundStream {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutboundStream::H3(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -69,6 +72,7 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutboundStream::H3(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -80,6 +84,7 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_flush(cx),
             OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutboundStream::H3(s) => std::pin::Pin::new(s).poll_flush(cx),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
@@ -91,6 +96,7 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             OutboundStream::Proxy(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             OutboundStream::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutboundStream::H3(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             OutboundStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -101,6 +107,9 @@ pub enum UdpOutbound {
     Proxy(Box<RemoteStream>),
     Direct(UdpSocket),
 }
+
+/// An h3 client and the key (address, SNI, account) it was made for.
+type KeyedH3Client = (String, Arc<crate::h3::H3Client>);
 
 /// The server new sessions are opened to. Swappable at runtime: existing
 /// sessions keep their server, new ones use the replacement.
@@ -154,6 +163,11 @@ pub struct ProxyClient {
     /// network-reachable inbound, where it would turn the proxy into a pivot
     /// into the host's own network.
     private_direct: bool,
+    /// The h3 client of the active server, kept with the key it was made
+    /// for (address, SNI, account) and replaced when the server changes.
+    h3: Arc<std::sync::Mutex<Option<KeyedH3Client>>>,
+    /// Roots h3 servers are checked against instead of the system's.
+    h3_roots: Option<Arc<rustls::RootCertStore>>,
 }
 
 impl ProxyClient {
@@ -184,6 +198,8 @@ impl ProxyClient {
             mux,
             handshakes,
             private_direct: true,
+            h3: Arc::default(),
+            h3_roots: None,
         })
     }
 
@@ -191,6 +207,13 @@ impl ProxyClient {
     /// (see [`ProxyClient::private_direct`]).
     pub fn allow_private_direct(mut self, allow: bool) -> Self {
         self.private_direct = allow;
+        self
+    }
+
+    /// Check h3 servers' certificates against `roots` only, instead of the
+    /// system's trust store (a private CA, tests).
+    pub fn with_h3_roots(mut self, roots: rustls::RootCertStore) -> Self {
+        self.h3_roots = Some(Arc::new(roots));
         self
     }
 
@@ -259,8 +282,20 @@ impl ProxyClient {
                 Ok(OutboundStream::Direct(stream))
             }
             Outbound::Proxy => {
+                let server = self.server.get();
+                if server.transport_kind()? == Transport::H3 {
+                    // Resolved here when DNS policy says so, as for VLESS.
+                    let request_address = self.resolver.resolve(address, port).await?;
+                    let client = self.h3_client(&server)?;
+                    let stream = timeout(
+                        Duration::from_secs(self.runtime.connect_timeout_secs),
+                        client.open_tcp(&request_address, port),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
+                    return Ok(OutboundStream::H3(stream));
+                }
                 if let Some(mux) = &self.mux {
-                    let server = self.server.get();
                     // Vision cannot be multiplexed; such servers get plain sessions.
                     if server.vision_flow()?.is_none() {
                         return Ok(OutboundStream::Mux(
@@ -273,6 +308,36 @@ impl ProxyClient {
                 )))
             }
         }
+    }
+
+    /// The h3 client for `server`, made on first use and reused while the
+    /// server stays the same; one QUIC connection carries all its streams.
+    fn h3_client(&self, server: &ServerConfig) -> Result<Arc<crate::h3::H3Client>> {
+        let key = format!(
+            "{}|{}|{}",
+            server.endpoint(),
+            server.tls_server_name(),
+            server.uuid
+        );
+        let mut slot = self.h3.lock().expect("h3 client lock poisoned");
+        if let Some((current, client)) = slot.as_ref() {
+            if *current == key {
+                return Ok(client.clone());
+            }
+        }
+        let roots = match &self.h3_roots {
+            Some(roots) => (**roots).clone(),
+            None => crate::transport::tls::system_root_store(),
+        };
+        let client = Arc::new(crate::h3::H3Client::with_roots(
+            &server.address,
+            server.port,
+            server.tls_server_name(),
+            server.uuid,
+            roots,
+        )?);
+        *slot = Some((key, client.clone()));
+        Ok(client)
     }
 
     /// A Mux.Cool session to `address:port`, dialing a new multiplexed VLESS
@@ -325,9 +390,14 @@ impl ProxyClient {
                 socket.connect(target).await?;
                 Ok(UdpOutbound::Direct(socket))
             }
-            Outbound::Proxy => Ok(UdpOutbound::Proxy(Box::new(
-                self.connect_udp_target(address, port).await?,
-            ))),
+            Outbound::Proxy => {
+                if self.server.get().transport_kind()? == Transport::H3 {
+                    anyhow::bail!("UDP over h3 is not supported yet: {address}:{port}");
+                }
+                Ok(UdpOutbound::Proxy(Box::new(
+                    self.connect_udp_target(address, port).await?,
+                )))
+            }
         }
     }
 
@@ -1330,6 +1400,19 @@ pub(crate) fn reality_client(server: &ServerConfig) -> Result<RealityClient> {
 /// and describe the result. Used by `vproxy --probe`.
 pub async fn probe_transport(config: &Config) -> Result<String> {
     let server = &config.server;
+    if server.transport_kind()? == Transport::H3 {
+        let elapsed = measure_handshake(
+            server,
+            Duration::from_secs(config.runtime.connect_timeout_secs),
+        )
+        .await?;
+        return Ok(format!(
+            "QUIC handshake OK with {} (sni {}, alpn h3) in {} ms",
+            server.endpoint(),
+            server.tls_server_name(),
+            elapsed.as_millis()
+        ));
+    }
     let remote = tokio::time::timeout(
         Duration::from_secs(config.runtime.connect_timeout_secs),
         connect_remote(server),
@@ -1371,6 +1454,20 @@ pub async fn probe_transport(config: &Config) -> Result<String> {
 /// `--ping` show as latency.
 pub async fn measure_handshake(server: &ServerConfig, limit: Duration) -> Result<Duration> {
     let started = std::time::Instant::now();
+    if server.transport_kind()? == Transport::H3 {
+        let client = crate::h3::H3Client::new(
+            &server.address,
+            server.port,
+            server.tls_server_name(),
+            server.uuid,
+        )?;
+        let conn = timeout(limit, client.connection())
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout after {}s", limit.as_secs()))??;
+        let elapsed = started.elapsed();
+        conn.close(crate::h3::wire::H3_NO_ERROR.into(), b"");
+        return Ok(elapsed);
+    }
     let remote = timeout(limit, connect_remote(server))
         .await
         .map_err(|_| anyhow::anyhow!("timeout after {}s", limit.as_secs()))??;
@@ -1472,6 +1569,9 @@ async fn connect_remote(server: &ServerConfig) -> Result<MaybeTlsStream<TcpStrea
         (Transport::Xhttp, _) => Ok(MaybeTlsStream::Xhttp(
             crate::transport::xhttp::connect(server).await?,
         )),
+        // One shared QUIC connection, not a stream per session: ProxyClient
+        // routes h3 servers to its H3Client before getting here.
+        (Transport::H3, _) => anyhow::bail!("h3 servers carry no per-session transport"),
     }
 }
 
@@ -1488,7 +1588,7 @@ async fn prime_remote<C: AsyncRead + Unpin>(
         OutboundStream::Proxy(r) => r.header_pending(),
         // A mux session opens with its first payload, or alone when the
         // local side reads first; nothing to wait for here.
-        OutboundStream::Mux(_) | OutboundStream::Direct(_) => false,
+        OutboundStream::Mux(_) | OutboundStream::H3(_) | OutboundStream::Direct(_) => false,
     };
     if !pending {
         return Ok(false);

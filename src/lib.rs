@@ -6,6 +6,7 @@
 //! - [`protocol`]: VLESS framing, REALITY, XTLS Vision, Mux.Cool and the
 //!   Chrome-shaped ClientHello.
 //! - [`transport`]: TLS, WebSocket and XHTTP carriers.
+//! - [`h3`]: the QUIC transport to our own server (`vproxy-server`).
 //! - [`inbound`]: the local SOCKS5 and HTTP listeners.
 //! - [`proxy`]: the relay, routing, DNS, counters and the `serve` entry point.
 //! - [`system`]: TUN mode (sing-box), installing sing-box, services, the
@@ -20,6 +21,7 @@
 //! the core that spawns no processes (the iOS build).
 
 pub mod config;
+pub mod h3;
 pub mod inbound;
 pub mod logging;
 pub mod netstack;

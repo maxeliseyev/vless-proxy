@@ -61,8 +61,8 @@ pub fn config_from_link(link: &str, inbound_port: u16) -> Result<Config> {
     if amnezia::is_link(link) {
         return amnezia::from_link(link, inbound_port);
     }
-    if !link.starts_with("vless://") {
-        bail!("expected a vless:// or vpn:// link");
+    if !link.starts_with("vless://") && !link.starts_with("h3://") {
+        bail!("expected a vless://, h3:// or vpn:// link");
     }
     let url = VlessUrl::parse(link)?;
     let config = Config::from_vless_url(&url, inbound_port);

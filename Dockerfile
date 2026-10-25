@@ -14,6 +14,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 COPY ffi ./ffi
+COPY server ./server
 RUN cargo build --release --locked && strip target/release/vproxy
 
 FROM alpine:3.21

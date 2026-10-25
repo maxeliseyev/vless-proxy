@@ -25,6 +25,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
       - run: cargo test
+      - run: cargo clippy -p vproxy-server --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
+      - run: cargo test -p vproxy-server
 
   audit:
     name: cargo audit

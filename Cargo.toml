@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ffi"]
+members = [".", "ffi", "server"]
 
 [package]
 name = "vproxy"
@@ -59,11 +59,15 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # Userspace TCP/IP stack for the in-process TUN (iOS Packet Tunnel).
 ipstack = "1.0.1"
+# QUIC for the h3 transport (docs/h3-transport-plan.md); rustls comes from
+# the fork patched in below, like everywhere else.
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 
 [dev-dependencies]
 tempfile = "3"
 etherparse = "0.20"
 tun-rs = { version = "2.8.13", default-features = false, features = ["async"] }
+rcgen = "0.13"
 
 [patch.crates-io]
 # vproxy fork of rustls 0.23: adds ClientConfig::session_id_hook (REALITY) and

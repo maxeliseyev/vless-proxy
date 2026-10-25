@@ -340,7 +340,7 @@ pub fn parse_body(body: &str) -> (Vec<String>, usize) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with("vless://") || line.starts_with("vpn://") {
+        if line.starts_with("vless://") || line.starts_with("h3://") || line.starts_with("vpn://") {
             if !links.contains(&line.to_string()) {
                 links.push(line.to_string());
             }

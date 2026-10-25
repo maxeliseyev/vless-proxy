@@ -30,11 +30,15 @@ impl VlessUrl {
     pub fn parse(url: &str) -> Result<Self> {
         let url = url.trim();
 
-        if !url.starts_with("vless://") {
-            bail!("URL must start with vless://");
-        }
-
-        let without_scheme = &url[8..];
+        // `h3://` is our own QUIC transport: same shape as a vless:// link,
+        // always TLS (see crate::h3).
+        let (h3, without_scheme) = if let Some(rest) = url.strip_prefix("vless://") {
+            (false, rest)
+        } else if let Some(rest) = url.strip_prefix("h3://") {
+            (true, rest)
+        } else {
+            bail!("URL must start with vless:// or h3://");
+        };
 
         let (auth_with_host, fragment) = match without_scheme.split_once('#') {
             Some((base, frag)) => (base, Some(url_decode(frag))),
@@ -60,6 +64,7 @@ impl VlessUrl {
         }
 
         let transport = match params.get("type").map(|t| t.to_ascii_lowercase()) {
+            _ if h3 => "h3".to_string(),
             None => "tcp".to_string(),
             Some(t) if t == "tcp" || t == "raw" => "tcp".to_string(),
             Some(t) if t == "ws" || t == "websocket" => "ws".to_string(),
@@ -84,7 +89,10 @@ impl VlessUrl {
         let security = params
             .get("security")
             .cloned()
-            .unwrap_or_else(|| "none".to_string());
+            .unwrap_or_else(|| if h3 { "tls" } else { "none" }.to_string());
+        if h3 && security != "tls" {
+            bail!("h3:// links are always TLS, got security={security}");
+        }
         let sni = params
             .get("sni")
             .cloned()
@@ -223,6 +231,25 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.port, 8443);
         assert_eq!(parsed.transport, "ws");
+    }
+
+    #[test]
+    fn parses_h3_links() {
+        let parsed = VlessUrl::parse(
+            "h3://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?sni=site.example#own",
+        )
+        .unwrap();
+        assert_eq!(parsed.transport, "h3");
+        assert_eq!(parsed.security, "tls");
+        assert_eq!(parsed.sni.as_deref(), Some("site.example"));
+        assert_eq!(parsed.remark.as_deref(), Some("own"));
+        let config = crate::config::Config::from_vless_url(&parsed, 1080);
+        config.server.validate_transport_settings().unwrap();
+        assert!(!config.needs_xray_sidecar().unwrap());
+        assert!(VlessUrl::parse(
+            "h3://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@h.example:443?security=reality"
+        )
+        .is_err());
     }
 
     #[test]

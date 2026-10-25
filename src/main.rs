@@ -830,7 +830,11 @@ fn parse_args() -> Result<Args> {
             Some(value) if value.starts_with('-') => {
                 anyhow::bail!("Unknown argument: {value}");
             }
-            Some(value) if value.starts_with("vless://") || value.starts_with("vpn://") => {
+            Some(value)
+                if value.starts_with("vless://")
+                    || value.starts_with("h3://")
+                    || value.starts_with("vpn://") =>
+            {
                 if vless_url.is_some() {
                     anyhow::bail!("VLESS URL can only be provided once");
                 }

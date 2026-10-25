@@ -7,6 +7,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::debug;
 
+/// The system's trusted roots plus Mozilla's (webpki-roots).
+pub fn system_root_store() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
+    let native_certs = rustls_native_certs::load_native_certs();
+    if !native_certs.errors.is_empty() {
+        debug!(
+            "Skipped {} invalid native certificates while building trust store",
+            native_certs.errors.len()
+        );
+    }
+    root_store.add_parsable_certificates(native_certs.certs);
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    root_store
+}
+
 pub struct TlsClient {
     config: Arc<rustls::ClientConfig>,
     server_name: String,
@@ -21,17 +36,7 @@ impl TlsClient {
     /// TLS client offering the given ALPN protocols (e.g. `http/1.1` for WebSocket).
     pub fn with_alpn(server_name: impl Into<String>, alpn: &[&str]) -> Result<Self> {
         let server_name = server_name.into();
-        let mut root_store = rustls::RootCertStore::empty();
-
-        let native_certs = rustls_native_certs::load_native_certs();
-        if !native_certs.errors.is_empty() {
-            debug!(
-                "Skipped {} invalid native certificates while building trust store",
-                native_certs.errors.len()
-            );
-        }
-        root_store.add_parsable_certificates(native_certs.certs);
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let root_store = system_root_store();
 
         // Both `ring` and `aws-lc-rs` are compiled in (reqwest pulls ring), so
         // rustls cannot pick a process-level provider on its own; choose explicitly.
