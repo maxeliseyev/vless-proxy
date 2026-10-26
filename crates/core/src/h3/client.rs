@@ -20,8 +20,14 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Without traffic for this long the connection is gone (both ends agree on
-/// the smaller of their values)...
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// the smaller of their values, so this 20 s wins over the server's 30 s).
+/// Kept short on purpose: when a mobile path silently black-holes (the Wi-Fi
+/// interface stays "up" but stops forwarding, so iOS reports no change and
+/// migration is never triggered), this is how long the dead connection — and
+/// every multiplexed flow on it — hangs before the next flow redials. Lower
+/// trades a little battery and the odd dropped-then-redialed connection in a
+/// brief tunnel/elevator stall for roughly half the worst-case dead air.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// ...so it is pinged this often while a stream or UDP session is open.
 /// With none it is left to time out: pings would keep the phone's cellular
 /// radio from sleeping, and the next flow just dials again.
