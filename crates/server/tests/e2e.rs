@@ -69,7 +69,17 @@ async fn stand(allow_private: bool) -> Stand {
 fn client(stand: &Stand, uuid: Uuid) -> H3Client {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(stand.cert.clone()).unwrap();
-    H3Client::with_roots("127.0.0.1", stand.server.port(), NAME, uuid, roots).unwrap()
+    // Chrome fingerprint: the existing tests then also cover the reshaped
+    // QUIC ClientHello handshaking against the server.
+    H3Client::with_roots(
+        "127.0.0.1",
+        stand.server.port(),
+        NAME,
+        uuid,
+        roots,
+        vproxy_core::protocol::fingerprint::Fingerprint::Chrome,
+    )
+    .unwrap()
 }
 
 fn echo_target(stand: &Stand) -> (Address, u16) {

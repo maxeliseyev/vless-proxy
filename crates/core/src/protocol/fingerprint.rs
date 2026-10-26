@@ -42,6 +42,7 @@ const EXT_ALPS: u16 = 17613; // application_settings, new code point
 const EXT_TRUST_ANCHORS: u16 = 0xca34; // draft-ietf-tls-trust-anchor-ids
 const EXT_ECH: u16 = 0xfe0d;
 const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0x0039;
 
 const X25519MLKEM768: u16 = 0x11ec;
 const X25519: u16 = 0x001d;
@@ -58,6 +59,9 @@ const CIPHER_SUITES: [u16; 15] = [
 const SIGNATURE_ALGORITHMS: [u16; 8] = [
     0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
 ];
+
+/// rsa_pkcs1_sha1: Chrome appends it to the QUIC signature-algorithms list.
+const RSA_PKCS1_SHA1: u16 = 0x0201;
 
 /// ML-DSA-44/65/87, which Chrome 155 lists first (after a GREASE value).
 const MLDSA_SIGNATURE_ALGORITHMS: [u16; 3] = [0x0904, 0x0905, 0x0906];
@@ -223,6 +227,7 @@ impl ChromeHello {
             EXT_TRUST_ANCHORS,
             EXT_ECH,
             EXT_RENEGOTIATION_INFO,
+            EXT_QUIC_TRANSPORT_PARAMS,
         ] {
             ranks.insert(ext, rng.gen());
         }
@@ -469,11 +474,105 @@ impl ChromeHello {
             extensions: exts,
         })
     }
+
+    /// Build a Chrome-QUIC-shaped hello. Unlike [`ChromeHello::shape`], this
+    /// keeps the `quic_transport_parameters` extension quinn produced (RFC
+    /// 9001 requires it) and uses Chrome's QUIC extension set: ALPS and ALPN
+    /// are `h3`, the cipher list is the three TLS 1.3 suites with no GREASE
+    /// suite, and the TCP-only extensions are dropped. The transport-parameter
+    /// contents, the QUIC version and the Initial packet layout stay quinn's,
+    /// so this shapes the handshake's TLS layer only (see docs; the uQUIC
+    /// `QUICChrome` presets are the reference).
+    pub fn shape_quic(&self, original: &ParsedHello, retry: bool) -> Option<ParsedHello> {
+        if original.extension(EXT_PRE_SHARED_KEY).is_some()
+            || original.extension(EXT_EARLY_DATA).is_some()
+        {
+            return None; // resumption: the binder covers the exact bytes
+        }
+        // The three TLS 1.3 suites Chrome offers over QUIC (no GREASE suite).
+        let cipher_suites = vec![0x1301, 0x1302, 0x1303];
+
+        let mut exts: Vec<(u16, Vec<u8>)> = Vec::with_capacity(12);
+        // Required by RFC 9001: carry quinn's transport parameters through.
+        let qtp = original.extension(EXT_QUIC_TRANSPORT_PARAMS)?;
+        exts.push((EXT_QUIC_TRANSPORT_PARAMS, qtp.to_vec()));
+        if let Some(sni) = original.extension(EXT_SERVER_NAME) {
+            exts.push((EXT_SERVER_NAME, sni.to_vec()));
+        }
+        exts.push((
+            EXT_SUPPORTED_GROUPS,
+            u16_list(&[
+                self.grease_group,
+                X25519MLKEM768,
+                X25519,
+                SECP256R1,
+                SECP384R1,
+            ]),
+        ));
+        if let Some(alpn) = original.extension(EXT_ALPN) {
+            exts.push((EXT_ALPN, alpn.to_vec()));
+        }
+        // Chrome's classic signature algorithms plus rsa_pkcs1_sha1 (uQUIC).
+        let mut sigalgs = SIGNATURE_ALGORITHMS.to_vec();
+        sigalgs.push(RSA_PKCS1_SHA1);
+        exts.push((EXT_SIGNATURE_ALGORITHMS, u16_list(&sigalgs)));
+        if let Some(shares) = original.extension(EXT_KEY_SHARE) {
+            // Keep rustls's shares (the key exchange state); a one-byte GREASE
+            // share goes first, as in Chrome's first hello.
+            let body = shares.get(2..)?;
+            let mut data = Vec::with_capacity(shares.len() + 5);
+            if !retry {
+                data.extend_from_slice(&self.grease_group.to_be_bytes());
+                data.extend_from_slice(&1u16.to_be_bytes());
+                data.push(0);
+            }
+            data.extend_from_slice(body);
+            let mut ext = Vec::with_capacity(data.len() + 2);
+            ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&data);
+            exts.push((EXT_KEY_SHARE, ext));
+        }
+        exts.push((EXT_PSK_KEY_EXCHANGE_MODES, vec![0x01, 0x01]));
+        exts.push((
+            EXT_SUPPORTED_VERSIONS,
+            vec![
+                4,
+                (self.grease_version >> 8) as u8,
+                self.grease_version as u8,
+                0x03,
+                0x04,
+            ],
+        ));
+        exts.push((EXT_COMPRESS_CERTIFICATE, vec![0x02, 0x00, 0x02]));
+        exts.push((EXT_ALPS, vec![0x00, 0x03, 0x02, b'h', b'3']));
+        if let Some(cookie) = original.extension(EXT_COOKIE) {
+            exts.push((EXT_COOKIE, cookie.to_vec()));
+        }
+        exts.sort_by_key(|(typ, _)| self.ranks.get(typ).copied().unwrap_or(u32::MAX));
+        exts.insert(0, (self.grease_ext1, Vec::new()));
+        exts.push((self.grease_ext2, vec![0x00]));
+
+        Some(ParsedHello {
+            version: 0x0303,
+            random: original.random,
+            session_id: original.session_id.clone(),
+            cipher_suites,
+            compression: vec![0x00],
+            extensions: exts,
+        })
+    }
 }
 
 impl ClientHelloRewriter for ChromeHello {
     fn rewrite(&self, raw_client_hello: &[u8], retry: bool) -> Option<Vec<u8>> {
         let original = ParsedHello::parse(raw_client_hello)?;
+        // QUIC carries the transport-parameters extension; its presence marks
+        // the handshake as QUIC and selects the QUIC shape.
+        if original.extension(EXT_QUIC_TRANSPORT_PARAMS).is_some() {
+            let shaped = self.shape_quic(&original, retry)?.encode();
+            tracing::debug!("ClientHello shaped like Chrome (QUIC)");
+            return Some(shaped);
+        }
         let shaped = self.shape(&original, retry)?.encode();
         if let Some(ja4) = ja4(&shaped) {
             tracing::debug!("ClientHello shaped like Chrome (JA4 {ja4})");
@@ -774,5 +873,66 @@ mod tests {
         );
         assert_eq!(Fingerprint::parse(Some("none")), Fingerprint::None);
         assert_eq!(Fingerprint::parse(Some("rustls")), Fingerprint::None);
+    }
+
+    /// A hello of the shape quinn/rustls sends for QUIC: empty session id, an
+    /// ALPN of `h3`, and the quic_transport_parameters extension.
+    fn rustls_like_quic_hello() -> ParsedHello {
+        let mut h = rustls_like_hello();
+        h.session_id = Vec::new();
+        h.extensions
+            .retain(|(t, _)| *t != EXT_ALPN && *t != EXT_SERVER_NAME);
+        let mut sni = vec![0, 0, 0, 0, 0];
+        sni.extend_from_slice(b"intel.com");
+        let l = (sni.len() - 2) as u16;
+        sni[0..2].copy_from_slice(&l.to_be_bytes());
+        sni[3..5].copy_from_slice(&(l - 3).to_be_bytes());
+        h.extensions.push((EXT_SERVER_NAME, sni));
+        h.extensions
+            .push((EXT_ALPN, vec![0, 3, 2, b'h', b'3']));
+        // Opaque transport parameters, as quinn encodes them.
+        h.extensions
+            .push((EXT_QUIC_TRANSPORT_PARAMS, vec![0x01, 0x02, 0x03, 0x04]));
+        h
+    }
+
+    #[test]
+    fn shaped_quic_hello_matches_chrome() {
+        let chrome = ChromeHello::from_seed(Profile::Chrome155, [5u8; 32]);
+        let original = rustls_like_quic_hello();
+        let raw = chrome.rewrite(&original.encode(), false).unwrap();
+        let h = ParsedHello::parse(&raw).unwrap();
+
+        // The three TLS 1.3 suites, no GREASE suite (unlike the TCP shape).
+        assert_eq!(h.cipher_suites, vec![0x1301, 0x1302, 0x1303]);
+        assert!(h.session_id.is_empty());
+
+        // The transport parameters survive untouched: the handshake needs them.
+        assert_eq!(
+            h.extension(EXT_QUIC_TRANSPORT_PARAMS),
+            Some([0x01, 0x02, 0x03, 0x04].as_slice())
+        );
+        // ALPS is h3, not h2.
+        assert_eq!(h.extension(EXT_ALPS), Some([0, 3, 2, b'h', b'3'].as_slice()));
+
+        let types: Vec<u16> = h.extensions.iter().map(|(t, _)| *t).collect();
+        assert!(is_grease(types[0]) && is_grease(*types.last().unwrap()));
+        // No TCP-only extensions leak into the QUIC hello.
+        for t in [
+            EXT_EXTENDED_MASTER_SECRET,
+            EXT_RENEGOTIATION_INFO,
+            EXT_SESSION_TICKET,
+            EXT_STATUS_REQUEST,
+            EXT_SCT,
+            EXT_EC_POINT_FORMATS,
+            EXT_TRUST_ANCHORS,
+            EXT_ECH,
+        ] {
+            assert!(!types.contains(&t), "QUIC hello must not carry {t:#06x}");
+        }
+        // rsa_pkcs1_sha1 is appended to the signature algorithms.
+        let sigalgs: Vec<u16> =
+            be_u16s(&h.extension(EXT_SIGNATURE_ALGORITHMS).unwrap()[2..]).collect();
+        assert_eq!(sigalgs.last(), Some(&RSA_PKCS1_SHA1));
     }
 }

@@ -351,6 +351,7 @@ impl ProxyClient {
             server.tls_server_name(),
             server.uuid,
             roots,
+            server.fingerprint_kind(),
         )?);
         *slot = Some((key, client.clone()));
         Ok(client)
@@ -1428,6 +1429,7 @@ pub async fn measure_handshake(server: &ServerConfig, limit: Duration) -> Result
             server.port,
             server.tls_server_name(),
             server.uuid,
+            server.fingerprint_kind(),
         )?;
         let conn = timeout(limit, client.connection())
             .await

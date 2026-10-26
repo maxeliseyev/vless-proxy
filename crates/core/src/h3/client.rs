@@ -68,13 +68,20 @@ pub struct H3Client {
 impl H3Client {
     /// A client for `host:port` presenting `server_name` in TLS, trusting
     /// the system's roots and Mozilla's.
-    pub fn new(host: &str, port: u16, server_name: &str, uuid: Uuid) -> Result<Self> {
+    pub fn new(
+        host: &str,
+        port: u16,
+        server_name: &str,
+        uuid: Uuid,
+        fingerprint: crate::protocol::fingerprint::Fingerprint,
+    ) -> Result<Self> {
         Self::with_roots(
             host,
             port,
             server_name,
             uuid,
             crate::transport::tls::system_root_store(),
+            fingerprint,
         )
     }
 
@@ -85,6 +92,7 @@ impl H3Client {
         server_name: &str,
         uuid: Uuid,
         roots: rustls::RootCertStore,
+        fingerprint: crate::protocol::fingerprint::Fingerprint,
     ) -> Result<Self> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -93,6 +101,8 @@ impl H3Client {
             .with_root_certificates(roots)
             .with_no_client_auth();
         tls.alpn_protocols = vec![ALPN.to_vec()];
+        // Shape the ClientHello inside the QUIC Initial like Chrome's.
+        tls.client_hello_rewriter = fingerprint.rewriter();
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .map_err(|e| anyhow!("QUIC client config: {e}"))?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
