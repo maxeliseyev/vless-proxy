@@ -8,7 +8,12 @@
 //! client session. Ordinary HTTP/3 clients receive content from the
 //! operator-configured HTTP backend, deployed separately from this binary.
 
+mod admin;
 mod http3;
+mod stats;
+
+pub use admin::{fetch as fetch_stats, DEFAULT_SOCKET as DEFAULT_ADMIN_SOCKET};
+pub use stats::{AccountSnapshot, Snapshot, Stats};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::pem::PemObject;
@@ -17,6 +22,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
@@ -67,6 +73,10 @@ pub struct Settings {
     /// Without it, ordinary HTTP/3 requests receive a neutral 404 response.
     #[serde(default)]
     pub site_backend: Option<String>,
+    /// Local Unix socket for live stats (`vproxy-server --stats`/`--tui`).
+    /// Defaults to [`admin::DEFAULT_SOCKET`]; set to "" to turn it off.
+    #[serde(default)]
+    pub admin: Option<String>,
 }
 
 impl Settings {
@@ -87,6 +97,8 @@ pub struct Server {
     users: Arc<[Uuid]>,
     allow_private: bool,
     site: Option<http3::Site>,
+    stats: Arc<Stats>,
+    admin: Option<PathBuf>,
 }
 
 impl Server {
@@ -106,6 +118,12 @@ impl Server {
         if let Some(backend) = &settings.site_backend {
             server = server.with_site_backend(backend)?;
         }
+        // On by default; `admin = ""` turns it off.
+        server.admin = match settings.admin.as_deref() {
+            Some("") => None,
+            Some(path) => Some(PathBuf::from(path)),
+            None => Some(PathBuf::from(admin::DEFAULT_SOCKET)),
+        };
         Ok(server)
     }
 
@@ -139,6 +157,8 @@ impl Server {
             users: users.into(),
             allow_private,
             site: None,
+            stats: Arc::new(Stats::new()),
+            admin: None,
         })
     }
 
@@ -149,6 +169,12 @@ impl Server {
         Ok(self)
     }
 
+    /// Serve live stats on this local Unix socket instead of the default.
+    pub fn with_admin(mut self, path: PathBuf) -> Self {
+        self.admin = Some(path);
+        self
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
     }
@@ -156,10 +182,20 @@ impl Server {
     /// Accept connections until the endpoint is closed.
     pub async fn run(self) -> Result<()> {
         info!("listening on {}/udp", self.local_addr()?);
+        let stats = self.stats.clone();
+        if let Some(path) = self.admin.clone() {
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                if let Err(e) = admin::serve(&path, stats).await {
+                    warn!("admin socket: {e:#}");
+                }
+            });
+        }
         let shared = Arc::new(Shared {
             users: self.users,
             allow_private: self.allow_private,
             site: self.site,
+            stats,
         });
         while let Some(incoming) = self.endpoint.accept().await {
             let shared = shared.clone();
@@ -178,6 +214,7 @@ struct Shared {
     users: Arc<[Uuid]>,
     allow_private: bool,
     site: Option<http3::Site>,
+    stats: Arc<Stats>,
 }
 
 impl Shared {
@@ -187,10 +224,12 @@ impl Shared {
         let (user, transport) = http3::Transport::classify(conn.clone(), &self.users).await?;
         let Some(user) = user else {
             debug!("{remote}: serving HTTP/3");
+            self.stats.site_request();
             return http3::serve(transport, self.site.clone()).await;
         };
         drop(transport);
         let tag = account_tag(&user);
+        self.stats.conn_open(&tag);
         info!("{remote}: connected as {tag}");
         tokio::spawn(self.clone().datagrams(conn.clone()));
         loop {
@@ -198,7 +237,7 @@ impl Shared {
                 Ok(stream) => stream,
                 Err(e) => {
                     info!("{remote} ({tag}): closed: {e}");
-                    return Ok(());
+                    break;
                 }
             };
             let this = self.clone();
@@ -209,6 +248,8 @@ impl Shared {
                 }
             });
         }
+        self.stats.conn_close(&tag);
+        Ok(())
     }
 
     /// One TCP target: read its header, connect, answer with the status
@@ -229,7 +270,12 @@ impl Shared {
         send.write_all(&[Status::Connected as u8]).await?;
         let mut client = tokio::io::join(recv, send);
         let mut target = target;
-        tokio::io::copy_bidirectional(&mut client, &mut target).await?;
+        self.stats.stream_open();
+        // Bytes are tallied when the stream ends (client->target = up).
+        let relayed = tokio::io::copy_bidirectional(&mut client, &mut target).await;
+        let (up, down) = relayed.as_ref().copied().unwrap_or((0, 0));
+        self.stats.stream_close(up, down);
+        relayed?;
         Ok(())
     }
 
@@ -322,7 +368,11 @@ impl Shared {
             }
             let session = sessions.get_mut(&id).expect("just inserted");
             session.last = Instant::now();
-            let _ = session.socket.send(payload).await;
+            if session.socket.send(payload).await.is_ok() {
+                session
+                    .bytes_up
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            }
         }
         for session in sessions.values() {
             session.task.abort();
@@ -354,10 +404,14 @@ impl Shared {
         let socket = Arc::new(socket);
         let reader = socket.clone();
         let conn = conn.clone();
+        let bytes_up = Arc::new(AtomicU64::new(0));
+        let bytes_down = Arc::new(AtomicU64::new(0));
+        let down = bytes_down.clone();
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
             let mut packet: u16 = 0;
             'recv: while let Ok(n) = reader.recv(&mut buf).await {
+                down.fetch_add(n as u64, Ordering::Relaxed);
                 let Some(max) = conn.max_datagram_size() else {
                     break;
                 };
@@ -375,10 +429,14 @@ impl Shared {
                 }
             }
         });
+        self.stats.udp_open();
         Ok(UdpSession {
             socket,
             last: Instant::now(),
             task,
+            stats: self.stats.clone(),
+            bytes_up,
+            bytes_down,
         })
     }
 }
@@ -387,6 +445,19 @@ struct UdpSession {
     socket: Arc<UdpSocket>,
     last: Instant,
     task: JoinHandle<()>,
+    stats: Arc<Stats>,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.stats.udp_close(
+            self.bytes_up.load(Ordering::Relaxed),
+            self.bytes_down.load(Ordering::Relaxed),
+        );
+    }
 }
 
 async fn refuse(mut send: quinn::SendStream, status: Status, why: String) -> Result<()> {

@@ -28,6 +28,7 @@ http = "1.5.0"
 bytes = "1.12.1"
 h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h3-webtransport = "0.1.2"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 rcgen = "0.13"

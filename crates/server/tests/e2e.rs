@@ -23,12 +23,14 @@ struct Stand {
     echo: SocketAddr,
     udp_echo: SocketAddr,
     cert: CertificateDer<'static>,
+    admin: std::path::PathBuf,
 }
 
 async fn stand(allow_private: bool) -> Stand {
     let generated = rcgen::generate_simple_self_signed(vec![NAME.to_string()]).unwrap();
     let cert = CertificateDer::from(generated.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
+    let admin = std::env::temp_dir().join(format!("vproxy-e2e-{}.sock", Uuid::new_v4()));
     let server = Server::bind(
         "127.0.0.1:0".parse().unwrap(),
         vec![cert.clone()],
@@ -36,7 +38,8 @@ async fn stand(allow_private: bool) -> Stand {
         vec![ALICE],
         allow_private,
     )
-    .unwrap();
+    .unwrap()
+    .with_admin(admin.clone());
     let server_addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
 
@@ -63,6 +66,7 @@ async fn stand(allow_private: bool) -> Stand {
         echo: echo_addr,
         udp_echo: udp_echo_addr,
         cert,
+        admin,
     }
 }
 
@@ -391,4 +395,34 @@ async fn idle_connection_is_let_go() {
     stream.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"back");
     assert_eq!(client.handshakes(), 2);
+}
+
+/// The admin socket reports a connected client and its open stream.
+#[tokio::test]
+async fn stats_report_a_connection_and_its_stream() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = echo_target(&stand);
+    let mut stream = client.open_tcp(&address, port).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+
+    // The admin socket comes up alongside the server; retry briefly.
+    let mut snap = None;
+    for _ in 0..30 {
+        if let Ok(s) = vproxy_server::fetch_stats(&stand.admin).await {
+            snap = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let snap = snap.expect("admin socket never answered");
+    assert!(snap.conns_open >= 1, "a client is connected: {snap:?}");
+    assert_eq!(snap.conns_total, 1);
+    assert!(snap.streams_open >= 1, "the echo stream is open: {snap:?}");
+    assert!(snap.streams_total >= 1);
+    assert_eq!(snap.accounts.len(), 1);
+    assert_eq!(snap.accounts[0].open, 1);
 }
