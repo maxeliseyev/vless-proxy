@@ -11,11 +11,8 @@ FROM rust:1-alpine AS build
 RUN apk add --no-cache build-base cmake perl git linux-headers
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY examples ./examples
-COPY ffi ./ffi
-COPY server ./server
-RUN cargo build --release --locked && strip target/release/vproxy
+COPY crates ./crates
+RUN cargo build -p vproxy --release --locked && strip target/release/vproxy
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates && mkdir -p /data /root/.config/vproxy

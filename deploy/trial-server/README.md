@@ -41,6 +41,13 @@ iperf3 -u -c example.ru -b 10M -t 10
 
 - h3-транспорт: образ `ghcr.io/maxeliseyev/vproxy-server` из релиза, ничего собирать на VPS не нужно. `setup.sh` создаёт `h3-server.toml` (сертификат из хранилища Caddy, один uuid в `.h3-uuid`) и печатает ссылку `h3://…`, её принимают `vproxy` и Ratatosk. После продления сертификата: `docker compose --profile h3 restart`. Лог: `docker compose logs -f h3`.
 
+- В исходниках сервер уже поддерживает обычные HTTP/3 GET/HEAD через
+  `site_backend = "http://caddy:8080"`; `setup.sh` добавляет эту настройку
+  в новые конфиги. Изменение ещё не выпущено и не развёрнуто на VPS.
+  Текущий стенд сохраняет разные UDP-порты Caddy и прокси; перенос на общий
+  UDP/443 выполняется отдельно. Подробности — в
+  [README сервера](../../crates/server/README.md).
+
 - HTTP/3 в Caddy включён по умолчанию, заголовок `Alt-Svc` он добавляет сам. Выпускающий центр закреплён на Let's Encrypt, чтобы путь к сертификату в томе `caddy_data` был известен Hysteria.
 - Hysteria 2 слушает UDP 8443 (Brutal, когда клиент присылает bandwidth) и UDP 8444 (`ignoreClientBandwidth: true`, то есть BBR). Порт 443/udp занят Caddy, это осознанная разница с продуктивной схемой: H4 проверяет сигнатуру реализации, а не порт. Чужие клиенты и активный пробинг получают через Hysteria тот же сайт (маскировка на `http://caddy:8080`).
 - После продления сертификата (раз в 60 дней) Hysteria надо перезапустить: `docker compose --profile hysteria restart`.

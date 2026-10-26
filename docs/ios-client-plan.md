@@ -2,6 +2,11 @@
 
 Статус: этапы 0–2 сделаны 2026-10-24, этап 1 проверен на живом сервере, дальше Xcode-проект. Цель: VPN-приложение для iPhone, которое использует то же Rust-ядро, что и CLI (REALITY, Vision, Mux, XHTTP, WS, routing, подписки), без xray-core и sing-box.
 
+После разделения workspace (2026-10-26) ядро находится в `crates/core`,
+FFI — в `crates/ffi`, а desktop-интеграция — в `crates/cli`. Ядру больше
+не нужны feature-флаги для исключения TUI и внешних процессов; актуальные
+команды сборки — в [architecture.md](architecture.md).
+
 ## 1. Чем iOS отличается от desktop
 
 | Desktop vproxy | iOS |
@@ -35,7 +40,7 @@
 └────────────────────────────────────────────┘
 ```
 
-- **Шов с ядром.** `ProxyClient::open_tcp(address, port)` и `open_udp` (`src/proxy/runtime.rs`) уже принимают цель и сами выбирают proxy, direct или block. Стек только достаёт потоки из пакетов и вызывает их.
+- **Шов с ядром.** `ProxyClient::open_tcp(address, port)` и `open_udp` (`crates/core/src/proxy/runtime.rs`) уже принимают цель и сами выбирают proxy, direct или block. Стек только достаёт потоки из пакетов и вызывает их.
 - **Сетевой стек.** Готовый крейт, не свой. Кандидаты: `ipstack` (на нём tun2proxy) и `netstack-smoltcp`. Выбор после прототипа на нагрузке и памяти.
 - **DNS.** FakeDNS: туннель отдаёт системе свой DNS-адрес, стек отвечает фейковыми IP и помнит домен. Routing работает по доменам, на сервер уходит домен.
 - **FFI.** UniFFI или C ABI через cbindgen. API: `start(config, packet_callback)`, `push_packets`, `stop`, `stats`, `switch_server`, `ping`. Сборка в `.xcframework` для `aarch64-apple-ios` и `aarch64-apple-ios-sim`.
@@ -44,9 +49,9 @@
 
 ## 3. Этапы
 
-0. **Сделано.** Cargo features: `cli = tui + desktop` по умолчанию; `tui` включает ratatui, crossterm и `ui`; `desktop` включает `system` (sing-box, xray-core, установщик, службы), tempfile и tar. Бинарь требует `cli`. `cargo build --lib --no-default-features --target aarch64-apple-ios` собирается, aws-lc-rs и форк rustls тоже. Без `desktop` конфиг с xray-сайдкаром или TUN через sing-box отклоняется понятной ошибкой. CI-джоб `ios-core` проверяет это на каждом push.
-1. **Rust netstack + FakeDNS, первая версия готова.** `src/netstack/`: `ipstack` превращает пакеты в TCP-потоки и UDP-потоки, каждый идёт через `ProxyClient` (TCP через `relay_tcp`, тот же relay и таймауты, что у SOCKS). `FakeDns` раздаёт адреса из `198.18.0.0/15` (DNS-сервер туннеля `198.18.0.2`), на сервер уходит домен; AAAA и HTTPS получают пустой ответ. `device::channel_device` — устройство на каналах для iOS. Проверено e2e-тестами на вручную собранных пакетах (TCP и UDP до mock VLESS-сервера). Осталось: прогон на живом сервере через `examples/utun.rs` (нужен sudo), замер памяти под нагрузкой, ICMP не поддерживается.
-2. **FFI готов.** Крейт `ffi/` (`vproxy-ffi`, staticlib, ручной C ABI в `ffi/include/ratatosk.h`): `ratatosk_start` по ссылке, `ratatosk_push_packet`, callback с пакетами наружу, `ratatosk_stats`, `ratatosk_stop`, `ratatosk_set_logger`. `scripts/build-xcframework.sh` собирает `target/RatatoskCore.xcframework` (iPhone + симулятор Apple Silicon, профиль `ios`). Swift-обёртка `ffi/swift/RatatoskCore.swift` (`RatatoskEngine`: настройки сети, цикл `readPackets`/`writePackets`) и шаблон `PacketTunnelProvider.swift`. Проверено: тесты через C ABI, C-программа в симуляторе iOS (DNS-пакет туда и обратно), Swift проходит typecheck против iOS SDK; бинарь со статической библиотекой после strip около 7 МБ. Пока нет: событий потоков для экрана лога, смены сервера, пинга.
+0. **Сделано.** Исторически Cargo features: `cli = tui + desktop` по умолчанию; `tui` включает ratatui, crossterm и `ui`; `desktop` включает `system` (sing-box, xray-core, установщик, службы), tempfile и tar. Бинарь требует `cli`. `cargo build -p vproxy-core --lib --target aarch64-apple-ios` собирается, aws-lc-rs и форк rustls тоже. Без `desktop` конфиг с xray-сайдкаром или TUN через sing-box отклоняется понятной ошибкой. CI-джоб `ios-core` проверяет это на каждом push.
+1. **Rust netstack + FakeDNS, первая версия готова.** `crates/core/src/netstack/`: `ipstack` превращает пакеты в TCP-потоки и UDP-потоки, каждый идёт через `ProxyClient` (TCP через `relay_tcp`, тот же relay и таймауты, что у SOCKS). `FakeDns` раздаёт адреса из `198.18.0.0/15` (DNS-сервер туннеля `198.18.0.2`), на сервер уходит домен; AAAA и HTTPS получают пустой ответ. `device::channel_device` — устройство на каналах для iOS. Проверено e2e-тестами на вручную собранных пакетах (TCP и UDP до mock VLESS-сервера). Осталось: прогон на живом сервере через `examples/utun.rs` (нужен sudo), замер памяти под нагрузкой, ICMP не поддерживается.
+2. **FFI готов.** Крейт `crates/ffi/` (`vproxy-ffi`, staticlib, ручной C ABI в `crates/ffi/include/ratatosk.h`): `ratatosk_start` по ссылке, `ratatosk_push_packet`, callback с пакетами наружу, `ratatosk_stats`, `ratatosk_stop`, `ratatosk_set_logger`. `scripts/build-xcframework.sh` собирает `target/RatatoskCore.xcframework` (iPhone + симулятор Apple Silicon, профиль `ios`). Swift-обёртка `crates/ffi/swift/RatatoskCore.swift` (`RatatoskEngine`: настройки сети, цикл `readPackets`/`writePackets`) и шаблон `PacketTunnelProvider.swift`. Проверено: тесты через C ABI, C-программа в симуляторе iOS (DNS-пакет туда и обратно), Swift проходит typecheck против iOS SDK; бинарь со статической библиотекой после strip около 7 МБ. Пока нет: событий потоков для экрана лога, смены сервера, пинга.
 3. **Xcode-проект.** Приложение и Packet Tunnel extension, минимальный UI.
 4. **Доводка на устройстве.** Память под Instruments, Wi-Fi ↔ LTE (пересоздание соединений и Mux), сон и пробуждение, on-demand, kill switch (`includeAllNetworks`).
 5. **Распространение.**

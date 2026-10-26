@@ -160,8 +160,17 @@ dns_via_proxy = true
 ## Разработка
 
 ```sh
-cargo test                   # 99 unit + 5 e2e
-cargo clippy --all-targets
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
+cargo fmt --all --check
 ```
 
-Структура `src/`: `config/` (TOML, ссылки, списки серверов, подписки, импорт Xray и Amnezia), `protocol/` (VLESS, REALITY, Vision, Mux.Cool, отпечаток Chrome), `transport/` (TLS, WebSocket, XHTTP), `inbound/` (SOCKS5, HTTP), `proxy/` (relay, routing, DNS, счётчики), `system/` (TUN через sing-box, установка sing-box, сервисы, xray-sidecar), `ui/` (TUI); `main.rs` только разбирает аргументы. Релизы собирает GitHub Actions по тегу `v*`.
+Cargo workspace разделён на [ядро](crates/core/), [CLI-клиент](crates/cli/),
+[сервер](crates/server/) и [FFI для iOS](crates/ffi/).
+Границы пакетов, команды сборки и новые пути описаны в
+[docs/architecture.md](docs/architecture.md). Конкретный продуктивный сайт
+ведётся отдельно от публичного кода сервера. Релизы собирает GitHub Actions
+по тегу `v*`.
+
+Текущий статус и точка продолжения работы:
+[checkpoint-2026-10-26.md](docs/checkpoint-2026-10-26.md).

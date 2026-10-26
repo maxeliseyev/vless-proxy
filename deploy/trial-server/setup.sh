@@ -48,6 +48,7 @@ listen = "0.0.0.0:8445"
 cert = "$CERTS/$DOMAIN.crt"
 key = "$CERTS/$DOMAIN.key"
 users = ["$H3_UUID"]
+site_backend = "http://caddy:8080"
 TOML
 
 cat <<MSG

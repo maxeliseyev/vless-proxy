@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build RatatoskCore.xcframework (the vproxy core as a static library plus
-# ffi/include/ratatosk.h) for iPhone and the Apple Silicon simulator.
+# crates/ffi/include/ratatosk.h) for iPhone and the Apple Silicon simulator.
 #
 #   scripts/build-xcframework.sh [output dir]   # default: target/RatatoskCore.xcframework
 set -euo pipefail
@@ -16,7 +16,7 @@ rustup target add "${targets[@]}" >/dev/null
 args=()
 for target in "${targets[@]}"; do
     cargo build -p vproxy-ffi --profile ios --target "$target"
-    args+=(-library "target/$target/ios/libvproxy_ffi.a" -headers ffi/include)
+    args+=(-library "target/$target/ios/libvproxy_ffi.a" -headers crates/ffi/include)
 done
 
 rm -rf "$out"

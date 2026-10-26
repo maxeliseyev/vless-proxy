@@ -51,7 +51,7 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p vproxy --release --locked --target ${{ matrix.target }}
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: target/${{ matrix.target }}/release/vproxy --version
@@ -76,7 +76,7 @@ jobs:
             spkg="vproxy-server-${{ matrix.name }}"
             mkdir -p "dist/$spkg"
             cp "target/${{ matrix.target }}/release/vproxy-server" "dist/$spkg/"
-            cp server/README.md "dist/$spkg/"
+            cp crates/server/README.md "dist/$spkg/"
             tar -C dist -czf "dist/$spkg.tar.gz" "$spkg"
             (cd dist && shasum -a 256 "$spkg.tar.gz" > "$spkg.tar.gz.sha256")
             cat "dist/$spkg.tar.gz.sha256"

@@ -195,10 +195,10 @@ if [ "$mode" != none ]; then
     git --no-pager diff --stat
 
     log "Testing vproxy against the new fork"
-    cargo fmt --check
+    cargo fmt --all --check
     # shellcheck disable=SC2086
-    cargo clippy --all-targets -- $CLIPPY_FLAGS
-    cargo test --locked
+    cargo clippy --workspace --all-targets -- $CLIPPY_FLAGS
+    cargo test --workspace --locked
 
     if [ "$DRY_RUN" = 1 ]; then
         summary "Dry run: would commit the bump to $new"

@@ -22,11 +22,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
-      - run: cargo test
-      - run: cargo clippy -p vproxy-server --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
-      - run: cargo test -p vproxy-server
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
+      - run: cargo test --workspace --locked
 
   audit:
     name: cargo audit
@@ -39,7 +37,7 @@ jobs:
       - run: cargo audit --deny warnings
 
   ios-core:
-    name: core for iOS (no desktop features)
+    name: core and FFI for iOS
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -48,10 +46,10 @@ jobs:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --lib --no-default-features --target aarch64-apple-ios -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
-      - run: cargo build --lib --no-default-features --target aarch64-apple-ios-sim
-      - run: cargo test --no-default-features
+      - run: cargo clippy -p vproxy-core --lib --target aarch64-apple-ios -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
+      - run: cargo build -p vproxy-core --lib --target aarch64-apple-ios-sim
+      - run: cargo test -p vproxy-core
       - run: cargo clippy -p vproxy-ffi --all-targets -- -D warnings -A clippy::manual_ignore_case_cmp -A clippy::manual_is_multiple_of -A clippy::len_without_is_empty -A clippy::large_enum_variant
       - run: cargo test -p vproxy-ffi
       - run: cargo build -p vproxy-ffi --target aarch64-apple-ios
-      - run: xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -I ffi/include -typecheck ffi/swift/*.swift
+      - run: xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -I crates/ffi/include -typecheck crates/ffi/swift/*.swift

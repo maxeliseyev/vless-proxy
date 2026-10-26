@@ -1,4 +1,6 @@
 /target
+# Local checkout of separately managed private site content. Never publish it here.
+/private/
 .DS_Store
 tun-mytishchi.toml
 server.txt

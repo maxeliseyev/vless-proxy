@@ -1,0 +1,51 @@
+[package]
+name = "vproxy-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared networking core for vproxy clients and server"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+rustls = { version = "0.23", features = ["brotli"] }
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+base64 = "0.22"
+flate2 = "1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+serde_json = "1"
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+hmac = "0.12"
+x509-parser = "0.16"
+aws-lc-rs = "1"
+libc = "0.2"
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Userspace TCP/IP stack for the in-process TUN (iOS Packet Tunnel).
+ipstack = "1.0.1"
+# QUIC for the h3 transport (docs/h3-transport-plan.md); rustls comes from
+# the fork patched in below, like everywhere else.
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+tempfile = "3"
+etherparse = "0.20"
+tun-rs = { version = "2.8.13", default-features = false, features = ["async"] }
+rcgen = "0.13"

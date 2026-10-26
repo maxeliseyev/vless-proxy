@@ -1,0 +1,31 @@
+[package]
+name = "vproxy"
+version.workspace = true
+edition.workspace = true
+description = "Terminal client for vproxy"
+publish = false
+
+[lib]
+name = "vproxy_cli"
+
+[[bin]]
+name = "vproxy"
+path = "src/main.rs"
+
+[dependencies]
+vproxy-core = { path = "../core" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+ratatui = "0.30"
+crossterm = "0.29"
+libc = "0.2"
+
+[dev-dependencies]
+uuid = "1"
