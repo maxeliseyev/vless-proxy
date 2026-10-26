@@ -820,9 +820,12 @@ mod tests {
         assert_eq!(u16::from_be_bytes([tai[0], tai[1]]), 184);
         assert_eq!(&tai[2..8], &[5, 0x82, 0xdf, 0x13, 0x02, 0x01]);
 
-        // JA4 of Chrome 155 (t13d1517h2 + Chrome's cipher hash)
+        // JA4 of a fresh Chrome 155 TCP hello, captured live from real
+        // Chrome 155.0.0.0 on tls.peet.ws (its own capture was a resumption
+        // hello with pre_shared_key, t13d1518h2_..._e2d80978ab2e; dropping
+        // that extension — which our rewriter never adds — gives this).
         let ja4 = ja4(&raw).unwrap();
-        assert!(ja4.starts_with("t13d1517h2_8daaf6152771_"), "{ja4}");
+        assert_eq!(ja4, "t13d1517h2_8daaf6152771_cb7bf5808d99", "{ja4}");
 
         // the same connection keeps its order on a retry, minus the GREASE share
         let again = ParsedHello::parse(&chrome.rewrite(&original.encode(), true).unwrap()).unwrap();
