@@ -888,8 +888,7 @@ mod tests {
         sni[0..2].copy_from_slice(&l.to_be_bytes());
         sni[3..5].copy_from_slice(&(l - 3).to_be_bytes());
         h.extensions.push((EXT_SERVER_NAME, sni));
-        h.extensions
-            .push((EXT_ALPN, vec![0, 3, 2, b'h', b'3']));
+        h.extensions.push((EXT_ALPN, vec![0, 3, 2, b'h', b'3']));
         // Opaque transport parameters, as quinn encodes them.
         h.extensions
             .push((EXT_QUIC_TRANSPORT_PARAMS, vec![0x01, 0x02, 0x03, 0x04]));
@@ -913,7 +912,10 @@ mod tests {
             Some([0x01, 0x02, 0x03, 0x04].as_slice())
         );
         // ALPS is h3, not h2.
-        assert_eq!(h.extension(EXT_ALPS), Some([0, 3, 2, b'h', b'3'].as_slice()));
+        assert_eq!(
+            h.extension(EXT_ALPS),
+            Some([0, 3, 2, b'h', b'3'].as_slice())
+        );
 
         let types: Vec<u16> = h.extensions.iter().map(|(t, _)| *t).collect();
         assert!(is_grease(types[0]) && is_grease(*types.last().unwrap()));
