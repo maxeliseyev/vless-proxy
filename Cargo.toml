@@ -4,7 +4,7 @@ members = ["crates/core", "crates/cli", "crates/server", "crates/ffi"]
 default-members = ["crates/core", "crates/cli"]
 
 [workspace.package]
-version = "0.18.1"
+version = "0.18.2"
 edition = "2021"
 
 [patch.crates-io]
