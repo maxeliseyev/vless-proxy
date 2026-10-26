@@ -351,6 +351,39 @@ async fn connection_survives_a_network_change() {
     assert_eq!(client.handshakes(), 1, "moved, not reconnected");
 }
 
+/// A network change that arrives after the connection has already died (the
+/// idle timeout fired during a gap with no connectivity): the dead connection
+/// is dropped, so the next flow dials fresh on the new path instead of being
+/// handed the corpse first.
+#[tokio::test]
+async fn network_change_on_a_dead_connection_redials() {
+    let stand = stand(true).await;
+    let client = client(&stand, ALICE);
+    let (address, port) = echo_target(&stand);
+    let mut buf = [0u8; 4];
+    {
+        let mut stream = client.open_tcp(&address, port).await.unwrap();
+        stream.write_all(b"once").await.unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
+    }
+    // Kill the connection as a lost-connectivity idle timeout would.
+    let conn = client.connection().await.unwrap();
+    conn.close(0u32.into(), b"");
+    conn.closed().await;
+    assert_eq!(client.handshakes(), 1);
+
+    client.network_changed().await;
+
+    let mut stream = client.open_tcp(&address, port).await.unwrap();
+    stream.write_all(b"back").await.unwrap();
+    timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+        .await
+        .expect("did not redial after a network change on a dead connection")
+        .unwrap();
+    assert_eq!(&buf, b"back");
+    assert_eq!(client.handshakes(), 2, "should have dialed a fresh connection");
+}
+
 /// Past the 30 s idle timeout: kept up by pings while a stream is open.
 #[tokio::test]
 async fn open_stream_keeps_the_connection_alive() {

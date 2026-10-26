@@ -179,15 +179,30 @@ impl H3Client {
     /// connection to a new socket, so it carries on over the new path (QUIC
     /// connection migration) instead of dying by idle timeout.
     pub async fn network_changed(&self) {
-        let slot = self.conn.lock().await;
-        let Some(live) = slot.as_ref().filter(|l| l.conn.close_reason().is_none()) else {
-            return;
+        let mut slot = self.conn.lock().await;
+        let Some(live) = slot.as_ref() else {
+            return; // nothing live; the next flow dials on the new path
         };
+        // Already dead — e.g. the idle timeout fired during the gap when there
+        // was no connectivity at all. Drop the corpse now so the next flow
+        // dials fresh on the new path, rather than first handing it out and
+        // discovering it is closed.
+        if live.conn.close_reason().is_some() {
+            *slot = None;
+            return;
+        }
         let moved = std::net::UdpSocket::bind(unspecified(live.remote))
             .and_then(|socket| live.endpoint.rebind(socket));
         match moved {
             Ok(()) => info!("h3: network changed, connection moved to a new socket"),
-            Err(e) => warn!("h3: network changed, cannot move the connection: {e}"),
+            // The old socket is gone and we could not bind a new one, so the
+            // connection is now stranded on a dead path but still reads as
+            // open — `live()` would keep handing it out and every flow would
+            // stall until the idle timeout. Drop it so the next flow redials.
+            Err(e) => {
+                warn!("h3: network changed, cannot move the connection, dropping it: {e}");
+                *slot = None;
+            }
         }
     }
 
