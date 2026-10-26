@@ -397,6 +397,84 @@ async fn idle_connection_is_let_go() {
     assert_eq!(client.handshakes(), 2);
 }
 
+/// Layer A on the wire: drive a real quinn QUIC handshake against the server
+/// and capture the exact ClientHello bytes our rustls fork hands to quinn.
+/// That the capture fills at all proves quinn's QUIC path invokes the fork's
+/// `client_hello_rewriter` (a successful handshake alone would not — rustls's
+/// native hello would also connect). The captured bytes' QUIC JA4 must be the
+/// Chrome-QUIC value, so a probe on the wire sees Chrome, not quinn/rustls.
+#[tokio::test]
+async fn quic_clienthello_on_the_wire_is_chrome() {
+    use rustls::client::ClientHelloRewriter;
+
+    /// Wraps the real Chrome rewriter and keeps a copy of what it emits (i.e.
+    /// exactly what goes into the QUIC Initial on the wire).
+    #[derive(Debug)]
+    struct Capturing {
+        inner: Arc<dyn ClientHelloRewriter>,
+        seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    impl ClientHelloRewriter for Capturing {
+        fn rewrite(&self, raw: &[u8], retry: bool) -> Option<Vec<u8>> {
+            let out = self.inner.rewrite(raw, retry);
+            // What leaves the socket: the reshaped hello, or the original if
+            // the rewriter declined (it does not, for a first QUIC hello).
+            self.seen
+                .lock()
+                .unwrap()
+                .push(out.clone().unwrap_or_else(|| raw.to_vec()));
+            out
+        }
+    }
+
+    let stand = stand(true).await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chrome = vproxy_core::protocol::fingerprint::Fingerprint::Chrome
+        .rewriter()
+        .expect("Chrome yields a rewriter");
+
+    // The client TLS config as H3Client::with_roots builds it, but with the
+    // Chrome rewriter wrapped so we can read the hello it produces.
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(stand.cert.clone()).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.client_hello_rewriter = Some(Arc::new(Capturing {
+        inner: chrome,
+        seen: seen.clone(),
+    }));
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let config = quinn::ClientConfig::new(Arc::new(crypto));
+
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(config);
+    let conn = timeout(
+        Duration::from_secs(10),
+        endpoint.connect(stand.server, NAME).unwrap(),
+    )
+    .await
+    .expect("QUIC handshake timed out")
+    .expect("the Chrome-shaped QUIC hello did not complete a handshake");
+    assert_eq!(conn.remote_address(), stand.server);
+
+    let captured = seen.lock().unwrap().clone();
+    assert!(
+        !captured.is_empty(),
+        "quinn never called the fork's client_hello_rewriter on the QUIC path"
+    );
+    let ja4 = vproxy_core::protocol::fingerprint::ja4_quic(&captured[0])
+        .expect("the wire ClientHello parses");
+    assert_eq!(
+        ja4, "q13d0310h3_55b375c5d22e_d19a137375ab",
+        "the on-the-wire QUIC JA4 is not the Chrome-QUIC value"
+    );
+}
+
 /// The admin socket reports a connected client and its open stream.
 #[tokio::test]
 async fn stats_report_a_connection_and_its_stream() {

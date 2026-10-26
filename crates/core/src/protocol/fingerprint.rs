@@ -581,9 +581,22 @@ impl ClientHelloRewriter for ChromeHello {
     }
 }
 
-/// JA4 fingerprint of an encoded ClientHello (TCP, no QUIC), per the FoxIO
-/// spec: `t13d1516h2_<ciphers>_<extensions+sigalgs>`.
+/// JA4 fingerprint of an encoded ClientHello over TCP, per the FoxIO spec:
+/// `t13d1516h2_<ciphers>_<extensions+sigalgs>`.
 pub fn ja4(raw: &[u8]) -> Option<String> {
+    ja4_inner(raw, 't')
+}
+
+/// JA4 fingerprint of a ClientHello carried in a QUIC Initial: identical to
+/// [`ja4`] but with the `q` transport prefix (FoxIO: first byte is `q` for
+/// QUIC, `t` for TCP). JA4 sorts the cipher and extension lists, so the
+/// per-connection GREASE and shuffle do not change it — a Chrome-QUIC shape
+/// hashes to Chrome's QUIC JA4 regardless of the random order.
+pub fn ja4_quic(raw: &[u8]) -> Option<String> {
+    ja4_inner(raw, 'q')
+}
+
+fn ja4_inner(raw: &[u8], transport: char) -> Option<String> {
     use sha2::{Digest, Sha256};
     let hello = ParsedHello::parse(raw)?;
     let is_grease = |v: u16| v & 0x0f0f == 0x0a0a && (v >> 8) == (v & 0xff);
@@ -631,7 +644,7 @@ pub fn ja4(raw: &[u8]) -> Option<String> {
         })
         .unwrap_or_else(|| "00".to_string());
     let a = format!(
-        "t{version}{sni}{:02}{:02}{alpn}",
+        "{transport}{version}{sni}{:02}{:02}{alpn}",
         ciphers.len().min(99),
         ext_types.len().min(99)
     );
@@ -937,4 +950,38 @@ mod tests {
             be_u16s(&h.extension(EXT_SIGNATURE_ALGORITHMS).unwrap()[2..]).collect();
         assert_eq!(sigalgs.last(), Some(&RSA_PKCS1_SHA1));
     }
+
+    #[test]
+    fn quic_ja4_is_stable_across_connections() {
+        // JA4 sorts ciphers and extensions, so two connections — different
+        // GREASE and extension order — must hash to the same QUIC JA4. This
+        // is the value a probe sees; it must not vary per connection.
+        let original = rustls_like_quic_hello();
+        let a = ChromeHello::from_seed(Profile::Chrome155, [5u8; 32]);
+        let b = ChromeHello::from_seed(Profile::Chrome155, [99u8; 32]);
+        let ja4_a = ja4_quic(&a.rewrite(&original.encode(), false).unwrap()).unwrap();
+        let ja4_b = ja4_quic(&b.rewrite(&original.encode(), false).unwrap()).unwrap();
+        assert_eq!(ja4_a, ja4_b, "QUIC JA4 varies per connection");
+
+        // The `q` transport prefix, TLS 1.3, SNI present, 3 cipher suites, and
+        // an h3 ALPN. The extension count is the Chrome-QUIC set we emit.
+        assert!(
+            ja4_a.starts_with("q13d03"),
+            "unexpected QUIC JA4 header: {ja4_a}"
+        );
+        assert!(ja4_a.contains("h3_"), "ALPN not h3 in QUIC JA4: {ja4_a}");
+        // Pin the whole string so a change to the shaped set is caught here and
+        // can be compared against a real Chrome-QUIC capture.
+        assert_eq!(ja4_a, QUIC_JA4, "QUIC JA4 changed: {ja4_a}");
+    }
+
+    /// The QUIC JA4 of our Chrome-QUIC shape: `q` (QUIC) + TLS 1.3 + SNI +
+    /// three TLS 1.3 suites + ten extensions + h3 ALPN, over the uQUIC
+    /// `QUICChrome` set (ten extensions, nine signature algorithms). The
+    /// cipher component `55b375c5d22e` is the canonical hash of the three
+    /// TLS 1.3 suites that real Chrome-QUIC also emits. Confirm the whole
+    /// string against a live Chrome QUIC ClientHello (e.g. tls.peet.ws over
+    /// HTTP/3). The wire test `quic_clienthello_on_the_wire_is_chrome` asserts
+    /// a real quinn handshake produces exactly this.
+    const QUIC_JA4: &str = "q13d0310h3_55b375c5d22e_d19a137375ab";
 }
