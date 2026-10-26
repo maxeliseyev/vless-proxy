@@ -53,6 +53,8 @@ Env overrides: `VPROXY_VERSION`, `SERVER_IP` (skip the DNS lookup), `SOCKS_PORT`
 | `/etc/init.d/vproxy` | procd service, SOCKS5 on `127.0.0.1:1080` |
 | `/etc/sing-box/config.json` | tun + DNS-hijack + routing (gvisor stack) |
 | `/etc/config/sing-box` | uci: `user root`, `enabled 1` |
+| `/etc/config/firewall` | a `proxy` zone (tun0, masq, MSS clamp) + `lan → proxy` forwarding |
+| `/etc/hotplug.d/net/99-proxy-fw` | reloads fw4 when tun0 appears (boot order) |
 | `/etc/hosts` | pins `<exit-host> -> <ip>` (see note) |
 
 **Why the `/etc/hosts` pin matters:** without it, vproxy's own DNS lookup of the

@@ -150,12 +150,41 @@ uci set sing-box.main.conffile='/etc/sing-box/config.json'
 uci commit sing-box
 /etc/init.d/sing-box enable
 
+# --- firewall: allow LAN clients to be forwarded into the tunnel -----------
+# tun0 is unzoned by default and fw4's forward policy is drop, so forwarded
+# LAN traffic to it is rejected (the router's own traffic still works). Put
+# tun0 in its own zone (masq + MSS clamp) and allow lan -> proxy forwarding.
+uci -q delete firewall.proxy || true
+uci set firewall.proxy='zone'
+uci set firewall.proxy.name='proxy'
+uci set firewall.proxy.input='ACCEPT'
+uci set firewall.proxy.output='ACCEPT'
+uci set firewall.proxy.forward='ACCEPT'
+uci set firewall.proxy.masq='1'
+uci set firewall.proxy.mtu_fix='1'
+uci add_list firewall.proxy.device='tun0'
+uci -q delete firewall.lan_proxy || true
+uci set firewall.lan_proxy='forwarding'
+uci set firewall.lan_proxy.src='lan'
+uci set firewall.lan_proxy.dest='proxy'
+uci commit firewall
+
+# At boot fw4 starts before sing-box creates tun0, so the zone binds to nothing
+# until a reload. Reload fw4 whenever tun0 appears.
+mkdir -p /etc/hotplug.d/net
+cat > /etc/hotplug.d/net/99-proxy-fw <<'HP'
+#!/bin/sh
+[ "$ACTION" = "add" ] && { [ "$INTERFACE" = "tun0" ] || [ "$DEVICE" = "tun0" ]; } && fw4 reload
+HP
+chmod 0755 /etc/hotplug.d/net/99-proxy-fw
+
 # --- (re)start, vproxy first so sing-box's SOCKS outbound has a listener ----
 echo ">> starting services"
 /etc/init.d/vproxy restart
 sleep 2
 /etc/init.d/sing-box restart
 sleep 6
+fw4 reload >/dev/null 2>&1 || true   # bind the proxy zone now that tun0 exists
 
 echo
 echo ">> done. Checking the exit:"
