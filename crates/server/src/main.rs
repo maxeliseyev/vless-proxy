@@ -5,20 +5,23 @@ use anyhow::{bail, Result};
 use std::path::PathBuf;
 use vproxy_server::{Server, Settings, Snapshot, DEFAULT_ADMIN_SOCKET};
 
-const USAGE: &str =
-    "usage: vproxy-server -c server.toml [-v]\n       vproxy-server --stats [--admin <socket>]";
+mod tui;
+
+const USAGE: &str = "usage: vproxy-server -c server.toml [-v]\n       vproxy-server --stats [--admin <socket>]\n       vproxy-server --tui [--admin <socket>]";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config: Option<PathBuf> = None;
     let mut admin: Option<PathBuf> = None;
     let mut stats = false;
+    let mut tui = false;
     let mut verbose = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--config" => config = args.next().map(PathBuf::from),
             "--stats" => stats = true,
+            "--tui" => tui = true,
             "--admin" => admin = args.next().map(PathBuf::from),
             "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
@@ -29,8 +32,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if stats {
+    if stats || tui {
         let path = admin.unwrap_or_else(|| PathBuf::from(DEFAULT_ADMIN_SOCKET));
+        if tui {
+            return tui::run(&path).await;
+        }
         let snap = vproxy_server::fetch_stats(&path).await?;
         print_stats(&snap);
         return Ok(());
