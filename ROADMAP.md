@@ -1,4 +1,7 @@
-# vproxy roadmap
+# Ratatosk roadmap
+
+(Проект Ratatosk; исторически — vproxy. Имена крейтов и бинарников `vproxy`/
+`vproxy-server` пока прежние, переименование артефактов — отдельным релизом.)
 
 Актуальная рабочая точка на 2026-10-26:
 [checkpoint-2026-10-26.md](docs/checkpoint-2026-10-26.md).
