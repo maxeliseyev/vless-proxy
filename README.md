@@ -6,7 +6,7 @@
 - **`vproxy`** — терминальный клиент для macOS/Linux: один бинарник, локальный SOCKS5/HTTP-прокси или системный VPN через TUN, TUI со статистикой, routing-правила.
 - **`vproxy-server`** — серверный конец QUIC/HTTP-3-транспорта; обычным HTTP/3-клиентам отдаёт настоящий сайт (см. [docs/h3-transport-plan.md](docs/h3-transport-plan.md)).
 - **ядро** (крейт `vproxy-core`) — REALITY, Vision, транспорты, netstack; общее для клиента, сервера и iOS.
-- **Ratatosk (iOS)** — приложение на этом ядре, одноимённое зонтичному проекту ([отдельный репозиторий](https://github.com/maxeliseyev/ratatosk)).
+- **Ratatosk (iOS)** — приложение на этом ядре, одноимённое зонтичному проекту ([отдельный репозиторий](https://github.com/maxeliseyev/ratatosk-ios)).
 
 Имена бинарников, крейтов и образов (`vproxy`, `vproxy-server`) пока прежние — переименование артефактов под зонтичное имя запланировано отдельным релизом. Подробный план и история решений: [`ROADMAP.md`](ROADMAP.md).
 
