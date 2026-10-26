@@ -477,9 +477,10 @@ impl ChromeHello {
 
     /// Build a Chrome-QUIC-shaped hello. Unlike [`ChromeHello::shape`], this
     /// keeps the `quic_transport_parameters` extension quinn produced (RFC
-    /// 9001 requires it) and uses Chrome's QUIC extension set: ALPS and ALPN
-    /// are `h3`, the cipher list is the three TLS 1.3 suites with no GREASE
-    /// suite, and the TCP-only extensions are dropped. The transport-parameter
+    /// 9001 requires it) and uses Chrome's QUIC extension set (uQUIC
+    /// `QUICChrome_146`): ALPS and ALPN are `h3`, the cipher list is the three
+    /// TLS 1.3 suites with no GREASE suite, GREASE ECH is kept, and the
+    /// TCP-only extensions are dropped. The transport-parameter
     /// contents, the QUIC version and the Initial packet layout stay quinn's,
     /// so this shapes the handshake's TLS layer only (see docs; the uQUIC
     /// `QUICChrome` presets are the reference).
@@ -545,6 +546,10 @@ impl ChromeHello {
         ));
         exts.push((EXT_COMPRESS_CERTIFICATE, vec![0x02, 0x00, 0x02]));
         exts.push((EXT_ALPS, vec![0x00, 0x03, 0x02, b'h', b'3']));
+        // GREASE ECH, which Chrome 133+ sends over QUIC too (uQUIC
+        // `QUICChrome_146` `BoringGREASEECH`). The same per-connection value as
+        // the TCP shape; it is advertised only, never selected.
+        exts.push((EXT_ECH, self.ech.clone()));
         if let Some(cookie) = original.extension(EXT_COOKIE) {
             exts.push((EXT_COOKIE, cookie.to_vec()));
         }
@@ -941,10 +946,16 @@ mod tests {
             EXT_SCT,
             EXT_EC_POINT_FORMATS,
             EXT_TRUST_ANCHORS,
-            EXT_ECH,
         ] {
             assert!(!types.contains(&t), "QUIC hello must not carry {t:#06x}");
         }
+        // GREASE ECH is carried over QUIC, as Chrome 133+ does.
+        assert!(
+            types.contains(&EXT_ECH),
+            "QUIC hello should carry GREASE ECH"
+        );
+        let non_grease: Vec<u16> = types.iter().copied().filter(|t| !is_grease(*t)).collect();
+        assert_eq!(non_grease.len(), 11, "QUICChrome_146 set: {non_grease:?}");
         // rsa_pkcs1_sha1 is appended to the signature algorithms.
         let sigalgs: Vec<u16> =
             be_u16s(&h.extension(EXT_SIGNATURE_ALGORITHMS).unwrap()[2..]).collect();
@@ -966,7 +977,7 @@ mod tests {
         // The `q` transport prefix, TLS 1.3, SNI present, 3 cipher suites, and
         // an h3 ALPN. The extension count is the Chrome-QUIC set we emit.
         assert!(
-            ja4_a.starts_with("q13d03"),
+            ja4_a.starts_with("q13d0311h3"),
             "unexpected QUIC JA4 header: {ja4_a}"
         );
         assert!(ja4_a.contains("h3_"), "ALPN not h3 in QUIC JA4: {ja4_a}");
@@ -976,12 +987,14 @@ mod tests {
     }
 
     /// The QUIC JA4 of our Chrome-QUIC shape: `q` (QUIC) + TLS 1.3 + SNI +
-    /// three TLS 1.3 suites + ten extensions + h3 ALPN, over the uQUIC
-    /// `QUICChrome` set (ten extensions, nine signature algorithms). The
-    /// cipher component `55b375c5d22e` is the canonical hash of the three
-    /// TLS 1.3 suites that real Chrome-QUIC also emits. Confirm the whole
-    /// string against a live Chrome QUIC ClientHello (e.g. tls.peet.ws over
-    /// HTTP/3). The wire test `quic_clienthello_on_the_wire_is_chrome` asserts
-    /// a real quinn handshake produces exactly this.
-    const QUIC_JA4: &str = "q13d0310h3_55b375c5d22e_d19a137375ab";
+    /// three TLS 1.3 suites + eleven extensions + h3 ALPN, matching the uQUIC
+    /// `QUICChrome_146` set (eleven extensions incl. GREASE ECH, nine
+    /// signature algorithms). The cipher component `55b375c5d22e` is the
+    /// canonical hash of the three TLS 1.3 suites real Chrome-QUIC emits.
+    /// (The latest Chrome in FoxIO's DB shows `q13d0312h3` — one extension
+    /// more; identifying the twelfth needs a live h3 capture, which the VPN on
+    /// the dev machine blocks.) The wire test
+    /// `quic_clienthello_on_the_wire_is_chrome` asserts a real quinn handshake
+    /// produces exactly this.
+    const QUIC_JA4: &str = "q13d0311h3_55b375c5d22e_653d80c3fe9d";
 }

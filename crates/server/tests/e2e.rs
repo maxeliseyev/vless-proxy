@@ -470,7 +470,7 @@ async fn quic_clienthello_on_the_wire_is_chrome() {
     let ja4 = vproxy_core::protocol::fingerprint::ja4_quic(&captured[0])
         .expect("the wire ClientHello parses");
     assert_eq!(
-        ja4, "q13d0310h3_55b375c5d22e_d19a137375ab",
+        ja4, "q13d0311h3_55b375c5d22e_653d80c3fe9d",
         "the on-the-wire QUIC JA4 is not the Chrome-QUIC value"
     );
 }
