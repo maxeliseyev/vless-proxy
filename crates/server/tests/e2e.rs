@@ -13,7 +13,7 @@ use uuid::Uuid;
 use vproxy_core::h3::H3Client;
 use vproxy_core::protocol::vless::Address;
 use vproxy_core::{ActiveServer, Config, ProxyClient, VlessUrl};
-use vproxy_server::Server;
+use vproxy_server::{Accounts, Server};
 
 const NAME: &str = "h3.test";
 const ALICE: Uuid = Uuid::from_u128(0xa11ce);
@@ -24,6 +24,7 @@ struct Stand {
     udp_echo: SocketAddr,
     cert: CertificateDer<'static>,
     admin: std::path::PathBuf,
+    accounts: Accounts,
 }
 
 async fn stand(allow_private: bool) -> Stand {
@@ -41,6 +42,7 @@ async fn stand(allow_private: bool) -> Stand {
     .unwrap()
     .with_admin(admin.clone());
     let server_addr = server.local_addr().unwrap();
+    let accounts = server.accounts();
     tokio::spawn(server.run());
 
     let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -67,6 +69,7 @@ async fn stand(allow_private: bool) -> Stand {
         udp_echo: udp_echo_addr,
         cert,
         admin,
+        accounts,
     }
 }
 
@@ -382,6 +385,54 @@ async fn network_change_on_a_dead_connection_redials() {
         .unwrap();
     assert_eq!(&buf, b"back");
     assert_eq!(client.handshakes(), 2, "should have dialed a fresh connection");
+}
+
+/// A user added to the allow-list at runtime (what a SIGHUP reload does in the
+/// binary) can connect, with no restart and without disturbing other accounts.
+#[tokio::test]
+async fn reloaded_account_can_connect() {
+    let stand = stand(true).await;
+    let carol = Uuid::from_u128(0xca401);
+    let (address, port) = echo_target(&stand);
+    let mut buf = [0u8; 4];
+
+    // Not yet a user: the server treats it as an unauthenticated HTTP/3
+    // client, so a proxy stream does not echo (it errors or never answers).
+    let before = client(&stand, carol);
+    let unauth = timeout(Duration::from_secs(5), async {
+        let mut s = before.open_tcp(&address, port).await.map_err(|_| ())?;
+        s.write_all(b"ping").await.map_err(|_| ())?;
+        s.read_exact(&mut buf).await.map_err(|_| ())?;
+        Ok::<(), ()>(())
+    })
+    .await;
+    assert!(
+        unauth.is_err() || unauth.unwrap().is_err(),
+        "an account not on the list should not be able to tunnel"
+    );
+
+    // Reload the allow-list to include carol (what SIGHUP does in the binary).
+    *stand.accounts.write().unwrap() = Arc::from(vec![ALICE, carol]);
+
+    // A fresh client (new connection) now authenticates and echoes.
+    let after = client(&stand, carol);
+    let mut s = after.open_tcp(&address, port).await.unwrap();
+    s.write_all(b"good").await.unwrap();
+    timeout(Duration::from_secs(10), s.read_exact(&mut buf))
+        .await
+        .expect("reloaded account did not get through")
+        .unwrap();
+    assert_eq!(&buf, b"good");
+
+    // The original account is unaffected by the reload.
+    let alice = client(&stand, ALICE);
+    let mut s = alice.open_tcp(&address, port).await.unwrap();
+    s.write_all(b"also").await.unwrap();
+    timeout(Duration::from_secs(10), s.read_exact(&mut buf))
+        .await
+        .expect("existing account broke after reload")
+        .unwrap();
+    assert_eq!(&buf, b"also");
 }
 
 /// Past the 30 s idle timeout: kept up by pings while a stream is open.

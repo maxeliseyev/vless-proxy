@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
@@ -32,6 +32,13 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use vproxy_core::h3::wire::{self, Status, ALPN};
 use vproxy_core::protocol::vless::Address;
+
+/// The account allow-list, swappable at runtime so a reload (SIGHUP in the
+/// binary) can replace it without dropping live connections. Read once per
+/// new connection, so a reload takes effect for the next connection; existing
+/// sessions carry on (adding a user is seamless, a removed user keeps its
+/// current session until it ends).
+pub type Accounts = Arc<RwLock<Arc<[Uuid]>>>;
 
 /// A new connection has this long to present its token, a new stream to
 /// name its target, a target to accept the TCP connection.
@@ -94,7 +101,7 @@ impl Settings {
 
 pub struct Server {
     endpoint: quinn::Endpoint,
-    users: Arc<[Uuid]>,
+    users: Accounts,
     allow_private: bool,
     site: Option<http3::Site>,
     stats: Arc<Stats>,
@@ -154,7 +161,7 @@ impl Server {
             .with_context(|| format!("listen on {listen}/udp"))?;
         Ok(Self {
             endpoint,
-            users: users.into(),
+            users: Arc::new(RwLock::new(users.into())),
             allow_private,
             site: None,
             stats: Arc::new(Stats::new()),
@@ -177,6 +184,13 @@ impl Server {
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.endpoint.local_addr()?)
+    }
+
+    /// A handle to the account allow-list, so the binary can hot-reload it on
+    /// SIGHUP (`*handle.write() = Arc::from(new_users)`) without a restart.
+    /// Take it before [`Server::run`], which consumes the server.
+    pub fn accounts(&self) -> Accounts {
+        self.users.clone()
     }
 
     /// Accept connections until the endpoint is closed.
@@ -211,7 +225,7 @@ impl Server {
 }
 
 struct Shared {
-    users: Arc<[Uuid]>,
+    users: Accounts,
     allow_private: bool,
     site: Option<http3::Site>,
     stats: Arc<Stats>,
@@ -221,7 +235,10 @@ impl Shared {
     async fn connection(self: Arc<Self>, incoming: quinn::Incoming) -> Result<()> {
         let remote = incoming.remote_address();
         let conn = incoming.await.context("handshake")?;
-        let (user, transport) = http3::Transport::classify(conn.clone(), &self.users).await?;
+        // Snapshot the allow-list for this connection (a reload swaps it for
+        // the next one, without disturbing connections already up).
+        let users = self.users.read().expect("accounts lock poisoned").clone();
+        let (user, transport) = http3::Transport::classify(conn.clone(), &users).await?;
         let Some(user) = user else {
             debug!("{remote}: serving HTTP/3");
             self.stats.site_request();
