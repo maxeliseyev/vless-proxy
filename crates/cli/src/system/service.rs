@@ -405,7 +405,9 @@ mod tests {
     fn unit_has_root_only_for_tun() {
         let tun = render_unit(&plan(true));
         assert!(tun.contains("User=root"));
-        assert!(tun.contains("ExecStart=/usr/local/bin/vproxy -f /Users/me/.config/vproxy/server.txt --tun"));
+        assert!(tun.contains(
+            "ExecStart=/usr/local/bin/vproxy -f /Users/me/.config/vproxy/server.txt --tun"
+        ));
         assert!(tun.contains("WantedBy=multi-user.target"));
         let local = render_unit(&plan(false));
         assert!(!local.contains("User=root"));

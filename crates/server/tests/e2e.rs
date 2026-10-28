@@ -384,7 +384,11 @@ async fn network_change_on_a_dead_connection_redials() {
         .expect("did not redial after a network change on a dead connection")
         .unwrap();
     assert_eq!(&buf, b"back");
-    assert_eq!(client.handshakes(), 2, "should have dialed a fresh connection");
+    assert_eq!(
+        client.handshakes(),
+        2,
+        "should have dialed a fresh connection"
+    );
 }
 
 /// A user added to the allow-list at runtime (what a SIGHUP reload does in the

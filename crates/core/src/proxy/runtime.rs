@@ -292,7 +292,9 @@ impl ProxyClient {
             };
             if let Some(egress) = &self.egress {
                 if let Err(e) = egress.bind_fd(socket.as_raw_fd(), addr) {
-                    last = Some(anyhow::anyhow!("pin direct socket to egress interface: {e}"));
+                    last = Some(anyhow::anyhow!(
+                        "pin direct socket to egress interface: {e}"
+                    ));
                     continue;
                 }
             }
