@@ -20,6 +20,8 @@ use vproxy_core::netstack::device::channel_device;
 use vproxy_core::netstack::fakedns::{FakeDns, DEFAULT_POOL};
 use vproxy_core::netstack::flows::{FlowLog, DEFAULT_CAPACITY};
 use vproxy_core::netstack::Netstack;
+use vproxy_core::proxy::direct_dns::DirectResolver;
+use vproxy_core::proxy::dns_cache::DnsCache;
 use vproxy_core::proxy::stats::{human_bytes, STATS};
 use vproxy_core::{ActiveServer, ProxyClient};
 
@@ -150,7 +152,16 @@ fn start(
         config.runtime.clone(),
         &config.routing,
         &config.mux,
-    )?;
+    )?
+    // A `direct` domain must be resolved to a real IP. The system resolver
+    // inside the Packet Tunnel is pointed at the netstack's FakeDNS, so query
+    // an upstream ourselves; the extension's own sockets already bypass the
+    // tunnel, so no egress binding is needed (unlike desktop TUN).
+    .with_direct_resolver(DirectResolver::new(
+        direct_dns_upstream(&config.tun.dns),
+        None,
+        DnsCache::new(Default::default()),
+    ));
     let flows = Arc::new(FlowLog::new(DEFAULT_CAPACITY));
     let netstack = Netstack {
         connector: connector.clone(),
@@ -454,6 +465,18 @@ pub unsafe extern "C" fn ratatosk_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(CString::from_raw(s));
     }
+}
+
+/// `config.tun.dns` as a `SocketAddr` (default port 53), falling back to Google
+/// public DNS when it is not a bare IP.
+fn direct_dns_upstream(dns: &str) -> std::net::SocketAddr {
+    if let Ok(addr) = dns.parse::<std::net::SocketAddr>() {
+        return addr;
+    }
+    if let Ok(ip) = dns.parse::<std::net::IpAddr>() {
+        return std::net::SocketAddr::new(ip, 53);
+    }
+    std::net::SocketAddr::from(([8, 8, 8, 8], 53))
 }
 
 unsafe fn c_str<'a>(s: *const c_char) -> Option<&'a str> {
