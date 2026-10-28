@@ -117,6 +117,7 @@ mod macos {
         let mut guard = NetGuard {
             gateway: gateway.clone(),
             iface: iface.clone(),
+            phys_iface: phys_iface.clone(),
             server_ips: server_ips.clone(),
             bypass_nets: Vec::new(),
             service: None,
@@ -177,6 +178,9 @@ mod macos {
     struct NetGuard {
         gateway: String,
         iface: String,
+        /// The physical interface (e.g. en0) — whose `networksetup` service
+        /// carries the DNS configuration, not the utun.
+        phys_iface: String,
         server_ips: Vec<Ipv4Addr>,
         bypass_nets: Vec<String>,
         service: Option<String>,
@@ -205,16 +209,18 @@ mod macos {
                     self.bypass_nets.push(net);
                 }
             }
-            // Point the system resolver at the netstack's FakeDNS.
-            if let Some(service) = network_service(&self.iface) {
+            // Point the system resolver at the netstack's FakeDNS. The DNS
+            // config lives on the physical interface's service (e.g. Wi-Fi),
+            // not the utun.
+            if let Some(service) = network_service(&self.phys_iface) {
                 let saved = current_dns(&service);
                 if set_dns(&service, &[dns_addr.to_string()]).is_ok() {
+                    info!("DNS -> {dns_addr} (FakeDNS) on \"{service}\"");
                     self.service = Some(service);
                     self.saved_dns = Some(saved);
-                    info!("DNS -> {dns_addr} (FakeDNS)");
                 }
             } else {
-                warn!("could not find the network service for {}; DNS not redirected (names may not resolve through the tunnel)", self.iface);
+                warn!("could not find the network service for {}; DNS not redirected (names may not resolve through the tunnel)", self.phys_iface);
             }
             Ok(())
         }
