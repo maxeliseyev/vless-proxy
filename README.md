@@ -28,16 +28,7 @@ docker run -d --name vproxy -p 127.0.0.1:1080:1080 ghcr.io/maxeliseyev/vproxy -s
 docker build -t vproxy .      # собрать самому (Alpine, статический musl)
 ```
 
-Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически). Форк раз в неделю сливается с upstream `rel-0.23` workflow'ом `rustls fork sync`: он прогоняет тесты rustls и vproxy, обновляет `rev` в `Cargo.toml`, а конфликт слияния или выход rustls 0.24 превращает в issue.
-
-Для системного режима (TUN) дополнительно нужен [sing-box](https://sing-box.sagernet.org). Его ставит сам vproxy:
-
-```sh
-vproxy install-sing-box              # Homebrew на macOS, официальный репозиторий sing-box на deb/rpm/Arch,
-                                     # иначе релиз с GitHub в ~/.config/vproxy/bin; --download принудительно скачивает
-```
-
-Без Homebrew на macOS команда предложит поставить и его. При `sudo vproxy --tun` без sing-box vproxy тоже предложит установку. Свой бинарник указывается `--sing-box /path` или `tun.sing_box_path` в TOML.
+Из исходников: `cargo build --release` (нужен Rust stable; rustls берётся из форка [maxeliseyev/rustls](https://github.com/maxeliseyev/rustls/tree/reality-0.23) автоматически и раз в неделю синхронизируется с upstream `rel-0.23`). Системный режим (`--tun`) встроен в бинарник — внешних зависимостей вроде sing-box больше не нужно.
 
 ## Быстрый старт
 
@@ -54,8 +45,9 @@ vproxy --tui                # то же с интерфейсом: сервер,
                             # a добавляет сервер (вставьте ссылку), d удаляет,
                             # p замеряет задержку всех серверов, b переключает на самый быстрый,
                             # u обновляет список из подписки
-sudo vproxy --tun           # весь системный трафик через сервер (sing-box TUN)
+sudo vproxy --tun           # весь системный трафик через сервер (встроенный TUN, macOS/Linux)
 sudo vproxy --tui --tun     # системный режим с интерфейсом
+sudo vproxy --tun --split-ru  # .ru .su .рф — напрямую, мимо прокси (сплит-туннелинг)
 ```
 
 Проверка: `curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org` (локальный режим) или просто `curl https://api.ipify.org` (TUN).
@@ -70,7 +62,7 @@ sudo vproxy service install --tun -f server.txt # системный VPN, дем
 vproxy service status | logs | uninstall        # с --tun для системного
 ```
 
-Пути к бинарнику, конфигу и sing-box записываются в сервис абсолютными. Логи: `~/Library/Logs/vproxy.log` или `/var/log/vproxy.log` на macOS, `journalctl -u vproxy` на Linux.
+Пути к бинарнику и конфигу записываются в сервис абсолютными. Логи: `~/Library/Logs/vproxy.log` или `/var/log/vproxy.log` на macOS, `journalctl -u vproxy` на Linux.
 
 Подписка провайдера (страница с base64-списком ссылок, как у 3x-ui, Marzban, Remnawave):
 
@@ -89,12 +81,13 @@ vproxy -u 'vless://...'              # ссылка аргументом, в к�
 vproxy -c config.toml                # полный TOML-конфиг
 vproxy --probe -f server.txt         # один handshake с сервером и отчёт
 vproxy --ping -f server.txt          # задержка handshake для всех серверов списка
-vproxy --print-tun-config -f server.txt   # показать сгенерированный конфиг sing-box
+vproxy --split-ru                    # .ru .su .рф direct (= --direct-zone ru,su,рф)
+vproxy --direct-zone ru,su,рф,cn     # свой список зон, которые идут мимо прокси
 ```
 
 Поддерживаются ссылки с `security=reality|tls|none`, транспортом `type=tcp|ws|xhttp` (`path`, `host`, `mode`, `extra`), `flow=xtls-rprx-vision`, параметрами `pbk`, `sid`, `sni`, `fp` (`chrome` по умолчанию, `none` отключает имитацию), `spx`, `alpn`, и `#имя` сервера.
 
-Конфиг Xray/Happ в JSON тоже подходит напрямую: `vproxy -c happ.json`. Берутся vless-outbound (адрес, uuid, tcp/ws, tls/reality), порт socks-inbound и правила `routing.rules` (domain/ip/port → direct/proxy/block; geosite/geoip переносятся как rule-set для TUN-режима).
+Конфиг Xray/Happ в JSON тоже подходит напрямую: `vproxy -c happ.json`. Берутся vless-outbound (адрес, uuid, tcp/ws, tls/reality), порт socks-inbound и правила `routing.rules` (domain/ip/port → direct/proxy/block; `geosite`/`geoip` разбираются, но пока не применяются — для зон по доменам есть `direct_suffix`).
 
 ## Конфиг
 
@@ -117,23 +110,21 @@ flow = "xtls-rprx-vision"
 
 [routing]                    # первое совпавшее правило побеждает, иначе final
 final = "proxy"
+direct_suffix = ["ru", "su", "рф"]  # сплит-туннелинг: эти зоны идут напрямую (= --split-ru)
 [[routing.rules]]
 outbound = "direct"          # proxy | direct | block
 ip_private = true
 [[routing.rules]]
 outbound = "direct"
 domain_suffix = ["ru", "su"]
-[[routing.rules]]
-outbound = "direct"
-geoip = ["ru"]               # geoip/geosite работают в TUN-режиме (rule-set sing-box)
 
 [tun]
-enabled = false              # то же, что --tun; нужен root и sing-box
+enabled = false              # то же, что --tun; нужен root
 dns = "8.8.8.8"
 dns_via_proxy = true
 ```
 
-Правила routing имеют семантику sing-box: поля внутри одного правила объединяются по AND, списки по OR. В локальном режиме vproxy сам открывает direct-соединения, в TUN-режиме те же правила транслируются в sing-box.
+Правила routing имеют семантику sing-box: поля внутри одного правила объединяются по AND, списки по OR. `direct_suffix` добавляется как правило `direct` после ваших (явное правило побеждает); `.рф` сопоставляется с punycode `xn--p1ai`. Направление direct/proxy работает одинаково в локальном и в TUN-режиме.
 
 Автозапуск: примеры в [`docs/launchd/`](docs/launchd) (macOS) и [`docs/systemd/`](docs/systemd) (Linux).
 
@@ -145,8 +136,8 @@ dns_via_proxy = true
 - **REALITY нативно**: X25519 + HKDF auth key, аутентификатор в `session_id` ClientHello (AES-256-GCM), проверка сертификата сервера по HMAC-SHA512, гибридный key share X25519MLKEM768, который требуют современные серверы. Поверх форка rustls с двумя хуками.
 - **Отпечаток TLS как у Chrome** (`fp=chrome`, включён по умолчанию для REALITY, TLS, WS и XHTTP): ClientHello пересобирается по профилю uTLS `HelloChrome_155` (Chrome stable с октября 2026): набор и порядок шифров, 17 расширений в случайном порядке, GREASE в шести местах, GREASE ECH, ALPS, SCT, session ticket, ML-DSA в signature_algorithms и `trust_anchors` со списком корней Chrome. JA4 `t13d1517h2_8daaf6152771_cb7bf5808d99`, проверить можно командой `cargo run --example fingerprint`. Прежняя форма Chrome 133 (её, по данным разработчиков Xray, ТСПУ выделяет и ограничивает) доступна как `fp=chrome133` для сравнения. Отключается `fp=none`.
 - **XTLS Vision нативно**: паддинг на время внутреннего TLS-handshake и прямая пересылка TCP (direct copy) для TLS 1.3 без двойного шифрования. Для этого REALITY-поток ведётся собственным драйвером поверх `rustls::ClientConnection` по одной TLS-записи за раз.
-- **TUN-режим** по схеме Happ: sing-box держит интерфейс и отдаёт всё в локальный SOCKS5; конфиг генерируется автоматически и защищён от петель.
-- **Routing**: direct / proxy / block по доменам, CIDR, приватным адресам, портам, geoip/geosite.
+- **TUN-режим** нативный, в одном процессе: собственный netstack + FakeDNS держат системный интерфейс и маршрутизацию, без sidecar и без внешних зависимостей (macOS/Linux; direct-соединения выходят через физический интерфейс).
+- **Routing** и **сплит-туннелинг**: direct / proxy / block по доменам (суффикс/ключевое слово, включая IDN/punycode), CIDR, приватным адресам и портам; `direct_suffix` / `--split-ru` пускают зону `.ru` `.su` `.рф` напрямую мимо прокси.
 - **TUI**: сервер и режим, соединения, трафик и скорость, лог с прокруткой (PgUp/PgDn, Home/End; свежие строки всегда видны) и его копия в `~/.config/vproxy/vproxy.log` с ротацией (5 MiB × 3, путь задаёт `--log-file`, `none` отключает); переключение между серверами из `server.txt` без перезапуска (новые соединения идут через выбранный, выбор запоминается), добавление сервера вставкой ссылки (`a`) и удаление (`d`) прямо из интерфейса; задержка handshake по каждому серверу (замер при старте и по `p`), `b` переключает на самый быстрый.
 - **MUX (Mux.Cool)**: несколько TCP-сессий в одном VLESS-соединении (`[mux]`, импортируется из Xray JSON); для серверов с Vision не применяется, как и в Xray.
 - **DNS**: remote/local, split-правила, кэш с TTL. Таймауты, лимит соединений, graceful shutdown.
@@ -161,7 +152,7 @@ dns_via_proxy = true
 - `server.txt` и `service.txt` содержат UUID и токен подписки, поэтому пишутся с правами `0600` в каталоге `0700`; в логах URL подписки показывается без пути. Ссылка в `-u` и URL в `-s` видны в `ps`, для постоянной работы лучше файл или `service install`.
 - Если inbound слушает не loopback (`-l 0.0.0.0`, Docker), это открытый прокси для всех, кто дотягивается до порта: `direct`-соединения к приватным и loopback адресам в этом режиме отклоняются (и после DNS-резолва), чтобы контейнер не стал мостом в сеть хоста. Публиковать порт стоит только как `-p 127.0.0.1:1080:1080` или внутри доверенной сети.
 - Отказ `accept()` при нехватке дескрипторов не роняет процесс, лимит открытых файлов поднимается при старте; UDP-ассоциация держит не более 128 целей.
-- `sudo vproxy --tun` и root-сервис запускают sing-box/xray из обычных путей, в том числе Homebrew (`/opt/homebrew/bin` принадлежит пользователю): vproxy предупредит, если бинарник доступен на запись не только root. Зависимости проверяются `cargo audit` в CI.
+- `sudo vproxy --tun` и root-сервис поднимают TUN в самом процессе vproxy, без запуска сторонних бинарников. Опциональный sidecar xray-core (только для Vision поверх обычного TLS) запускается из обычных путей — vproxy предупредит, если бинарник доступен на запись не только root. Зависимости проверяются `cargo audit` в CI.
 
 ## Разработка
 
