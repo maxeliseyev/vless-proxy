@@ -1,5 +1,6 @@
 //! The proxy itself: listeners, relay, routing, DNS and traffic counters.
 
+pub mod direct_dns;
 pub mod dns;
 pub mod dns_cache;
 pub mod egress;

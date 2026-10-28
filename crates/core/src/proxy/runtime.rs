@@ -175,6 +175,10 @@ pub struct ProxyClient {
     /// into the tunnel in TUN mode (set by the desktop TUN runner; `None`
     /// otherwise). See [`crate::proxy::egress`].
     egress: Option<crate::proxy::egress::Egress>,
+    /// Resolver for `direct` domains in TUN mode, where the system resolver is
+    /// redirected to FakeDNS and would only return fake IPs. `None` elsewhere,
+    /// where the OS resolver is used. See [`crate::proxy::direct_dns`].
+    direct_resolver: Option<crate::proxy::direct_dns::DirectResolver>,
 }
 
 impl ProxyClient {
@@ -208,6 +212,7 @@ impl ProxyClient {
             h3: Arc::default(),
             h3_roots: None,
             egress: None,
+            direct_resolver: None,
         })
     }
 
@@ -222,6 +227,16 @@ impl ProxyClient {
     /// physical NIC instead of looping back into the tunnel (desktop TUN mode).
     pub fn with_egress(mut self, egress: crate::proxy::egress::Egress) -> Self {
         self.egress = Some(egress);
+        self
+    }
+
+    /// Resolve `direct` domains with this resolver instead of the OS one, for
+    /// TUN mode where the system resolver points at FakeDNS (desktop TUN runner).
+    pub fn with_direct_resolver(
+        mut self,
+        resolver: crate::proxy::direct_dns::DirectResolver,
+    ) -> Self {
+        self.direct_resolver = Some(resolver);
         self
     }
 
@@ -242,9 +257,14 @@ impl ProxyClient {
         let resolved: Vec<std::net::SocketAddr> = match address {
             Address::Ipv4(ip) => vec![(IpAddr::V4(*ip), port).into()],
             Address::Ipv6(ip) => vec![(IpAddr::V6(*ip), port).into()],
-            Address::Domain(_) => tokio::net::lookup_host(direct_target(address, port))
-                .await?
-                .collect(),
+            // In TUN mode the OS resolver points at FakeDNS, so resolve direct
+            // domains ourselves over the egress interface; otherwise the OS one.
+            Address::Domain(domain) => match &self.direct_resolver {
+                Some(resolver) => resolver.resolve(domain, port).await?,
+                None => tokio::net::lookup_host(direct_target(address, port))
+                    .await?
+                    .collect(),
+            },
         };
         if resolved.is_empty() {
             anyhow::bail!("cannot resolve {address}");

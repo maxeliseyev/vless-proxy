@@ -53,6 +53,8 @@ mod shared {
     use vproxy_core::netstack::fakedns::{FakeDns, DEFAULT_POOL};
     use vproxy_core::netstack::flows::{FlowLog, DEFAULT_CAPACITY};
     use vproxy_core::netstack::Netstack;
+    use vproxy_core::proxy::direct_dns::DirectResolver;
+    use vproxy_core::proxy::dns_cache::{DnsCache, DnsCacheConfig};
     use vproxy_core::proxy::egress::Egress;
     use vproxy_core::proxy::runtime::ProxyClient;
     use vproxy_core::{ActiveServer, Config};
@@ -78,8 +80,23 @@ mod shared {
     }
 
     /// The proxy connector, pinned to the physical interface so every `direct`
-    /// dial egresses there instead of looping back into the tunnel.
+    /// dial egresses there instead of looping back into the tunnel. `direct`
+    /// domains are resolved against `config.tun.dns` over the same interface,
+    /// since the system resolver is redirected to FakeDNS.
     pub fn connector(config: &Config, phys_iface: &str) -> Result<ProxyClient> {
+        let egress = Egress::new(phys_iface);
+        let cache = DnsCache::new(DnsCacheConfig {
+            enabled: config.dns.cache.enabled,
+            max_entries: config.dns.cache.max_entries,
+            default_ttl_secs: config.dns.cache.ttl_secs,
+            min_ttl_secs: config.dns.cache.min_ttl_secs,
+            max_ttl_secs: config.dns.cache.max_ttl_secs,
+        });
+        let direct = DirectResolver::new(
+            direct_dns_upstream(&config.tun.dns),
+            Some(egress.clone()),
+            cache,
+        );
         Ok(ProxyClient::new(
             ActiveServer::new(config.server.clone()),
             config.dns.clone(),
@@ -87,7 +104,20 @@ mod shared {
             &config.routing,
             &config.mux,
         )?
-        .with_egress(Egress::new(phys_iface)))
+        .with_egress(egress)
+        .with_direct_resolver(direct))
+    }
+
+    /// `config.tun.dns` as a `SocketAddr`, defaulting the port to 53 and falling
+    /// back to Google public DNS if it is not a bare IP.
+    pub fn direct_dns_upstream(dns: &str) -> std::net::SocketAddr {
+        if let Ok(addr) = dns.parse::<std::net::SocketAddr>() {
+            return addr;
+        }
+        if let Ok(ip) = dns.parse::<std::net::IpAddr>() {
+            return std::net::SocketAddr::new(ip, 53);
+        }
+        std::net::SocketAddr::from(([8, 8, 8, 8], 53))
     }
 
     /// Create the TUN device (brought up, addressed), returning it and its name.
