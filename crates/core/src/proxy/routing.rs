@@ -13,6 +13,22 @@ use crate::protocol::vless::Address;
 use anyhow::{bail, Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// The Russian domain zone, the default for split-tunnelling (`--split-ru`,
+/// the iOS toggle). `.рф` is IDNA-encoded to `xn--p1ai` at compile time.
+pub const RU_ZONE: &[&str] = &["ru", "su", "рф"];
+
+/// IDNA-encode a domain/suffix so a rule written in Unicode (e.g. `рф`) matches
+/// the punycode (`xn--p1ai`) that actually appears in DNS and SNI. Falls back to
+/// the plain lowercased input when the entry is not a valid domain (e.g. a bare
+/// `domain_keyword`).
+fn to_ascii_domain(s: &str) -> String {
+    let s = s.trim().trim_start_matches('.');
+    match idna::domain_to_ascii(s) {
+        Ok(ascii) if !ascii.is_empty() => ascii,
+        _ => s.to_ascii_lowercase(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outbound {
     Proxy,
@@ -164,12 +180,33 @@ impl Router {
         if final_outbound == Outbound::Block {
             bail!("routing.final cannot be \"block\"");
         }
-        let mut rules = Vec::with_capacity(config.rules.len());
+        let mut rules = Vec::with_capacity(config.rules.len() + 1);
         let mut has_geo_rules = false;
         for (i, rule) in config.rules.iter().enumerate() {
             let compiled = compile_rule(rule).with_context(|| format!("routing.rules[{i}]"))?;
             has_geo_rules |= !rule.geoip.is_empty() || !rule.geosite.is_empty();
             rules.push(compiled);
+        }
+        // Split-tunnelling: send whole domain zones (e.g. `.ru .su .рф`)
+        // straight out. Appended after the user's rules so an explicit rule
+        // still wins, and before `final`.
+        let direct_suffix: Vec<String> = config
+            .direct_suffix
+            .iter()
+            .map(|s| to_ascii_domain(s))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !direct_suffix.is_empty() {
+            rules.push(CompiledRule {
+                outbound: Outbound::Direct,
+                domain: Vec::new(),
+                domain_suffix: direct_suffix,
+                domain_keyword: Vec::new(),
+                ip_cidr: Vec::new(),
+                ip_private: false,
+                port: Vec::new(),
+                geo_only: false,
+            });
         }
         Ok(Self {
             rules,
@@ -192,7 +229,9 @@ impl Router {
 
     pub fn decide(&self, address: &Address, port: u16) -> Outbound {
         let domain = match address {
-            Address::Domain(d) => Some(d.trim_end_matches('.').to_ascii_lowercase()),
+            // IDNA-encode so a Unicode hostname matches the punycode a rule
+            // compiled to (and so on-the-wire punycode compares as-is).
+            Address::Domain(d) => Some(to_ascii_domain(d.trim_end_matches('.'))),
             _ => None,
         };
         let ip = match address {
@@ -221,7 +260,7 @@ fn compile_rule(rule: &RoutingRule) -> Result<CompiledRule> {
         .collect::<Result<Vec<_>>>()?;
     let lower = |v: &[String]| -> Vec<String> {
         v.iter()
-            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .map(|s| to_ascii_domain(s))
             .filter(|s| !s.is_empty())
             .collect()
     };
@@ -301,6 +340,7 @@ mod tests {
         Router::new(&RoutingConfig {
             final_outbound: final_outbound.to_string(),
             rules,
+            ..Default::default()
         })
         .unwrap()
     }
@@ -404,27 +444,79 @@ mod tests {
     }
 
     #[test]
+    fn idn_suffix_matches_punycode() {
+        // A rule written in Unicode must match the punycode seen on the wire.
+        let mut r = rule("direct");
+        r.domain_suffix = vec!["рф".into()];
+        let router = router(vec![r], "proxy");
+        assert_eq!(
+            router.decide(&dom("example.xn--p1ai"), 443),
+            Outbound::Direct
+        );
+        assert_eq!(router.decide(&dom("президент.рф"), 443), Outbound::Direct);
+        assert_eq!(router.decide(&dom("example.com"), 443), Outbound::Proxy);
+    }
+
+    #[test]
+    fn direct_suffix_zone_split_tunnel() {
+        let router = Router::new(&RoutingConfig {
+            final_outbound: "proxy".into(),
+            rules: vec![],
+            direct_suffix: RU_ZONE.iter().map(|s| s.to_string()).collect(),
+        })
+        .unwrap();
+        assert_eq!(router.decide(&dom("mail.ru"), 443), Outbound::Direct);
+        assert_eq!(router.decide(&dom("vk.su"), 443), Outbound::Direct);
+        assert_eq!(router.decide(&dom("президент.рф"), 443), Outbound::Direct);
+        assert_eq!(
+            router.decide(&dom("xn--d1abbgf6aiiy.xn--p1ai"), 443),
+            Outbound::Direct
+        );
+        assert_eq!(router.decide(&dom("example.com"), 443), Outbound::Proxy);
+        assert!(!router.is_empty());
+    }
+
+    #[test]
+    fn explicit_rule_wins_over_direct_suffix() {
+        // A user rule is appended before the synthetic zone rule, so it wins.
+        let mut keep = rule("proxy");
+        keep.domain_suffix = vec!["bank.ru".into()];
+        let router = Router::new(&RoutingConfig {
+            final_outbound: "proxy".into(),
+            rules: vec![keep],
+            direct_suffix: vec!["ru".into()],
+        })
+        .unwrap();
+        assert_eq!(router.decide(&dom("my.bank.ru"), 443), Outbound::Proxy);
+        assert_eq!(router.decide(&dom("mail.ru"), 443), Outbound::Direct);
+    }
+
+    #[test]
     fn validation_errors() {
         assert!(Router::new(&RoutingConfig {
             final_outbound: "block".into(),
-            rules: vec![]
+            rules: vec![],
+            ..Default::default()
         })
         .is_err());
         assert!(Router::new(&RoutingConfig {
             final_outbound: "nowhere".into(),
-            rules: vec![]
+            rules: vec![],
+            ..Default::default()
         })
         .is_err());
         assert!(Router::new(&RoutingConfig {
             final_outbound: "proxy".into(),
-            rules: vec![rule("direct")]
+            rules: vec![rule("direct")],
+            ..Default::default()
         })
         .is_err());
         let mut bad = rule("direct");
         bad.ip_cidr = vec!["10.0.0.0/33".into()];
         assert!(Router::new(&RoutingConfig {
             final_outbound: "proxy".into(),
-            rules: vec![bad]
+            rules: vec![bad],
+            ..Default::default()
         })
         .is_err());
         assert!(Cidr::parse("::ffff:10.0.0.0/104")

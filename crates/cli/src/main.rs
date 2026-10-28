@@ -39,6 +39,9 @@ struct Args {
     tui: bool,
     /// `--log-file <PATH>`: where the TUI persists its log (`none` disables).
     log_file: Option<PathBuf>,
+    /// `--direct-zone <csv>` / `--split-ru`: domain suffixes to route `direct`
+    /// (split-tunnel). `ru` expands to the whole Russian zone (`ru su рф`).
+    direct_zones: Vec<String>,
 }
 
 #[tokio::main]
@@ -86,6 +89,11 @@ async fn main() -> Result<()> {
     }
 
     let (mut config, servers) = load_config(args.clone())?;
+    // Split-tunnel: union the CLI zones with any from the config's `[routing]`.
+    config
+        .routing
+        .direct_suffix
+        .extend(args.direct_zones.iter().cloned());
     if let Some(listen) = &args.listen {
         config.inbound.address = listen.clone();
     }
@@ -242,6 +250,9 @@ async fn service_install(args: Args) -> Result<()> {
     config.validate()?;
     if args.tun {
         service_args.push("--tun".to_string());
+    }
+    if !args.direct_zones.is_empty() {
+        service_args.extend(["--direct-zone".to_string(), args.direct_zones.join(",")]);
     }
     if args.verbose {
         service_args.push("-v".to_string());
@@ -670,6 +681,7 @@ fn parse_args() -> Result<Args> {
     let mut tun = false;
     let mut tui = false;
     let mut log_file = None;
+    let mut direct_zones: Vec<String> = Vec::new();
     let mut command = None;
 
     let mut args = std::env::args_os().skip(1).peekable();
@@ -748,6 +760,30 @@ fn parse_args() -> Result<Args> {
             }
             Some("--tun") => tun = true,
             Some("--tui") => tui = true,
+            Some("--split-ru") => {
+                direct_zones.extend(
+                    vproxy_core::proxy::routing::RU_ZONE
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+            }
+            Some("--direct-zone") => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--direct-zone requires a comma list of domain suffixes, e.g. ru,su,рф"
+                    )
+                })?;
+                let value = value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("Invalid --direct-zone encoding"))?;
+                direct_zones.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                );
+            }
             Some("--log-file") => {
                 let value = args
                     .next()
@@ -800,6 +836,7 @@ fn parse_args() -> Result<Args> {
         tun,
         tui,
         log_file,
+        direct_zones,
     })
 }
 
@@ -831,10 +868,12 @@ Options:
       --check-config        Validate config and exit
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
       --ping                Measure the handshake latency of every server in the list and exit
-      --tun                 System-wide mode: a native in-process TUN, all traffic through the tunnel (macOS, needs root)
+      --tun                 System-wide mode: a native in-process TUN, all traffic through the tunnel (macOS/Linux, needs root)
       --tui                 Terminal UI with live counters and logs (q to quit); the log is also
                             written to ~/.config/vproxy/vproxy.log (5 MiB, 3 rotated copies kept)
       --log-file <PATH>     --tui: log file instead of the default; none keeps logs in memory only
+      --split-ru            Split-tunnel: route the Russian zone (.ru .su .рф) direct, not through the proxy
+      --direct-zone <CSV>   Split-tunnel: comma list of domain suffixes to route direct, e.g. ru,su,рф,cn
   -h, --help                Show this help
   -V, --version             Print version
 

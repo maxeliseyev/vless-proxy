@@ -534,6 +534,19 @@ impl App {
             None => "mux off".to_string(),
         };
         let tun = if self.config.tun.enabled { "ON" } else { "off" };
+        let split = if self.config.routing.direct_suffix.is_empty() {
+            String::new()
+        } else {
+            let zones = self
+                .config
+                .routing
+                .direct_suffix
+                .iter()
+                .map(|s| format!(".{s}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("   split direct: {zones}")
+        };
         let uptime = self.started.elapsed().as_secs();
         let header = vec![
             Line::from(vec![
@@ -554,10 +567,11 @@ impl App {
             Line::from(vec![
                 Span::styled("inbound  ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!(
-                    "{} {}   TUN {}   uptime {:02}:{:02}:{:02}",
+                    "{} {}   TUN {}{}   uptime {:02}:{:02}:{:02}",
                     self.config.inbound.protocol,
                     self.config.inbound_addr(),
                     tun,
+                    split,
                     uptime / 3600,
                     uptime % 3600 / 60,
                     uptime % 60

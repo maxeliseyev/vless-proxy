@@ -3542,6 +3542,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "idna",
  "ipstack",
  "libc",
  "quinn",

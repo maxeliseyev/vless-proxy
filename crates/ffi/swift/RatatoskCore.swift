@@ -66,15 +66,20 @@ final class RatatoskEngine {
     }
 
     /// Start the core for a vless://, h3:// or vpn:// link and begin moving packets.
-    func start(link: String) throws {
+    /// `directZones` is a split-tunnel policy: a comma list of domain suffixes
+    /// routed direct instead of through the proxy (e.g. "ru,su,рф"); empty routes
+    /// everything through the proxy.
+    func start(link: String, directZones: String = "") throws {
         var error = [CChar](repeating: 0, count: 512)
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         let started = link.withCString { cLink in
-            ratatosk_start(cLink, UInt16(Self.mtu), { ctx, packets, lens, count in
-                guard let ctx, let packets, let lens else { return }
-                let engine = Unmanaged<RatatoskEngine>.fromOpaque(ctx).takeUnretainedValue()
-                engine.write(packets, lens, count)
-            }, ctx, &error, error.count)
+            directZones.withCString { cZones in
+                ratatosk_start(cLink, UInt16(Self.mtu), cZones, { ctx, packets, lens, count in
+                    guard let ctx, let packets, let lens else { return }
+                    let engine = Unmanaged<RatatoskEngine>.fromOpaque(ctx).takeUnretainedValue()
+                    engine.write(packets, lens, count)
+                }, ctx, &error, error.count)
+            }
         }
         guard let started else {
             throw RatatoskError.start(String(cString: error))

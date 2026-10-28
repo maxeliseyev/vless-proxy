@@ -65,13 +65,19 @@ pub struct RatatoskStats {
 /// Start the tunnel core for a `vless://`, `h3://` or `vpn://` link. Returns NULL on
 /// failure with the reason in `error` (truncated, NUL-terminated).
 ///
+/// `direct_zones` is a split-tunnel policy: a NUL-terminated comma list of
+/// domain suffixes routed `direct` instead of through the proxy (e.g.
+/// `"ru,su,рф"`); NULL or empty means everything goes through the proxy.
+///
 /// # Safety
-/// `link` is a NUL-terminated string; `error` is NULL or `error_len`
-/// writable bytes; `ctx` is valid for `on_packet` until `ratatosk_stop`.
+/// `link` and `direct_zones` are NUL-terminated strings (`direct_zones` may be
+/// NULL); `error` is NULL or `error_len` writable bytes; `ctx` is valid for
+/// `on_packet` until `ratatosk_stop`.
 #[no_mangle]
 pub unsafe extern "C" fn ratatosk_start(
     link: *const c_char,
     mtu: u16,
+    direct_zones: *const c_char,
     on_packet: PacketCallback,
     ctx: *mut c_void,
     error: *mut c_char,
@@ -84,7 +90,21 @@ pub unsafe extern "C" fn ratatosk_start(
             .to_str()
             .map_err(|_| anyhow::anyhow!("link is not UTF-8"))
     };
-    match link.and_then(|link| start(link, mtu, on_packet, HostContext(ctx))) {
+    // A bad `direct_zones` encoding is not worth failing the tunnel over: treat
+    // it as no split-tunnel.
+    let zones: Vec<String> = if direct_zones.is_null() {
+        Vec::new()
+    } else {
+        CStr::from_ptr(direct_zones)
+            .to_str()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    match link.and_then(|link| start(link, mtu, &zones, on_packet, HostContext(ctx))) {
         Ok(tunnel) => Box::into_raw(Box::new(tunnel)),
         Err(e) => {
             write_error(error, error_len, &format!("{e:#}"));
@@ -96,10 +116,15 @@ pub unsafe extern "C" fn ratatosk_start(
 fn start(
     link: &str,
     mtu: u16,
+    direct_zones: &[String],
     on_packet: PacketCallback,
     ctx: HostContext,
 ) -> anyhow::Result<Tunnel> {
     let mut config = vproxy_core::config::servers::config_from_link(link, 0)?;
+    config
+        .routing
+        .direct_suffix
+        .extend(direct_zones.iter().cloned());
     if config.needs_xray_sidecar()? {
         anyhow::bail!(
             "this server needs xray-core (XTLS Vision over plain TLS), which iOS cannot run"

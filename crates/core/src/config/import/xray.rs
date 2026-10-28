@@ -188,6 +188,7 @@ fn import_routing(routing: &Value) -> RoutingConfig {
     let mut out = RoutingConfig {
         final_outbound: "proxy".to_string(),
         rules: Vec::new(),
+        direct_suffix: Vec::new(),
     };
     for (i, rule) in routing["rules"]
         .as_array()

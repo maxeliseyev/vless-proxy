@@ -36,6 +36,7 @@ fn dns_query_round_trips_through_the_c_abi() {
         ratatosk_start(
             link.as_ptr(),
             1500,
+            c"ru,su,\u{440}\u{444}".as_ptr(), // split-tunnel: .ru .su .рф direct
             collect,
             ctx.cast(),
             error.as_mut_ptr(),
@@ -87,6 +88,7 @@ fn bad_link_is_refused_with_a_reason() {
         ratatosk_start(
             link.as_ptr(),
             1500,
+            std::ptr::null(), // no split-tunnel
             ignore,
             std::ptr::null_mut(),
             error.as_mut_ptr(),

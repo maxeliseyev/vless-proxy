@@ -2051,6 +2051,7 @@ mod tests {
                 ip_private: true,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let client = ProxyClient::new(
             ActiveServer::new(config.server.clone()),

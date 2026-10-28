@@ -153,6 +153,11 @@ pub struct RoutingConfig {
     #[serde(rename = "final")]
     pub final_outbound: String,
     pub rules: Vec<RoutingRule>,
+    /// Split-tunnelling: domain suffixes (zones) routed `direct`, e.g.
+    /// `["ru", "su", "рф"]`. A convenience over a full `direct` rule; IDNA is
+    /// applied so `рф` matches `xn--p1ai`. Set by `--split-ru`/`--direct-zone`
+    /// and the iOS toggle, or directly in a config's `[routing]`.
+    pub direct_suffix: Vec<String>,
 }
 
 /// One rule: every listed field must match (AND), lists are OR, first match wins.
@@ -176,7 +181,9 @@ pub struct RoutingRule {
 
 impl RoutingConfig {
     pub fn is_default(&self) -> bool {
-        self.rules.is_empty() && (self.final_outbound.is_empty() || self.final_outbound == "proxy")
+        self.rules.is_empty()
+            && self.direct_suffix.is_empty()
+            && (self.final_outbound.is_empty() || self.final_outbound == "proxy")
     }
 }
 

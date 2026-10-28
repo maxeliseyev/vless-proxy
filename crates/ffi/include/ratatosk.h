@@ -37,8 +37,11 @@ typedef void (*RatatoskPacketCallback)(void *ctx, const uint8_t *const *packets,
 typedef void (*RatatoskLogCallback)(void *ctx, uint8_t level, const char *line);
 
 // Start for a vless://, h3:// or vpn:// link. NULL on failure, the reason in `error`.
-// `ctx` must stay valid until ratatosk_stop returns.
+// `ctx` must stay valid until ratatosk_stop returns. `direct_zones` is a
+// split-tunnel policy: a comma list of domain suffixes routed direct instead of
+// through the proxy (e.g. "ru,su,рф"); NULL or empty routes everything.
 RatatoskTunnel *ratatosk_start(const char *link, uint16_t mtu,
+                               const char *direct_zones,
                                RatatoskPacketCallback on_packet, void *ctx,
                                char *error, size_t error_len);
 

@@ -415,6 +415,7 @@ async fn routing_direct_rule_bypasses_the_vless_server() -> Result<()> {
             ip_private: true,
             ..Default::default()
         }],
+        ..Default::default()
     };
     let proxy = spawn_proxy_with_routing("socks5", server.addr, routing).await?;
 

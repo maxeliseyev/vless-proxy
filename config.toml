@@ -47,9 +47,15 @@ concurrency = 8
 [routing]
 # Where targets go when no rule matches: "proxy" (default) or "direct".
 final = "proxy"
-# Rules are checked in order, first match wins. Inside one rule every listed
-# field must match (AND, like sing-box); keep different kinds of conditions in
-# separate rules. geoip/geosite use sing-box rule-sets and apply in TUN mode only.
+# Split-tunnel shortcut: domain suffixes (zones) sent "direct" instead of through
+# the proxy. Same as a `direct` rule with these domain_suffix, but one line; IDNA
+# is applied so "рф" matches "xn--p1ai". The CLI's --split-ru / --direct-zone add
+# to this. Example (the Russian zone direct):
+# direct_suffix = ["ru", "su", "рф"]
+# Rules are checked in order, first match wins (and before direct_suffix's zone
+# rule). Inside one rule every listed field must match (AND, like sing-box); keep
+# different kinds of conditions in separate rules. geoip/geosite are parsed for
+# compatibility but ignored (they needed the dropped sing-box sidecar).
 [[routing.rules]]
 outbound = "direct"
 ip_private = true
