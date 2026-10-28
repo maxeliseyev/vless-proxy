@@ -20,7 +20,7 @@
 # SOCKS_PORT (default 1080), REPO (GitHub owner/repo of the release).
 set -eu
 
-VPROXY_VERSION="${VPROXY_VERSION:-0.18.5}"
+VPROXY_VERSION="${VPROXY_VERSION:-0.18.6}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 REPO="${REPO:-maxeliseyev/vless-proxy}"
 
