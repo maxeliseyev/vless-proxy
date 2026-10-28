@@ -66,14 +66,28 @@ impl DirectResolver {
         let (v4, v6) = tokio::join!(self.query(host, TYPE_A), self.query(host, TYPE_AAAA));
         let mut ips: Vec<IpAddr> = Vec::new();
         let mut ttl = self.cache.config().default_ttl_secs;
-        for (answers, answer_ttl) in [v4, v6].into_iter().flatten() {
-            if !answers.is_empty() {
-                ttl = ttl.min(answer_ttl.max(1));
+        let mut last_err: Option<anyhow::Error> = None;
+        for result in [v4, v6] {
+            match result {
+                Ok((answers, answer_ttl)) => {
+                    if !answers.is_empty() {
+                        ttl = ttl.min(answer_ttl.max(1));
+                    }
+                    ips.extend(answers);
+                }
+                Err(e) => last_err = Some(e),
             }
-            ips.extend(answers);
         }
         if ips.is_empty() {
-            bail!("no DNS answer for {host} from {}", self.upstream);
+            // Distinguish a failed query (connect/send/recv) from an empty but
+            // successful answer, so the flow log shows the real cause.
+            // `{e:#}` flattens the whole chain (e.g. "connect: Network is
+            // unreachable") into one line, since the flow log shows only the
+            // top-level message.
+            match last_err {
+                Some(e) => bail!("resolve {host} direct via {}: {e:#}", self.upstream),
+                None => bail!("no DNS answer for {host} from {} (empty)", self.upstream),
+            }
         }
         self.cache
             .insert(host, ips.clone(), Duration::from_secs(ttl))
@@ -100,9 +114,12 @@ impl DirectResolver {
                 .bind_fd(socket.as_raw_fd(), self.upstream)
                 .context("pin DNS query socket to egress")?;
         }
-        socket.connect(self.upstream).await?;
+        socket.connect(self.upstream).await.context("connect")?;
         let id: u16 = rand::random();
-        socket.send(&build_query(id, host, qtype)?).await?;
+        socket
+            .send(&build_query(id, host, qtype)?)
+            .await
+            .context("send")?;
         let mut buf = [0u8; 1500];
         let n = timeout(self.timeout, socket.recv(&mut buf))
             .await

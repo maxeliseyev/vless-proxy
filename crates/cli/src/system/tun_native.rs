@@ -282,6 +282,7 @@ mod macos {
             phys_iface: phys_iface.clone(),
             server_ips,
             bypass_nets: Vec::new(),
+            scoped_default: false,
             service: None,
             saved_dns: None,
         };
@@ -306,6 +307,9 @@ mod macos {
         phys_iface: String,
         server_ips: Vec<Ipv4Addr>,
         bypass_nets: Vec<String>,
+        /// Whether we added an interface-scoped default for `phys_iface` (see
+        /// `install`); removed on teardown.
+        scoped_default: bool,
         service: Option<String>,
         saved_dns: Option<Vec<String>>,
     }
@@ -324,6 +328,20 @@ mod macos {
                 "-interface",
                 &self.iface,
             ])?;
+            // `direct` sockets egress the physical NIC via IP_BOUND_IF
+            // (egress.rs), which does an interface-scoped route lookup. The
+            // plain default route is not scoped, so once the tunnel owns 0/1
+            // such a socket gets ENETUNREACH. Add a scoped default for the
+            // physical interface so the bound lookup resolves via the gateway.
+            let _ = route(&[
+                "-n",
+                "add",
+                "-ifscope",
+                &self.phys_iface,
+                "default",
+                &self.gateway,
+            ]);
+            self.scoped_default = true;
             for net in LOCAL_NETS
                 .iter()
                 .map(|s| s.to_string())
@@ -355,6 +373,9 @@ mod macos {
             }
             let _ = route(&["-n", "delete", "-net", "0.0.0.0/1"]);
             let _ = route(&["-n", "delete", "-net", "128.0.0.0/1"]);
+            if self.scoped_default {
+                let _ = route(&["-n", "delete", "-ifscope", &self.phys_iface, "default"]);
+            }
             for net in &self.bypass_nets {
                 let _ = route(&["-n", "delete", "-net", net]);
             }
