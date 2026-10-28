@@ -26,6 +26,8 @@ tempfile = "3"
 ratatui = "0.30"
 crossterm = "0.29"
 libc = "0.2"
+# Native TUN device for `--tun` (macOS utun), driving the core netstack.
+tun-rs = { version = "2.8.13", default-features = false, features = ["async"] }
 
 [dev-dependencies]
 uuid = "1"

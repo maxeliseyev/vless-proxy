@@ -14,19 +14,12 @@ use vproxy_core::{ActiveServer, Config, ServerList};
 /// Subcommands that run instead of the proxy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Subcommand {
-    InstallSingBox,
     Service(String),
 }
 
 #[derive(Clone)]
 struct Args {
     command: Option<Subcommand>,
-    /// `--sing-box <PATH>`: sing-box binary for TUN mode.
-    sing_box: Option<PathBuf>,
-    /// `--yes`: accept the default answer to every question.
-    yes: bool,
-    /// `--download`: fetch the sing-box release instead of using a package manager.
-    download: bool,
     config_path: Option<PathBuf>,
     vless_url: Option<String>,
     url_file: Option<PathBuf>,
@@ -43,7 +36,6 @@ struct Args {
     /// `--refresh`: update the links file from its subscription and exit.
     refresh: bool,
     tun: bool,
-    print_tun_config: bool,
     tui: bool,
     /// `--log-file <PATH>`: where the TUI persists its log (`none` disables).
     log_file: Option<PathBuf>,
@@ -97,12 +89,9 @@ async fn main() -> Result<()> {
     if let Some(listen) = &args.listen {
         config.inbound.address = listen.clone();
     }
-    if args.tun || args.print_tun_config {
+    if args.tun {
         config.tun.enabled = true;
         config.validate()?;
-    }
-    if args.tun {
-        config.tun.sing_box_path = resolve_sing_box(&args, &config.tun.sing_box_path).await?;
     }
     let config = Arc::new(config);
     let sidecar = if config.needs_xray_sidecar()? {
@@ -126,15 +115,6 @@ async fn main() -> Result<()> {
 
     if args.check_config {
         info!("Configuration is valid");
-        return Ok(());
-    }
-
-    if args.print_tun_config {
-        let rendered = crate::system::tun::build_sing_box_config(
-            config.as_ref(),
-            crate::system::tun::current_process_name().as_deref(),
-        )?;
-        println!("{}", serde_json::to_string_pretty(&rendered)?);
         return Ok(());
     }
 
@@ -186,37 +166,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Find sing-box for TUN mode, offering to install it on a terminal.
-async fn resolve_sing_box(args: &Args, configured: &str) -> Result<String> {
-    if let Some(path) = &args.sing_box {
-        return match crate::system::singbox::locate(&path.display().to_string()) {
-            Some(p) => Ok(p.display().to_string()),
-            None => anyhow::bail!("--sing-box {} is not an executable", path.display()),
-        };
-    }
-    if let Some(found) = crate::system::singbox::locate(configured) {
-        return Ok(found.display().to_string());
-    }
-    eprintln!("{}", crate::system::singbox::not_found_hint());
-    if crate::system::singbox::ask("Install sing-box now?", true, args.yes)? {
-        let path = crate::system::singbox::install(args.yes).await?;
-        return Ok(path.display().to_string());
-    }
-    anyhow::bail!("sing-box is required for --tun")
-}
-
-/// `install-sing-box` and `service ...`.
+/// `service ...`.
 async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
     match command {
-        Subcommand::InstallSingBox => {
-            let path = if args.download {
-                crate::system::singbox::download_release(args.yes).await?
-            } else {
-                crate::system::singbox::install(args.yes).await?
-            };
-            info!("sing-box ready at {}", path.display());
-            Ok(())
-        }
         Subcommand::Service(action) => match action.as_str() {
             "install" => service_install(args).await,
             "uninstall" | "remove" => {
@@ -236,8 +188,8 @@ async fn run_subcommand(command: Subcommand, args: Args) -> Result<()> {
     }
 }
 
-/// Resolve the config source to absolute paths, check it loads, pick the
-/// sing-box binary for `--tun`, then install the launchd/systemd service.
+/// Resolve the config source to absolute paths, check it loads, then install
+/// the launchd/systemd service.
 async fn service_install(args: Args) -> Result<()> {
     use crate::system::service::absolute;
     let mut service_args: Vec<String> = Vec::new();
@@ -253,7 +205,7 @@ async fn service_install(args: Args) -> Result<()> {
         check.url_file = Some(file);
     } else if let Some(link) = &args.vless_url {
         // The service cannot take the link on its command line safely; keep it in a file.
-        let dir = crate::system::singbox::real_home()
+        let dir = crate::system::service::real_home()
             .map(|h| h.join(".config").join("vproxy"))
             .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
         let file = dir.join("service.txt");
@@ -286,14 +238,10 @@ async fn service_install(args: Args) -> Result<()> {
         service_args.extend(["-l".to_string(), listen.clone()]);
     }
     let (mut config, _) = load_config(check.clone())?;
+    config.tun.enabled = args.tun;
+    config.validate()?;
     if args.tun {
-        config.tun.enabled = true;
-        config.validate()?;
-        let sing_box = resolve_sing_box(&args, &config.tun.sing_box_path).await?;
         service_args.push("--tun".to_string());
-        service_args.extend(["--sing-box".to_string(), sing_box]);
-    } else {
-        config.validate()?;
     }
     if args.verbose {
         service_args.push("-v".to_string());
@@ -720,31 +668,20 @@ fn parse_args() -> Result<Args> {
     let mut subscription = None;
     let mut refresh = false;
     let mut tun = false;
-    let mut print_tun_config = false;
     let mut tui = false;
     let mut log_file = None;
     let mut command = None;
-    let mut sing_box = None;
-    let mut yes = false;
-    let mut download = false;
 
     let mut args = std::env::args_os().skip(1).peekable();
-    match args.peek().and_then(|a| a.to_str()) {
-        Some("install-sing-box") => {
-            args.next();
-            command = Some(Subcommand::InstallSingBox);
-        }
-        Some("service") => {
-            args.next();
-            let action = args
-                .next()
-                .and_then(|a| a.to_str().map(str::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("service needs an action: install, uninstall, status, logs")
-                })?;
-            command = Some(Subcommand::Service(action));
-        }
-        _ => {}
+    if args.peek().and_then(|a| a.to_str()) == Some("service") {
+        args.next();
+        let action = args
+            .next()
+            .and_then(|a| a.to_str().map(str::to_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!("service needs an action: install, uninstall, status, logs")
+            })?;
+        command = Some(Subcommand::Service(action));
     }
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -810,7 +747,6 @@ fn parse_args() -> Result<Args> {
                 );
             }
             Some("--tun") => tun = true,
-            Some("--print-tun-config") => print_tun_config = true,
             Some("--tui") => tui = true,
             Some("--log-file") => {
                 let value = args
@@ -818,14 +754,6 @@ fn parse_args() -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--log-file requires a path or none"))?;
                 log_file = Some(PathBuf::from(value));
             }
-            Some("--sing-box") => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--sing-box requires a path"))?;
-                sing_box = Some(PathBuf::from(value));
-            }
-            Some("-y") | Some("--yes") => yes = true,
-            Some("--download") => download = true,
             Some("-h") | Some("--help") => {
                 print_help();
                 std::process::exit(0);
@@ -858,9 +786,6 @@ fn parse_args() -> Result<Args> {
 
     Ok(Args {
         command,
-        sing_box,
-        yes,
-        download,
         config_path,
         vless_url,
         url_file,
@@ -873,7 +798,6 @@ fn parse_args() -> Result<Args> {
         subscription,
         refresh,
         tun,
-        print_tun_config,
         tui,
         log_file,
     })
@@ -886,7 +810,6 @@ vproxy - terminal VLESS client
 
 Usage:
   vproxy [OPTIONS] [config-path|vless://...|vpn://...]
-  vproxy install-sing-box [--yes] [--download]
   vproxy service install|uninstall|status|logs [--tun] [config options]
 
 Without arguments vproxy uses ./server.txt, then ~/.config/vproxy/config.toml or
@@ -908,20 +831,14 @@ Options:
       --check-config        Validate config and exit
       --probe               Connect once, finish the transport (TLS/REALITY) handshake and exit
       --ping                Measure the handshake latency of every server in the list and exit
-      --tun                 System-wide mode: run a sing-box TUN sidecar on top of the SOCKS5 inbound (needs root)
-      --print-tun-config    Print the generated sing-box config for --tun and exit
+      --tun                 System-wide mode: a native in-process TUN, all traffic through the tunnel (macOS, needs root)
       --tui                 Terminal UI with live counters and logs (q to quit); the log is also
                             written to ~/.config/vproxy/vproxy.log (5 MiB, 3 rotated copies kept)
       --log-file <PATH>     --tui: log file instead of the default; none keeps logs in memory only
-      --sing-box <PATH>     sing-box binary for --tun (default: ~/.config/vproxy/bin, PATH, Homebrew, Happ)
-  -y, --yes                 Answer yes to questions (install prompts)
-      --download            install-sing-box: skip package managers, download the GitHub release
   -h, --help                Show this help
   -V, --version             Print version
 
 Commands:
-  install-sing-box          Install sing-box for TUN mode: Homebrew / the official repo script
-                            when available, otherwise the GitHub release into ~/.config/vproxy/bin
   service install           Run vproxy in the background (launchd / systemd), start at login or boot;
                             with --tun a system daemon (sudo). uninstall, status and logs manage it
 

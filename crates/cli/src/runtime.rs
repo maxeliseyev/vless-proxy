@@ -85,5 +85,5 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
 }
 
 async fn run_tun(config: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<()> {
-    crate::system::tun::run(config, shutdown).await
+    crate::system::tun_native::run(config, shutdown).await
 }

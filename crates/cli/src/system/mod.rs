@@ -1,8 +1,7 @@
-//! Integration with the host: TUN mode via sing-box, installing sing-box,
-//! running as a service, the xray-core sidecar fallback.
+//! Integration with the host: native TUN mode (macOS), running as a service,
+//! the xray-core sidecar fallback.
 
 pub mod service;
 pub mod sidecar;
-pub mod singbox;
-pub mod tun;
+pub mod tun_native;
 pub mod xray_sidecar;

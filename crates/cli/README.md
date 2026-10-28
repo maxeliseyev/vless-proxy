@@ -1,7 +1,9 @@
 # vproxy — CLI-клиент
 
-Бинарник `vproxy`, терминальный интерфейс, журнал, службы и управление
-внешними процессами sing-box/xray. Использует независимый `vproxy-core`.
+Бинарник `vproxy`, терминальный интерфейс, журнал, службы и системный
+TUN-режим (`--tun`, нативный in-process netstack на macOS; xray-core
+используется как sidecar только для XTLS Vision поверх plain TLS).
+Использует независимый `vproxy-core`.
 
 ```sh
 cargo run -p vproxy -- --help

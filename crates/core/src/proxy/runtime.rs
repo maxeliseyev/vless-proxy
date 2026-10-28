@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::IpAddr;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
@@ -170,6 +171,10 @@ pub struct ProxyClient {
     h3: Arc<std::sync::Mutex<Option<KeyedH3Client>>>,
     /// Roots h3 servers are checked against instead of the system's.
     h3_roots: Option<Arc<rustls::RootCertStore>>,
+    /// Interface to pin `direct` outbound sockets to, so they do not loop back
+    /// into the tunnel in TUN mode (set by the desktop TUN runner; `None`
+    /// otherwise). See [`crate::proxy::egress`].
+    egress: Option<crate::proxy::egress::Egress>,
 }
 
 impl ProxyClient {
@@ -182,7 +187,7 @@ impl ProxyClient {
     ) -> Result<Self> {
         let router = Router::new(routing)?;
         if router.has_geo_rules() {
-            warn!("routing: geoip/geosite rules are only applied in TUN mode (sing-box); the local proxy ignores them");
+            warn!("routing: geoip/geosite rules are not supported (they needed sing-box); these rules are ignored");
         }
         let mux = mux.sessions_per_connection().map(|concurrency| {
             if server.get().vision_flow().ok().flatten().is_some() {
@@ -202,6 +207,7 @@ impl ProxyClient {
             private_direct: true,
             h3: Arc::default(),
             h3_roots: None,
+            egress: None,
         })
     }
 
@@ -209,6 +215,13 @@ impl ProxyClient {
     /// (see [`ProxyClient::private_direct`]).
     pub fn allow_private_direct(mut self, allow: bool) -> Self {
         self.private_direct = allow;
+        self
+    }
+
+    /// Pin `direct` outbound sockets to this interface so they egress the
+    /// physical NIC instead of looping back into the tunnel (desktop TUN mode).
+    pub fn with_egress(mut self, egress: crate::proxy::egress::Egress) -> Self {
+        self.egress = Some(egress);
         self
     }
 
@@ -259,6 +272,39 @@ impl ProxyClient {
         Ok(out)
     }
 
+    /// Connect directly to the first working address, pinned to the egress
+    /// interface when one is set so it does not loop back into the tunnel.
+    async fn direct_tcp(&self, addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+        let connect_timeout = Duration::from_secs(self.runtime.connect_timeout_secs);
+        let mut last: Option<anyhow::Error> = None;
+        for &addr in addrs {
+            let socket = if addr.is_ipv6() {
+                tokio::net::TcpSocket::new_v6()
+            } else {
+                tokio::net::TcpSocket::new_v4()
+            };
+            let socket = match socket {
+                Ok(s) => s,
+                Err(e) => {
+                    last = Some(e.into());
+                    continue;
+                }
+            };
+            if let Some(egress) = &self.egress {
+                if let Err(e) = egress.bind_fd(socket.as_raw_fd(), addr) {
+                    last = Some(anyhow::anyhow!("pin direct socket to egress interface: {e}"));
+                    continue;
+                }
+            }
+            match timeout(connect_timeout, socket.connect(addr)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => last = Some(e.into()),
+                Err(_) => last = Some(anyhow::anyhow!("Direct connection timeout")),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no address to connect directly")))
+    }
+
     /// Multiplexer, when `[mux]` is on.
     pub fn mux(&self) -> Option<&MuxManager> {
         self.mux.as_deref()
@@ -275,12 +321,7 @@ impl ProxyClient {
             Outbound::Direct => {
                 debug!("route direct: {address}:{port}");
                 let addrs = self.direct_addrs(&address, port).await?;
-                let stream = timeout(
-                    Duration::from_secs(self.runtime.connect_timeout_secs),
-                    TcpStream::connect(addrs.as_slice()),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("Direct connection timeout"))??;
+                let stream = self.direct_tcp(&addrs).await?;
                 Ok(OutboundStream::Direct(stream))
             }
             Outbound::Proxy => {
@@ -404,6 +445,11 @@ impl ProxyClient {
                     "[::]:0".parse().unwrap()
                 };
                 let socket = UdpSocket::bind(bind).await?;
+                if let Some(egress) = &self.egress {
+                    egress
+                        .bind_fd(socket.as_raw_fd(), target)
+                        .map_err(|e| anyhow::anyhow!("pin direct udp socket to egress: {e}"))?;
+                }
                 socket.connect(target).await?;
                 Ok(UdpOutbound::Direct(socket))
             }
@@ -521,7 +567,7 @@ pub async fn serve_with_server(config: Arc<Config>, active: ActiveServer) -> Res
         anyhow::bail!("this server needs the xray-core sidecar; run it through the desktop client");
     }
     if config.tun.enabled {
-        anyhow::bail!("TUN mode runs sing-box; run it through the desktop client");
+        anyhow::bail!("TUN mode is handled by the desktop client (native netstack), not here");
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

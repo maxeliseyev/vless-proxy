@@ -7,6 +7,33 @@ use tokio::process::Command;
 use tracing::info;
 use vproxy_core::config::{Config, InboundProtocol, TransportSecurity};
 
+fn is_root() -> bool {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() == 0 }
+}
+
+/// Warn if a binary we run as root is writable by a non-root user: anyone who
+/// can change it could then run code as root.
+fn warn_if_unsafe_for_root(binary: &std::path::Path, what: &str) {
+    use std::os::unix::fs::MetadataExt;
+    if !is_root() {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(binary) else {
+        return;
+    };
+    let world_or_group_writable = meta.mode() & 0o022 != 0;
+    if meta.uid() != 0 || world_or_group_writable {
+        tracing::warn!(
+            "{what} {} is owned by uid {} (mode {:o}) and runs as root: anyone who can change \
+             that file can run code as root. Prefer a root-owned copy, e.g. /usr/local/bin.",
+            binary.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        );
+    }
+}
+
 pub async fn run(config: Arc<Config>) -> Result<()> {
     let rendered = build_config_json(config.as_ref())?;
     let mut temp = Builder::new()
@@ -23,10 +50,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         config.server.address, config.server.port, config.runtime.xray_path
     );
 
-    crate::system::singbox::warn_if_unsafe_for_root(
-        std::path::Path::new(&config.runtime.xray_path),
-        "xray-core",
-    );
+    warn_if_unsafe_for_root(std::path::Path::new(&config.runtime.xray_path), "xray-core");
     let mut child = Command::new(&config.runtime.xray_path)
         .arg("run")
         .arg("-c")

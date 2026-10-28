@@ -3,10 +3,28 @@
 //! working after the terminal is closed and starts at boot. `--tun` installs a
 //! system daemon (root); without it a per-user agent/unit for the local proxy.
 
-use crate::system::singbox;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The real user's home even under `sudo` (so a service installed with sudo
+/// still lands in the user's `~`, not root's).
+pub fn real_home() -> Option<PathBuf> {
+    if let Some(user) = std::env::var_os("SUDO_USER") {
+        let user = user.to_string_lossy();
+        if user != "root" {
+            let candidate = if cfg!(target_os = "macos") {
+                PathBuf::from("/Users").join(&*user)
+            } else {
+                PathBuf::from("/home").join(&*user)
+            };
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
 
 /// What the installed service should run.
 pub struct ServicePlan {
@@ -29,7 +47,7 @@ fn is_root() -> bool {
 }
 
 fn home() -> Result<PathBuf> {
-    singbox::real_home().context("HOME is not set")
+    real_home().context("HOME is not set")
 }
 
 /// Where the unit file and log live for this mode.
@@ -364,8 +382,6 @@ mod tests {
                 "-f".into(),
                 "/Users/me/.config/vproxy/server.txt".into(),
                 "--tun".into(),
-                "--sing-box".into(),
-                "/Users/me/.config/vproxy/bin/sing-box".into(),
             ],
         }
     }
@@ -380,7 +396,7 @@ mod tests {
         let xml = render_plist(&plan(true), &p);
         assert!(xml.contains("<string>/usr/local/bin/vproxy</string>"));
         assert!(xml.contains("<string>--tun</string>"));
-        assert!(xml.contains("<string>/Users/me/.config/vproxy/bin/sing-box</string>"));
+        assert!(xml.contains("<string>/Users/me/.config/vproxy/server.txt</string>"));
         assert!(xml.contains("<key>Label</key><string>com.vproxy.tun</string>"));
         assert!(xml.contains("/var/log/vproxy.log"));
     }
@@ -389,7 +405,7 @@ mod tests {
     fn unit_has_root_only_for_tun() {
         let tun = render_unit(&plan(true));
         assert!(tun.contains("User=root"));
-        assert!(tun.contains("ExecStart=/usr/local/bin/vproxy -f /Users/me/.config/vproxy/server.txt --tun --sing-box"));
+        assert!(tun.contains("ExecStart=/usr/local/bin/vproxy -f /Users/me/.config/vproxy/server.txt --tun"));
         assert!(tun.contains("WantedBy=multi-user.target"));
         let local = render_unit(&plan(false));
         assert!(!local.contains("User=root"));

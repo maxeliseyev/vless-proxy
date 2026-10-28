@@ -167,9 +167,10 @@ pub struct RoutingRule {
     pub ip_cidr: Vec<String>,
     pub ip_private: bool,
     pub port: Vec<u16>,
-    /// sing-box rule-set tags such as `ru`, `cn` (TUN mode only).
+    /// Geo rule-set tags such as `ru`, `cn`. Not supported any more (they
+    /// needed sing-box); parsed for compatibility but ignored.
     pub geoip: Vec<String>,
-    /// sing-box rule-set tags such as `category-ru` (TUN mode only).
+    /// Geo rule-set tags such as `category-ru`. Not supported (see `geoip`).
     pub geosite: Vec<String>,
 }
 
@@ -179,17 +180,15 @@ impl RoutingConfig {
     }
 }
 
-/// System-wide mode through a `sing-box` TUN sidecar (see `tun.rs`).
+/// System-wide (TUN) mode: a native in-process TUN on the desktop client
+/// (macOS), see `crates/cli/src/system/tun_native.rs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TunConfig {
     pub enabled: bool,
-    pub sing_box_path: String,
     /// Interface address, CIDR.
     pub address: String,
     pub mtu: u32,
-    /// `mixed` | `system` | `gvisor`
-    pub stack: String,
     pub strict_route: bool,
     /// Upstream DNS used for everything caught by the tunnel.
     pub dns: String,
@@ -205,10 +204,8 @@ impl Default for TunConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            sing_box_path: "sing-box".to_string(),
             address: "172.18.0.1/30".to_string(),
             mtu: 1500,
-            stack: "mixed".to_string(),
             strict_route: true,
             dns: "8.8.8.8".to_string(),
             dns_via_proxy: true,
@@ -224,17 +221,11 @@ impl TunConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.sing_box_path.trim().is_empty() {
-            bail!("tun.sing_box_path must not be empty");
-        }
         if !self.address.contains('/') {
             bail!("tun.address must be an interface address in CIDR form, e.g. 172.18.0.1/30");
         }
         if !(576..=65535).contains(&self.mtu) {
             bail!("tun.mtu must be between 576 and 65535");
-        }
-        if !matches!(self.stack.as_str(), "mixed" | "system" | "gvisor") {
-            bail!("tun.stack must be \"mixed\", \"system\" or \"gvisor\"");
         }
         if self.dns.parse::<std::net::IpAddr>().is_err() {
             bail!("tun.dns must be an IP address");
